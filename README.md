@@ -46,7 +46,7 @@ agents can query it semantically.
 Requires Python 3.11+ and a running [Ollama](https://ollama.com/download).
 
 ```bash
-git clone https://github.com/fferrari/mem-vault.git
+git clone https://github.com/jagoff/mem-vault.git
 cd mem-vault
 uv tool install --editable .
 

@@ -40,8 +40,8 @@ mem-vault = "mem_vault.server:main"
 mem-vault-mcp = "mem_vault.server:main"
 
 [project.urls]
-Homepage = "https://github.com/fferrari/mem-vault"
-Issues = "https://github.com/fferrari/mem-vault/issues"
+Homepage = "https://github.com/jagoff/mem-vault"
+Issues = "https://github.com/jagoff/mem-vault/issues"
 
 [build-system]
 requires = ["uv_build>=0.11.3,<0.12.0"]
