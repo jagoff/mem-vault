@@ -1,0 +1,28 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Local state
+.engram/
+.qdrant/
+*.db
+*.sqlite
+*.sqlite-journal
+
+# Test artifacts
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage

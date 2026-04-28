@@ -1,0 +1,59 @@
+[project]
+name = "mem-vault"
+version = "0.1.0"
+description = "Local MCP server that gives AI agents infinite memory backed by an Obsidian vault. 100% local stack: Ollama + Qdrant + sqlite. No API keys."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Fernando Ferrari", email = "fernandoferrari@gmail.com" }
+]
+requires-python = ">=3.11"
+keywords = ["mcp", "memory", "obsidian", "ollama", "rag", "agents", "claude", "devin", "local-first"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "mem0ai>=0.1.0",
+    "ollama>=0.3.0",
+    "python-frontmatter>=1.1.0",
+    "pydantic>=2.0",
+    "qdrant-client>=1.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+mem-vault = "mem_vault.server:main"
+mem-vault-mcp = "mem_vault.server:main"
+
+[project.urls]
+Homepage = "https://github.com/fferrari/mem-vault"
+Issues = "https://github.com/fferrari/mem-vault/issues"
+
+[build-system]
+requires = ["uv_build>=0.11.3,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
