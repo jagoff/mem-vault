@@ -63,8 +63,9 @@ This installs two binaries on your `PATH`:
 
 - `mem-vault-mcp` — the MCP stdio server (what your agent talks to)
 - `mem-vault` — top-level CLI with subcommands (`serve`, `import-engram`,
-  `hook-sessionstart`, `hook-stop`, `version`). Bare `mem-vault` (no args)
-  boots the MCP server, identical to `mem-vault-mcp`.
+  `reindex`, `hook-sessionstart`, `hook-userprompt`, `hook-stop`, `version`).
+  Bare `mem-vault` (no args) boots the MCP server, identical to
+  `mem-vault-mcp`.
 
 ## Configure
 
@@ -154,6 +155,7 @@ dependencies:
 | Hook | Subcommand | What it does |
 | --- | --- | --- |
 | `SessionStart` | `mem-vault hook-sessionstart` | At every session start, queries the vault for `type=preference` + `type=feedback` memories, emits an `additionalContext` block so the agent sees them right away — no cold start, no re-explaining preferences |
+| `UserPromptSubmit` | `mem-vault hook-userprompt` | Before each user message, runs a semantic search against the index and injects the top-3 most relevant memories. Skips short messages (`<20` chars) and slash-commands automatically. Tunable via `MEM_VAULT_USERPROMPT_K`, `MEM_VAULT_USERPROMPT_THRESHOLD`, `MEM_VAULT_USERPROMPT_MIN_CHARS` |
 | `Stop` | `mem-vault hook-stop` | Appends a tab-separated audit line to `~/.local/share/mem-vault/sessions.log` whenever the agent finishes its turn |
 
 Wire them up alongside your existing `hooks` config:
@@ -164,6 +166,11 @@ Wire them up alongside your existing `hooks` config:
     "SessionStart": [
       { "matcher": "", "hooks": [
         { "type": "command", "command": "/Users/you/.local/bin/mem-vault hook-sessionstart", "timeout": 15 }
+      ]}
+    ],
+    "UserPromptSubmit": [
+      { "matcher": "", "hooks": [
+        { "type": "command", "command": "/Users/you/.local/bin/mem-vault hook-userprompt", "timeout": 12 }
       ]}
     ],
     "Stop": [
@@ -236,6 +243,22 @@ models). Use it when you're ingesting a long conversation transcript and want
 mem0's deduplication; stick with the default for one-line preferences and bug
 fixes.
 
+## Reindex (after editing memories by hand)
+
+The vector index is updated automatically on every `memory_save` /
+`memory_update`. If you edit a memory's `.md` directly in Obsidian, or you
+import memories from an external source, the embeddings can drift out of
+sync. Rebuild the index any time with:
+
+```bash
+mem-vault reindex                  # idempotent: re-embeds every memory
+mem-vault reindex --purge          # nukes the Qdrant collection first (clean slate)
+mem-vault reindex --auto-extract   # also runs the LLM extractor while reindexing
+mem-vault reindex --limit 20       # debugging: stop after N memories
+```
+
+A reindex of ~50 memories takes ~10 s on bge-m3 + Apple Silicon.
+
 ## Migrating from engram
 
 If you've been using [engram](https://github.com/engramhq/engram), bulk-import
@@ -301,8 +324,8 @@ is your knowledge graph** and you want the agent's memory to live inside it.
 - [x] Auto-import existing engram exports (`engram export memories.json` → mem-vault) — `mem-vault import-engram`
 - [x] Per-agent collections — auto, derived from `agent_id`
 - [x] Optional fastembed BM25 hybrid retrieval — install `'.[hybrid]'`
-- [x] Lifecycle hooks for Claude Code / Devin — `hook-sessionstart` + `hook-stop`
-- [ ] `UserPromptSubmit` hook that injects per-prompt context from semantic search
+- [x] Lifecycle hooks for Claude Code / Devin — `hook-sessionstart` + `hook-userprompt` + `hook-stop`
+- [x] Reindex command for hand-edited / external-source memories — `mem-vault reindex`
 - [ ] Per-agent visibility scopes (`agent_id_visible_to: [...]`)
 - [ ] Browser UI to triage memories without leaving the terminal
 - [ ] Memory consolidation (weekly LLM pass that merges near-duplicates)
