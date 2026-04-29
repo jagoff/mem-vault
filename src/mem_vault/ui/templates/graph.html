@@ -1,24 +1,25 @@
+{% set prefix = request.scope.root_path %}
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>mem-vault · graph</title>
-  <link rel="stylesheet" href="/static/style.css" />
-  <link rel="stylesheet" href="/static/graph.css" />
+  <link rel="stylesheet" href="{{ prefix }}/static/style.css" />
+  <link rel="stylesheet" href="{{ prefix }}/static/graph.css" />
   <script src="https://unpkg.com/[email protected]/dist/cytoscape.min.js" crossorigin="anonymous"></script>
   <script src="https://unpkg.com/htmx.org@2.0.4" crossorigin="anonymous"></script>
 </head>
-<body>
+<body data-prefix="{{ prefix }}">
   <header class="topbar">
     <div class="brand">
       <span class="brand-name">mem-vault</span>
       <span class="brand-version">v{{ version }}</span>
     </div>
     <nav class="navlinks">
-      <a href="/">list</a>
+      <a href="{{ prefix }}/">list</a>
       <span class="dot">·</span>
-      <a href="/graph" class="active">graph</a>
+      <a href="{{ prefix }}/graph" class="active">graph</a>
     </nav>
     <div class="meta">
       <span class="kbd">{{ vault_path }}</span>
@@ -92,6 +93,7 @@
     };
     const FALLBACK_COLOR = '#94a3b8';
 
+    const PREFIX = document.body.dataset.prefix || '';
     let cy = null;
 
     function renderGraph(payload) {
@@ -197,7 +199,7 @@
             ${d.agent_id ? `<span>@${d.agent_id}</span>` : ''}
             ${d.updated ? `<span>${d.updated.slice(0, 10)}</span>` : ''}
           </footer>
-          <a href="/" class="open-list">open in list view →</a>
+          <a href="${PREFIX}/" class="open-list">open in list view →</a>
         </div>
       `;
     }
@@ -218,7 +220,7 @@
       const maxNodes = document.getElementById('max-nodes').value;
       document.getElementById('graph-stats').innerHTML =
         '<span class="stat-pill">loading…</span>';
-      const res = await fetch(`/api/graph?min_shared_tags=${minTags}&max_nodes=${maxNodes}`);
+      const res = await fetch(`${PREFIX}/api/graph?min_shared_tags=${minTags}&max_nodes=${maxNodes}`);
       const payload = await res.json();
       renderGraph(payload);
     }

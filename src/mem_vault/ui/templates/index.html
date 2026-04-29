@@ -1,23 +1,24 @@
+{% set prefix = request.scope.root_path %}
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>mem-vault · browse</title>
-  <link rel="stylesheet" href="/static/style.css" />
-  <link rel="stylesheet" href="/static/graph.css" />
+  <link rel="stylesheet" href="{{ prefix }}/static/style.css" />
+  <link rel="stylesheet" href="{{ prefix }}/static/graph.css" />
   <script src="https://unpkg.com/htmx.org@2.0.4" crossorigin="anonymous"></script>
 </head>
-<body>
+<body data-prefix="{{ prefix }}">
   <header class="topbar">
     <div class="brand">
       <span class="brand-name">mem-vault</span>
       <span class="brand-version">v{{ version }}</span>
     </div>
     <nav class="navlinks">
-      <a href="/" class="active">list</a>
+      <a href="{{ prefix }}/" class="active">list</a>
       <span class="dot">·</span>
-      <a href="/graph">graph</a>
+      <a href="{{ prefix }}/graph">graph</a>
     </nav>
     <div class="meta">
       <span class="kbd">{{ vault_path }}</span>
@@ -28,7 +29,7 @@
     </div>
     <div id="stats"
          class="stats"
-         hx-get="/api/stats"
+         hx-get="{{ prefix }}/api/stats"
          hx-trigger="load, refreshStats from:body"
          hx-swap="innerHTML">
       <span class="stat-pill" aria-busy="true">loading…</span>
@@ -38,7 +39,7 @@
   <main>
     <section class="controls">
       <form id="filters"
-            hx-get="/api/memories"
+            hx-get="{{ prefix }}/api/memories"
             hx-target="#rows"
             hx-trigger="input delay:300ms from:input[name='q'], change from:select[name='type'], submit"
             hx-swap="innerHTML"
@@ -67,7 +68,7 @@
     </section>
 
     <section id="rows"
-             hx-get="/api/memories"
+             hx-get="{{ prefix }}/api/memories"
              hx-trigger="load"
              hx-swap="innerHTML">
       <div class="empty">loading memories…</div>
@@ -77,6 +78,11 @@
   <div id="modal-root"></div>
 
   <script>
+    // The prefix is "" when running standalone (port 7880) and "/memory"
+    // (or whatever) when mounted under another FastAPI app. JS reads it
+    // from <body data-prefix="..."> so the same code works in both modes.
+    const PREFIX = document.body.dataset.prefix || '';
+
     // Tiny modal helper. Click a row → fetch detail → populate modal-root.
     document.body.addEventListener('htmx:afterSwap', (evt) => {
       if (evt.detail.target.id === 'modal-root') {
@@ -87,7 +93,7 @@
     document.body.addEventListener('click', (evt) => {
       const row = evt.target.closest('.row');
       if (row && !evt.target.closest('button, a, input, textarea, select')) {
-        htmx.ajax('GET', `/api/memories/${row.dataset.id}`, '#modal-root');
+        htmx.ajax('GET', `${PREFIX}/api/memories/${row.dataset.id}`, '#modal-root');
       }
     });
     // ESC closes the modal

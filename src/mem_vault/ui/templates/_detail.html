@@ -7,8 +7,9 @@
     <h2>{{ m.name }}</h2>
   </header>
 
+  {% set prefix = request.scope.root_path %}
   <form id="edit-form-{{ m.id }}"
-        hx-patch="/api/memories/{{ m.id }}"
+        hx-patch="{{ prefix }}/api/memories/{{ m.id }}"
         hx-target="#row-{{ m.id }}"
         hx-swap="outerHTML"
         hx-on::after-request="if (event.detail.successful) { document.querySelector('#modal-root dialog').close(); htmx.trigger('body', 'refreshStats'); }"
@@ -42,7 +43,7 @@
     <div class="detail-actions">
       <button type="button"
               class="danger"
-              hx-delete="/api/memories/{{ m.id }}"
+              hx-delete="{{ prefix }}/api/memories/{{ m.id }}"
               hx-confirm="Delete this memory permanently? The .md file is removed too."
               hx-target="#row-{{ m.id }}"
               hx-swap="outerHTML"
