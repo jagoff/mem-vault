@@ -50,6 +50,10 @@ git clone https://github.com/jagoff/mem-vault.git
 cd mem-vault
 uv tool install --editable .
 
+# (optional) hybrid retrieval — adds fastembed for BM25 keyword scoring on top
+# of the dense vector search. Adds ~200 MB of deps.
+uv tool install --editable '.[hybrid]'
+
 # pull the default models (≈3 GB total)
 ollama pull qwen2.5:3b      # LLM extractor (only used when auto_extract=true)
 ollama pull bge-m3          # 1024-dim multilingual embedder
@@ -58,7 +62,9 @@ ollama pull bge-m3          # 1024-dim multilingual embedder
 This installs two binaries on your `PATH`:
 
 - `mem-vault-mcp` — the MCP stdio server (what your agent talks to)
-- `mem-vault` — same as `mem-vault-mcp`, shorter alias
+- `mem-vault` — top-level CLI with subcommands (`serve`, `import-engram`,
+  `hook-sessionstart`, `hook-stop`, `version`). Bare `mem-vault` (no args)
+  boots the MCP server, identical to `mem-vault-mcp`.
 
 ## Configure
 
@@ -94,7 +100,7 @@ auto_extract_default = false      # opt-in LLM dedup; default off for predictabi
 | `MEM_VAULT_LLM_MODEL` | `llm_model` | `qwen2.5:3b` |
 | `MEM_VAULT_EMBEDDER_MODEL` | `embedder_model` | `bge-m3:latest` |
 | `MEM_VAULT_EMBEDDER_DIMS` | `embedder_dims` | `1024` |
-| `MEM_VAULT_COLLECTION` | `qdrant_collection` | `mem_vault` |
+| `MEM_VAULT_COLLECTION` | `qdrant_collection` | `mem_vault_<agent_id>` if `agent_id` is set, else `mem_vault` |
 | `MEM_VAULT_USER_ID` | `user_id` | `default` |
 | `MEM_VAULT_AGENT_ID` | `agent_id` | `null` |
 | `MEM_VAULT_AUTO_EXTRACT` | `auto_extract_default` | `false` |
@@ -138,6 +144,40 @@ auto_extract_default = false      # opt-in LLM dedup; default off for predictabi
 ### Cursor / Windsurf / VS Code
 
 Same shape — point any MCP-compatible client at `mem-vault-mcp`.
+
+## Lifecycle hooks (Devin / Claude Code)
+
+mem-vault ships two optional [lifecycle hooks](https://docs.anthropic.com/en/docs/claude-code/hooks)
+that run inside the same virtualenv as the MCP server, so they always see all
+dependencies:
+
+| Hook | Subcommand | What it does |
+| --- | --- | --- |
+| `SessionStart` | `mem-vault hook-sessionstart` | At every session start, queries the vault for `type=preference` + `type=feedback` memories, emits an `additionalContext` block so the agent sees them right away — no cold start, no re-explaining preferences |
+| `Stop` | `mem-vault hook-stop` | Appends a tab-separated audit line to `~/.local/share/mem-vault/sessions.log` whenever the agent finishes its turn |
+
+Wire them up alongside your existing `hooks` config:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      { "matcher": "", "hooks": [
+        { "type": "command", "command": "/Users/you/.local/bin/mem-vault hook-sessionstart", "timeout": 15 }
+      ]}
+    ],
+    "Stop": [
+      { "matcher": "", "hooks": [
+        { "type": "command", "command": "/Users/you/.local/bin/mem-vault hook-stop", "timeout": 5 }
+      ]}
+    ]
+  }
+}
+```
+
+Both hooks are best-effort — they print to stderr and exit 0 if anything goes
+wrong (vault missing, Ollama down, etc.). They never block the session. See
+[`hooks/README.md`](./hooks/README.md) for failure modes and verification.
 
 ## Tools exposed
 
@@ -196,6 +236,22 @@ models). Use it when you're ingesting a long conversation transcript and want
 mem0's deduplication; stick with the default for one-line preferences and bug
 fixes.
 
+## Migrating from engram
+
+If you've been using [engram](https://github.com/engramhq/engram), bulk-import
+its memories into mem-vault in one shot:
+
+```bash
+engram export /tmp/engram-export.json
+mem-vault import-engram /tmp/engram-export.json --agent-id engram --dry-run
+mem-vault import-engram /tmp/engram-export.json --agent-id engram
+```
+
+Each engram observation becomes one `.md` file in your vault, tagged
+`source:engram` plus the original `project:` and `topic_key` slugs so you can
+trace it back. Pass `--auto-extract` to additionally run the LLM extractor and
+let mem0 dedupe against any memories you already had.
+
 ## Smoke test
 
 ```bash
@@ -242,11 +298,14 @@ is your knowledge graph** and you want the agent's memory to live inside it.
 
 ## Roadmap
 
-- [ ] Auto-import existing engram exports (`engram export memories.json` → mem-vault)
-- [ ] Per-agent collections (`MEM_VAULT_COLLECTION=$AGENT_ID`)
-- [ ] Optional fastembed BM25 hybrid retrieval
-- [ ] Lifecycle hooks for Claude Code (auto save on `Stop`, auto search on `SessionStart`)
+- [x] Auto-import existing engram exports (`engram export memories.json` → mem-vault) — `mem-vault import-engram`
+- [x] Per-agent collections — auto, derived from `agent_id`
+- [x] Optional fastembed BM25 hybrid retrieval — install `'.[hybrid]'`
+- [x] Lifecycle hooks for Claude Code / Devin — `hook-sessionstart` + `hook-stop`
+- [ ] `UserPromptSubmit` hook that injects per-prompt context from semantic search
+- [ ] Per-agent visibility scopes (`agent_id_visible_to: [...]`)
 - [ ] Browser UI to triage memories without leaving the terminal
+- [ ] Memory consolidation (weekly LLM pass that merges near-duplicates)
 
 ## License
 

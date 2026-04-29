@@ -34,9 +34,14 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.5",
 ]
+hybrid = [
+    # BM25 keyword retrieval blended with the dense vector search.
+    # mem0 auto-detects fastembed and enables hybrid scoring transparently.
+    "fastembed>=0.3",
+]
 
 [project.scripts]
-mem-vault = "mem_vault.server:main"
+mem-vault = "mem_vault.cli:main"
 mem-vault-mcp = "mem_vault.server:main"
 
 [project.urls]

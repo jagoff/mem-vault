@@ -56,9 +56,13 @@ class Config(BaseModel):
         default=1024,
         description="Embedding dimensionality. Must match the embedder model.",
     )
-    qdrant_collection: str = Field(
-        default="mem_vault",
-        description="Qdrant collection name. Useful to namespace per-agent or per-project.",
+    qdrant_collection: str | None = Field(
+        default=None,
+        description=(
+            "Qdrant collection name. If left null and ``agent_id`` is set, "
+            "defaults to ``mem_vault_<agent_id>`` for natural per-agent isolation. "
+            "Otherwise falls back to ``mem_vault``."
+        ),
     )
     user_id: str = Field(
         default="default",
@@ -162,6 +166,10 @@ def load_config(config_path: Path | None = None) -> Config:
             merged[field] = value
 
     cfg = Config(**merged)
+    if cfg.qdrant_collection is None:
+        cfg.qdrant_collection = (
+            f"mem_vault_{cfg.agent_id}" if cfg.agent_id else "mem_vault"
+        )
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.qdrant_path.mkdir(parents=True, exist_ok=True)
     cfg.memory_dir.mkdir(parents=True, exist_ok=True)
