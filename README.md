@@ -341,6 +341,88 @@ models). Use it when you're ingesting a long conversation transcript and want
 mem0's deduplication; stick with the default for one-line preferences and bug
 fixes.
 
+## Browser UI
+
+Sometimes you just want to see what the agent has been remembering, without
+opening Obsidian. The `ui` subcommand boots a local web app for that:
+
+```bash
+mem-vault ui                       # http://127.0.0.1:7880
+mem-vault ui --port 8000           # custom port
+mem-vault ui --host 0.0.0.0        # expose on the LAN (no auth! local only)
+```
+
+What you get:
+
+- semantic search bar (HTMX-driven, debounced — types over the embedder index)
+- filters by `type` and tag chips
+- list of memories sorted by most-recently-updated, with type pill, name,
+  description preview, tags, agent_id, and a relative timestamp
+- click a row → modal with the full body, editable inline
+- save → re-indexes the memory and refreshes the row
+- delete → removes the `.md` file + every embedding pointing to it
+
+Stack: FastAPI server-rendered + HTMX (~14 KB) + Pico-style hand-rolled CSS.
+No build step, no SPA framework, no JavaScript bundler. The whole UI is
+~10 KB of HTML + ~14 KB of CSS.
+
+The UI dependencies are shipped as an optional extra:
+
+```bash
+uv tool install --editable '.[ui]'
+# or, with hybrid retrieval too:
+uv tool install --editable '.[ui,hybrid]'
+```
+
+## Consolidate (merge near-duplicates)
+
+After a few weeks of `auto_extract=True`, the vault accumulates near-
+duplicates: "Fer prefers TS over JS" + "the user uses TypeScript" + "code
+should be in TS". The `consolidate` subcommand finds and merges them with
+a local LLM:
+
+```bash
+mem-vault consolidate                          # dry-run, prints proposed merges
+mem-vault consolidate --threshold 0.90         # only very similar pairs (default 0.85)
+mem-vault consolidate --max-pairs 10           # limit per run
+mem-vault consolidate --apply                  # actually merge them
+```
+
+How it works:
+
+1. Walk every memory, hit Qdrant for the K nearest neighbors per memory.
+2. Keep pairs above the cosine similarity threshold.
+3. For each pair, ask Ollama (`qwen2.5:3b` by default) to choose: `MERGE`,
+   `KEEP_BOTH`, `KEEP_FIRST`, or `KEEP_SECOND`. Strict-JSON output.
+4. Apply: `MERGE` rewrites the older memory with a fused body and deletes
+   the newer one; `KEEP_FIRST/SECOND` deletes the redundant memory; the
+   index is kept consistent throughout.
+
+Run it weekly via `cron` / `launchd` to keep the vault tidy.
+
+## Per-agent visibility
+
+Memories support an optional `visible_to: [...]` allowlist:
+
+```yaml
+---
+name: Internal note for Devin
+agent_id: devin
+visible_to: []           # private to the owner agent only
+# visible_to: [claude-code, codex]  # explicit allowlist
+# visible_to: ["*"]                   # public (default — same as omitting the field)
+---
+```
+
+When a viewer's `agent_id` is passed to `VaultStorage.list(viewer_agent_id=…)`
+or to the future `memory_search` filter, restricted memories are filtered
+out unless the viewer is the owner or appears in the allowlist. Memories
+without the field default to public (backward-compatible — your existing
+`.md` files keep working).
+
+This is the building block for "private notes per agent" without renaming
+collections or running multiple servers.
+
 ## Reindex (after editing memories by hand)
 
 The vector index is updated automatically on every `memory_save` /
