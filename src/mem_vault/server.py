@@ -83,6 +83,19 @@ _TOOLS: list[types.Tool] = [
                     "default": False,
                     "description": "If true, run the LLM extractor + dedup. If false, save literally.",
                 },
+                "visible_to": {
+                    "description": (
+                        "Which agents can see this memory. Defaults to public. Pass "
+                        "the string 'private' to scope it to the saving agent only, "
+                        "'public' for everyone (default), or a list of agent ids "
+                        "(['claude-code', 'cursor']) for explicit allowlist. The "
+                        "saving agent is always implicitly included."
+                    ),
+                    "oneOf": [
+                        {"type": "string", "enum": ["public", "private"]},
+                        {"type": "array", "items": {"type": "string"}},
+                    ],
+                },
                 "user_id": {"type": "string"},
                 "agent_id": {"type": "string"},
             },
@@ -206,6 +219,14 @@ class MemVaultService:
         user_id = args.get("user_id") or self.config.user_id
         agent_id = args.get("agent_id") or self.config.agent_id
         auto_extract = bool(args.get("auto_extract", self.config.auto_extract_default))
+        # Visibility: caller can pass an explicit list, or one of the shorthands.
+        # When ``visible_to`` is omitted, default to public ("*"). Mostly we want
+        # multi-agent setups to opt-in to privacy, not the other way around.
+        visible_to = args.get("visible_to")
+        if visible_to == "private":
+            visible_to = []
+        elif visible_to == "public" or visible_to is None:
+            visible_to = ["*"]
 
         mem = await self._to_thread(
             self.storage.save,
@@ -216,6 +237,7 @@ class MemVaultService:
             tags=tags,
             agent_id=agent_id,
             user_id=user_id,
+            visible_to=visible_to,
         )
 
         index_results: list[dict[str, Any]] = []
@@ -253,16 +275,25 @@ class MemVaultService:
         mtype = args.get("type")
         user_id = args.get("user_id") or self.config.user_id
         threshold = float(args.get("threshold", 0.1))
+        # Visibility filtering happens AFTER the vector search, on the
+        # filesystem side. Reason: the embedding metadata stored by mem0 is
+        # a flat dict, and post-filtering against the canonical .md file is
+        # cheap (we already need to load the body for the response).
+        viewer_agent_id = args.get("viewer_agent_id")
+        if viewer_agent_id is None:
+            viewer_agent_id = self.config.agent_id
 
         filters: dict[str, Any] = {}
         if mtype:
             filters["type"] = mtype
 
+        # Over-fetch so visibility filtering doesn't leave us short.
+        raw_k = max(k, k * 3, 20)
         hits = await self._to_thread(
             self.index.search,
             query,
             user_id=user_id,
-            top_k=k,
+            top_k=raw_k,
             filters=filters or None,
             threshold=threshold,
         )
@@ -271,6 +302,8 @@ class MemVaultService:
         results: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
         for hit in hits:
+            if len(results) >= k:
+                break
             md = (hit.get("metadata") or {}) if isinstance(hit, dict) else {}
             mem_id = md.get("memory_id")
             if not mem_id:
@@ -281,6 +314,8 @@ class MemVaultService:
                 continue
             seen_ids.add(mem_id)
             mem = await self._to_thread(self.storage.get, mem_id)
+            if mem is not None and not mem.is_visible_to(viewer_agent_id):
+                continue
             results.append(
                 {
                     "id": mem_id,
@@ -299,11 +334,15 @@ class MemVaultService:
         tags = args.get("tags")
         user_id = args.get("user_id")
         limit = int(args.get("limit", 20))
+        viewer_agent_id = args.get("viewer_agent_id")
+        if viewer_agent_id is None:
+            viewer_agent_id = self.config.agent_id
         memories = await self._to_thread(
             self.storage.list,
             type=mtype,
             tags=tags,
             user_id=user_id,
+            viewer_agent_id=viewer_agent_id,
             limit=limit,
         )
         return {

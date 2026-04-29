@@ -62,10 +62,10 @@ ollama pull bge-m3          # 1024-dim multilingual embedder
 This installs two binaries on your `PATH`:
 
 - `mem-vault-mcp` — the MCP stdio server (what your agent talks to)
-- `mem-vault` — top-level CLI with subcommands (`serve`, `import-engram`,
-  `reindex`, `hook-sessionstart`, `hook-userprompt`, `hook-stop`, `version`).
-  Bare `mem-vault` (no args) boots the MCP server, identical to
-  `mem-vault-mcp`.
+- `mem-vault` — top-level CLI with subcommands (`serve`, `ui`,
+  `import-engram`, `reindex`, `consolidate`, `hook-sessionstart`,
+  `hook-userprompt`, `hook-stop`, `version`). Bare `mem-vault` (no args)
+  boots the MCP server, identical to `mem-vault-mcp`.
 
 ## Configure
 
@@ -120,6 +120,89 @@ auto_extract_default = false      # opt-in LLM dedup; default off for predictabi
 - macOS: `~/Library/Application Support/mem-vault`
 - Linux: `~/.local/share/mem-vault` (respects `$XDG_DATA_HOME`)
 - Windows: `%LOCALAPPDATA%\mem-vault\mem-vault`
+
+## Workflow — what using mem-vault feels like
+
+Once configured, you don't think about mem-vault explicitly. Memories
+accumulate as a side effect of normal conversation:
+
+```
+You: "preferimos rate limits a 60/min, no a 100. Recordá esto."
+agent: invokes memory_save(content="...", type="preference",
+                          tags=["rate-limit", "convention"])
+       → file written to <vault>/<memory_subdir>/preferimos_rate_limits.md
+       → embedding stored in Qdrant
+```
+
+Days later, a new session:
+
+```
+You: "diseñá la API de auth"
+[UserPromptSubmit hook fires before the agent reads the prompt]
+[hook does memory_search("API de auth diseñá") → finds rate-limit preference at score 0.71]
+[the preference is injected into the agent's context]
+
+agent: "Por las preferencias de rate limit (60/min) que ya pediste antes,
+        propongo este diseño..."
+```
+
+You never had to remind it. The vault is a markdown folder you can open
+in Obsidian, edit, link from other notes, and grep. The agent reads it
+automatically.
+
+### Three save modes worth knowing
+
+```python
+# Literal save — fast, deterministic, no LLM
+memory_save(content="X is Y because Z")
+# → writes the .md, embeds the body, returns. ~150 ms.
+
+# Auto-extracted — slower, LLM rewrites + dedupes against existing
+memory_save(content="long conversation transcript...", auto_extract=True)
+# → ollama distills facts, may emit ADD/UPDATE/NOOP per fact. ~5–15 s.
+
+# Private to one agent
+memory_save(content="claude-code internal note", visible_to="private")
+# → only the saving agent_id sees it via memory_list/memory_search.
+```
+
+### Maintenance commands you'll occasionally run
+
+```bash
+# Bring the index up to date after editing .md files in Obsidian:
+mem-vault reindex
+
+# Detect near-duplicates and ask the LLM to merge them:
+mem-vault consolidate                       # dry-run
+mem-vault consolidate --apply               # actually merge
+mem-vault consolidate --threshold 0.95      # stricter (only obvious dupes)
+
+# Bring memories from another tool:
+engram export /tmp/engram-export.json
+mem-vault import-engram /tmp/engram-export.json --agent-id engram
+```
+
+### Browser UI for triage
+
+When you'd rather click than grep, install the optional UI extra and open
+the local-only web app:
+
+```bash
+uv tool install --editable '.[ui]'
+mem-vault ui                  # serves on http://127.0.0.1:7880
+mem-vault ui --port 8088      # custom port
+```
+
+The UI runs locally (binds to `127.0.0.1` by default — never to
+`0.0.0.0`), no auth, intended for single-machine use. Features:
+
+- Filter by type / tag / search query (semantic via mem-vault, no LLM call)
+- Inline edit of body, title, tags, visibility
+- Delete memories (with confirmation)
+- Live stats: total count, by type, by agent
+
+The UI talks to the same `MemVaultService` as the MCP server — there's no
+separate sync to maintain.
 
 ## Connect your agent
 
@@ -205,11 +288,11 @@ wrong (vault missing, Ollama down, etc.). They never block the session. See
 
 | Tool | Purpose | Notes |
 | --- | --- | --- |
-| `memory_save` | Persist a new memory | `auto_extract=false` (default) writes the literal content; `auto_extract=true` runs the LLM to extract canonical facts and dedupe |
-| `memory_search` | Semantic search | Returns full memory bodies, not just snippets |
-| `memory_list` | Browse with filters | Filter by `type` / `tags` / `user_id` |
+| `memory_save` | Persist a new memory | `auto_extract=false` (default) writes the literal content; `auto_extract=true` runs the LLM to extract canonical facts and dedupe. `visible_to` controls who can read it (`"public"` / `"private"` / `["agent-a", "agent-b"]`) |
+| `memory_search` | Semantic search | Returns full memory bodies, not just snippets. Respects visibility — over-fetches and filters post-hoc |
+| `memory_list` | Browse with filters | Filter by `type` / `tags` / `user_id`. Same visibility rules as search |
 | `memory_get` | Read one memory | The id is just the filename slug |
-| `memory_update` | Replace fields | Re-indexes if `content` changes |
+| `memory_update` | Replace fields | Re-indexes if `content` changes. Can change `visible_to` |
 | `memory_delete` | Remove file + index | Irreversible — confirm with the user |
 
 Memory types are constrained to a small enum:
@@ -361,9 +444,12 @@ is your knowledge graph** and you want the agent's memory to live inside it.
 - [x] Optional fastembed BM25 hybrid retrieval — install `'.[hybrid]'`
 - [x] Lifecycle hooks for Claude Code / Devin — `hook-sessionstart` + `hook-userprompt` + `hook-stop`
 - [x] Reindex command for hand-edited / external-source memories — `mem-vault reindex`
-- [ ] Per-agent visibility scopes (`agent_id_visible_to: [...]`)
-- [ ] Browser UI to triage memories without leaving the terminal
-- [ ] Memory consolidation (weekly LLM pass that merges near-duplicates)
+- [x] Per-agent visibility scopes — `visible_to: ["*" | [] | ["agent-a", ...]]`
+- [x] Memory consolidation (LLM pass that merges near-duplicates) — `mem-vault consolidate`
+- [x] Browser UI for triage (FastAPI + HTMX) — `mem-vault ui`
+- [ ] Cross-vault sync (sharing memories between machines beyond iCloud)
+- [ ] Time-decay scoring for `memory_search` (recent memories rank higher)
+- [ ] `UserPromptSubmit` skip rules for non-Spanish/English prompts (locale-aware)
 
 ## License
 

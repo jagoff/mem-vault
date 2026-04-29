@@ -40,6 +40,11 @@ hybrid = [
     # mem0 auto-detects fastembed and enables hybrid scoring transparently.
     "fastembed>=0.3",
 ]
+ui = [
+    "fastapi>=0.136.1",
+    "jinja2>=3.1.6",
+    "uvicorn>=0.46.0",
+]
 
 [project.scripts]
 mem-vault = "mem_vault.cli:main"

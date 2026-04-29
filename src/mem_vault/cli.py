@@ -2,15 +2,19 @@
 
 Subcommands:
 - ``serve`` (default) — start the MCP stdio server. Same as ``mem-vault-mcp``.
+- ``ui`` — start a browser UI (localhost) to browse / search / edit / delete.
+- ``reindex`` — re-embed every memory into Qdrant (after hand-edits / imports).
 - ``import-engram`` — bulk-import memories from an ``engram export`` JSON file.
 - ``hook-sessionstart`` — SessionStart lifecycle hook (reads stdin, prints JSON).
 - ``hook-userprompt`` — UserPromptSubmit lifecycle hook (semantic search per prompt).
-- ``hook-stop`` — Stop lifecycle hook (logs to ~/.local/share/mem-vault/sessions.log).
+- ``hook-stop`` — Stop lifecycle hook (logs to <state_dir>/sessions.log).
 - ``version`` — print package version.
 
 Usage:
     mem-vault                            # equivalent to `mem-vault serve`
     mem-vault serve
+    mem-vault ui --port 7880
+    mem-vault reindex --purge
     mem-vault import-engram /tmp/engram-export.json --agent-id engram
     mem-vault hook-sessionstart < event.json
     mem-vault hook-userprompt < event.json
@@ -54,6 +58,18 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
     sub.add_parser("serve", help="Start the MCP stdio server (default).")
     sub.add_parser("version", help="Print package version.")
+
+    p_ui = sub.add_parser(
+        "ui",
+        help="Start a local browser UI to browse, search, edit, and delete memories.",
+    )
+    p_ui.add_argument("--host", default="127.0.0.1")
+    p_ui.add_argument("--port", type=int, default=7880)
+    p_ui.add_argument(
+        "--log-level",
+        default="info",
+        choices=["critical", "error", "warning", "info", "debug", "trace"],
+    )
     sub.add_parser(
         "hook-sessionstart",
         help="SessionStart lifecycle hook: inject preferences into agent context.",
@@ -86,6 +102,33 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=0,
         help="Stop after this many memories (0 = no limit, default).",
+    )
+
+    p_consolidate = sub.add_parser(
+        "consolidate",
+        help="Detect near-duplicate memories and merge them with the LLM.",
+    )
+    p_consolidate.add_argument(
+        "--threshold",
+        type=float,
+        default=0.85,
+        help=(
+            "Cosine similarity threshold for candidate pairs (default 0.85). "
+            "Tune to your embedder: bge-m3 rarely exceeds 0.92 even on near-"
+            "duplicates; OpenAI text-embedding-3-large can. The LLM is the "
+            "second filter that catches false positives."
+        ),
+    )
+    p_consolidate.add_argument(
+        "--max-pairs",
+        type=int,
+        default=20,
+        help="Process at most this many pairs per run (default 20).",
+    )
+    p_consolidate.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually merge/delete. Without this flag, only print the plan.",
     )
 
     p_import = sub.add_parser(
@@ -325,6 +368,80 @@ async def _reindex(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# consolidate
+# ---------------------------------------------------------------------------
+
+
+def _consolidate(args: argparse.Namespace) -> int:
+    """Detect + merge near-duplicate memories.
+
+    Two-pass design:
+    1. ``find_candidate_pairs`` (pure embedding similarity, no LLM).
+    2. For each pair, ``_ask_llm`` decides MERGE / KEEP_BOTH / KEEP_FIRST /
+       KEEP_SECOND. The LLM call is the slow part; we cap it to
+       ``--max-pairs`` so a wild run doesn't burn through 400 LLM calls.
+    """
+    import ollama
+
+    from mem_vault.consolidate import (
+        _ask_llm,
+        apply_resolution,
+        find_candidate_pairs,
+    )
+
+    config = load_config()
+    service = MemVaultService(config)
+    storage = service.storage
+    index = service.index
+
+    print(
+        f"consolidate: scanning {config.memory_dir} "
+        f"threshold={args.threshold} max_pairs={args.max_pairs} "
+        f"apply={args.apply}"
+    )
+
+    pairs = find_candidate_pairs(storage, index, threshold=args.threshold, user_id=config.user_id)
+    if not pairs:
+        print("  no near-duplicate pairs found.")
+        return 0
+    print(f"  found {len(pairs)} candidate pairs (showing top {args.max_pairs}):")
+
+    ollama_client = ollama.Client(host=config.ollama_host)
+    summary = {"MERGE": 0, "KEEP_BOTH": 0, "KEEP_FIRST": 0, "KEEP_SECOND": 0}
+
+    for i, pair in enumerate(pairs[: args.max_pairs], start=1):
+        print(
+            f"\n  [{i}/{min(len(pairs), args.max_pairs)}] "
+            f"score={pair.score:.3f}\n"
+            f"    A: {pair.a.id} ({pair.a.type}) — {pair.a.name[:60]}\n"
+            f"    B: {pair.b.id} ({pair.b.type}) — {pair.b.name[:60]}"
+        )
+        try:
+            res = _ask_llm(config, pair, ollama_client=ollama_client)
+        except Exception as exc:
+            print(f"    LLM call failed: {exc}", file=sys.stderr)
+            continue
+
+        print(f"    -> {res.action}: {res.rationale[:100]}")
+        if not args.apply:
+            continue
+
+        try:
+            outcome = apply_resolution(storage, index, pair, res, user_id=config.user_id)
+            summary[res.action] = summary.get(res.action, 0) + 1
+            print(f"       applied: {outcome}")
+        except Exception as exc:
+            print(f"    apply failed: {exc}", file=sys.stderr)
+
+    print()
+    if args.apply:
+        print(f"consolidate done: {summary}")
+    else:
+        print("consolidate done (dry-run, no changes written). Re-run with --apply to commit.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # entrypoint
 # ---------------------------------------------------------------------------
 
@@ -347,11 +464,26 @@ def main() -> None:
     if cmd == "serve":
         return serve_main()
 
+    if cmd == "ui":
+        try:
+            from mem_vault.ui.server import serve as ui_serve
+        except ImportError as exc:
+            print(
+                f"error: ui dependencies not installed ({exc}). "
+                "Install with: uv tool install --editable '.[ui]'",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        return ui_serve(host=args.host, port=args.port, log_level=args.log_level)
+
     if cmd == "import-engram":
         sys.exit(asyncio.run(_import_engram(args)))
 
     if cmd == "reindex":
         sys.exit(asyncio.run(_reindex(args)))
+
+    if cmd == "consolidate":
+        sys.exit(_consolidate(args))
 
     if cmd == "hook-sessionstart":
         from mem_vault.hooks import sessionstart  # local import to keep startup fast

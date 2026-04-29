@@ -1,0 +1,4 @@
+<span class="stat-pill" title="total memories">{{ total }} memor{% if total != 1 %}ies{% else %}y{% endif %}</span>
+{% for type, count in by_type.items() %}
+  <span class="stat-pill type-{{ type }}" title="{{ count }} {{ type }} memor{% if count != 1 %}ies{% else %}y{% endif %}">{{ type }} · {{ count }}</span>
+{% endfor %}

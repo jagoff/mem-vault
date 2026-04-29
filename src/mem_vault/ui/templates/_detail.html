@@ -1,0 +1,57 @@
+<dialog class="detail">
+  <form method="dialog" class="detail-close">
+    <button class="close" aria-label="Close">×</button>
+  </form>
+  <header class="detail-head">
+    <span class="type type-{{ m.type }}">{{ m.type }}</span>
+    <h2>{{ m.name }}</h2>
+  </header>
+
+  <form id="edit-form-{{ m.id }}"
+        hx-patch="/api/memories/{{ m.id }}"
+        hx-target="#row-{{ m.id }}"
+        hx-swap="outerHTML"
+        hx-on::after-request="if (event.detail.successful) { document.querySelector('#modal-root dialog').close(); htmx.trigger('body', 'refreshStats'); }"
+        class="detail-form">
+    <label>
+      <span>title</span>
+      <input type="text" name="title" value="{{ m.name }}" />
+    </label>
+    <label>
+      <span>description</span>
+      <input type="text" name="description" value="{{ m.description }}" />
+    </label>
+    <label>
+      <span>tags <em>(comma separated)</em></span>
+      <input type="text" name="tags" value="{{ m.tags|join(', ') }}" />
+    </label>
+    <label>
+      <span>body</span>
+      <textarea name="content" rows="14" spellcheck="false">{{ m.body }}</textarea>
+    </label>
+
+    <div class="meta-grid">
+      <div><span class="meta-label">id</span><code>{{ m.id }}</code></div>
+      <div><span class="meta-label">type</span>{{ m.type }}</div>
+      <div><span class="meta-label">user_id</span>{{ m.user_id }}</div>
+      <div><span class="meta-label">agent_id</span>{{ m.agent_id or '—' }}</div>
+      <div><span class="meta-label">created</span>{{ m.created or '—' }}</div>
+      <div><span class="meta-label">updated</span>{{ m.updated or '—' }}</div>
+    </div>
+
+    <div class="detail-actions">
+      <button type="button"
+              class="danger"
+              hx-delete="/api/memories/{{ m.id }}"
+              hx-confirm="Delete this memory permanently? The .md file is removed too."
+              hx-target="#row-{{ m.id }}"
+              hx-swap="outerHTML"
+              hx-on::after-request="if (event.detail.successful) { document.querySelector('#modal-root dialog').close(); htmx.trigger('body', 'refreshStats'); }">
+        delete
+      </button>
+      <span class="spacer"></span>
+      <button type="button" class="ghost" onclick="this.closest('dialog').close()">cancel</button>
+      <button type="submit" class="primary">save</button>
+    </div>
+  </form>
+</dialog>

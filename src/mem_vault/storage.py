@@ -42,9 +42,20 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _VALID_TYPES = {"feedback", "preference", "decision", "fact", "note", "bug", "todo"}
 
 
+VISIBLE_TO_ALL = "*"
+
+
 @dataclass
 class Memory:
-    """A single memory entry (one .md file in the vault)."""
+    """A single memory entry (one .md file in the vault).
+
+    Visibility model:
+    - ``agent_id`` records the agent that created or last touched the memory.
+    - ``visible_to`` is a list of agent ids that can read it. ``["*"]`` (the
+      default for legacy / unset) means every agent. An empty list ``[]``
+      means private to ``agent_id`` (and any caller that explicitly asks
+      for that agent's memories).
+    """
 
     id: str
     name: str
@@ -58,7 +69,22 @@ class Memory:
     user_id: str = "default"
     origin_session_id: str | None = None
     contradicts: list[str] = field(default_factory=list)
+    visible_to: list[str] = field(default_factory=lambda: [VISIBLE_TO_ALL])
     extra: dict[str, Any] = field(default_factory=dict)
+
+    def is_visible_to(self, agent_id: str | None) -> bool:
+        """Returns True iff ``agent_id`` (or anyone, if None) may read this memory."""
+        if not self.visible_to:
+            # Empty list = strictly private to the owner agent.
+            return agent_id is not None and agent_id == self.agent_id
+        if VISIBLE_TO_ALL in self.visible_to:
+            return True
+        if agent_id is None:
+            # No agent context → only see public memories.
+            return False
+        if agent_id == self.agent_id:
+            return True
+        return agent_id in self.visible_to
 
     def to_frontmatter(self) -> dict[str, Any]:
         meta: dict[str, Any] = {
@@ -76,6 +102,11 @@ class Memory:
             meta["origin_session_id"] = self.origin_session_id
         if self.contradicts:
             meta["contradicts"] = list(self.contradicts)
+        # Only emit ``visible_to`` when it's non-default — files written by
+        # other tools (engram, manual notes) should round-trip cleanly
+        # without sprouting a noisy field they didn't ask for.
+        if self.visible_to != [VISIBLE_TO_ALL]:
+            meta["visible_to"] = list(self.visible_to)
         meta.update(self.extra)
         return meta
 
@@ -93,6 +124,7 @@ class Memory:
             "user_id": self.user_id,
             "origin_session_id": self.origin_session_id,
             "contradicts": self.contradicts,
+            "visible_to": self.visible_to,
         }
 
 
@@ -201,12 +233,17 @@ class VaultStorage:
         user_id: str = "default",
         origin_session_id: str | None = None,
         memory_id: str | None = None,
+        visible_to: list[str] | None = None,
     ) -> Memory:
         """Write a new memory file. Returns the created Memory.
 
         - ``title`` defaults to the first line of ``content`` (truncated).
         - ``description`` defaults to the first 200 chars of ``content``.
         - ``memory_id``, if provided, overwrites any existing file with that id.
+        - ``visible_to`` controls which agents can read this memory:
+          ``["*"]`` (default) = visible to everyone,
+          ``[]`` = strictly private to ``agent_id``,
+          ``["claude-code", "cursor"]`` = visible to those agents + the owner.
         """
         if type not in _VALID_TYPES:
             type = "note"
@@ -233,6 +270,7 @@ class VaultStorage:
             agent_id=agent_id,
             user_id=user_id,
             origin_session_id=origin_session_id,
+            visible_to=list(visible_to) if visible_to is not None else [VISIBLE_TO_ALL],
         )
         self._write(mem)
         return mem
@@ -245,6 +283,7 @@ class VaultStorage:
         title: str | None = None,
         description: str | None = None,
         tags: list[str] | None = None,
+        visible_to: list[str] | None = None,
     ) -> Memory:
         mem = self.get(memory_id)
         if mem is None:
@@ -257,6 +296,8 @@ class VaultStorage:
             mem.description = description
         if tags is not None:
             mem.tags = tags
+        if visible_to is not None:
+            mem.visible_to = list(visible_to)
         mem.updated = _now_iso()
         self._write(mem)
         return mem
@@ -280,8 +321,16 @@ class VaultStorage:
         type: str | None = None,
         tags: list[str] | None = None,
         user_id: str | None = None,
+        viewer_agent_id: str | None = None,
         limit: int = 50,
     ) -> list[Memory]:
+        """List memories sorted by mtime desc, applying optional filters.
+
+        ``viewer_agent_id`` enforces the visibility model: when provided,
+        memories with restricted ``visible_to`` are filtered out unless the
+        viewer is in the allowlist. Pass ``None`` (default) to skip the
+        visibility check entirely — useful for admin / reindex flows.
+        """
         results: list[Memory] = []
         files = sorted(self.memory_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
         for path in files:
@@ -294,6 +343,8 @@ class VaultStorage:
             if tags and not set(tags).issubset(set(mem.tags)):
                 continue
             if user_id and mem.user_id != user_id:
+                continue
+            if viewer_agent_id is not None and not mem.is_visible_to(viewer_agent_id):
                 continue
             results.append(mem)
             if len(results) >= limit:
@@ -316,10 +367,21 @@ class VaultStorage:
             "origin_session_id",
             "originSessionId",
             "contradicts",
+            "visible_to",
         }
         # accept legacy "originSessionId" camelCase from existing files
         origin = meta.pop("origin_session_id", None) or meta.pop("originSessionId", None)
         extra = {k: v for k, v in meta.items() if k not in known}
+        # Memories without an explicit ``visible_to`` (engram imports, manual
+        # files, anything pre-visibility) default to public — the safest
+        # backward-compatible behavior.
+        visible_to_raw = meta.get("visible_to")
+        if visible_to_raw is None:
+            visible_to = [VISIBLE_TO_ALL]
+        elif isinstance(visible_to_raw, list):
+            visible_to = [str(v) for v in visible_to_raw]
+        else:
+            visible_to = [str(visible_to_raw)]
         return Memory(
             id=path.stem,
             name=str(meta.get("name") or path.stem),
@@ -333,6 +395,7 @@ class VaultStorage:
             user_id=str(meta.get("user_id") or "default"),
             origin_session_id=origin,
             contradicts=list(meta.get("contradicts") or []),
+            visible_to=visible_to,
             extra=extra,
         )
 

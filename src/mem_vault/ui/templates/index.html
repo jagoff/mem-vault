@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>mem-vault · browse</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://unpkg.com/htmx.org@2.0.4" crossorigin="anonymous"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-name">mem-vault</span>
+      <span class="brand-version">v{{ version }}</span>
+    </div>
+    <div class="meta">
+      <span class="kbd">{{ vault_path }}</span>
+      <span class="dot">·</span>
+      <span>agent · <code>{{ agent_id }}</code></span>
+      <span class="dot">·</span>
+      <span>collection · <code>{{ collection }}</code></span>
+    </div>
+    <div id="stats"
+         class="stats"
+         hx-get="/api/stats"
+         hx-trigger="load, refreshStats from:body"
+         hx-swap="innerHTML">
+      <span class="stat-pill" aria-busy="true">loading…</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="controls">
+      <form id="filters"
+            hx-get="/api/memories"
+            hx-target="#rows"
+            hx-trigger="input delay:300ms from:input[name='q'], change from:select[name='type'], submit"
+            hx-swap="innerHTML"
+            hx-indicator="#search-indicator">
+        <div class="search">
+          <input type="search"
+                 name="q"
+                 placeholder="semantic search across all memories…"
+                 autocomplete="off"
+                 spellcheck="false"
+                 autofocus />
+          <span id="search-indicator" class="htmx-indicator">searching…</span>
+        </div>
+        <select name="type">
+          <option value="">all types</option>
+          <option value="preference">preference</option>
+          <option value="feedback">feedback</option>
+          <option value="decision">decision</option>
+          <option value="fact">fact</option>
+          <option value="note">note</option>
+          <option value="bug">bug</option>
+          <option value="todo">todo</option>
+        </select>
+        <input type="hidden" name="tag" value="" />
+      </form>
+    </section>
+
+    <section id="rows"
+             hx-get="/api/memories"
+             hx-trigger="load"
+             hx-swap="innerHTML">
+      <div class="empty">loading memories…</div>
+    </section>
+  </main>
+
+  <div id="modal-root"></div>
+
+  <script>
+    // Tiny modal helper. Click a row → fetch detail → populate modal-root.
+    document.body.addEventListener('htmx:afterSwap', (evt) => {
+      if (evt.detail.target.id === 'modal-root') {
+        const dialog = document.querySelector('#modal-root dialog');
+        if (dialog) dialog.showModal();
+      }
+    });
+    document.body.addEventListener('click', (evt) => {
+      const row = evt.target.closest('.row');
+      if (row && !evt.target.closest('button, a, input, textarea, select')) {
+        htmx.ajax('GET', `/api/memories/${row.dataset.id}`, '#modal-root');
+      }
+    });
+    // ESC closes the modal
+    document.addEventListener('keydown', (evt) => {
+      if (evt.key === 'Escape') {
+        const dlg = document.querySelector('#modal-root dialog[open]');
+        if (dlg) dlg.close();
+      }
+    });
+  </script>
+</body>
+</html>

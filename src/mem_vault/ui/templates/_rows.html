@@ -1,0 +1,15 @@
+{% if not memories %}
+  <div class="empty">
+    {% if searched %}no matches for "{{ q }}"{% else %}no memories yet — save one via memory_save{% endif %}
+  </div>
+{% else %}
+  <div class="row-count">
+    {{ memories|length }} {% if searched %}match{% if memories|length != 1 %}es{% endif %}{% else %}memor{% if memories|length != 1 %}ies{% else %}y{% endif %}{% endif %}
+    {% if searched and q %}for <code>"{{ q }}"</code>{% endif %}
+    {% if type %}· type=<code>{{ type }}</code>{% endif %}
+    {% if tag %}· tag=<code>{{ tag }}</code>{% endif %}
+  </div>
+  {% for m in memories %}
+    {% include "_row.html" %}
+  {% endfor %}
+{% endif %}

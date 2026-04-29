@@ -1,0 +1,20 @@
+<article class="row" data-id="{{ m.id }}" id="row-{{ m.id }}">
+  <header class="row-head">
+    <span class="type type-{{ m.type }}">{{ m.type }}</span>
+    <h3 class="name">{{ m.name }}</h3>
+    {% if m._score %}<span class="score">{{ "%.2f"|format(m._score) }}</span>{% endif %}
+  </header>
+  {% if m.description %}
+    <p class="desc">{{ m.description }}</p>
+  {% endif %}
+  <footer class="row-foot">
+    <code class="id">{{ m.id }}</code>
+    {% if m.tags %}
+      <span class="tags">
+        {% for t in m.tags %}<span class="tag">#{{ t }}</span>{% endfor %}
+      </span>
+    {% endif %}
+    {% if m.updated %}<span class="time">{{ m.updated|relative_time }}</span>{% endif %}
+    {% if m.agent_id %}<span class="agent">@{{ m.agent_id }}</span>{% endif %}
+  </footer>
+</article>
