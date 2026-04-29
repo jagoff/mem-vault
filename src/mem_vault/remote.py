@@ -27,7 +27,21 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TIMEOUT_S = 10.0
+# Default timeout para read+write+connect cubriendo cualquier endpoint del
+# servidor remoto. ANTES era 10s, lo cual rompía `save({auto_extract: true})`
+# casi siempre: cuando el server delega al LLM extractor (Ollama qwen2.5:7b
+# u otro), una sola llamada de extract+dedup contra contenido de varios KB
+# tarda 30-120s; el timeout disparaba antes y devolvía
+# `{"ok": false, "error": "mem-vault remote timeout: "}` aunque el server
+# del otro lado SÍ estuviera trabajando bien.
+#
+# 180s cubre el caso del LLM con margen sin colgarnos eternamente si algo
+# realmente falla. Operaciones rápidas (search/list/get/delete = <1s
+# normalmente) NO se ven afectadas — el timeout es un MAX, no un MIN.
+#
+# Para operaciones que SÍ querramos rápidas a propósito (ej. health checks)
+# se puede pasar `timeout=N` explícito al constructor del cliente.
+DEFAULT_TIMEOUT_S = 180.0
 
 
 class RemoteMemVaultService:
