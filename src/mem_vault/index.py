@@ -18,6 +18,7 @@ Both paths run on localhost: zero API keys, zero outbound calls.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from typing import Any
 
 from mem0 import Memory as Mem0Memory
@@ -25,6 +26,36 @@ from mem0 import Memory as Mem0Memory
 from mem_vault.config import Config
 
 logger = logging.getLogger(__name__)
+
+
+def time_decay_factor(updated_iso: str | None, half_life_days: float) -> float:
+    """Multiplier in (0, 1] applied to a search score given an ``updated`` ISO timestamp.
+
+    Returns 1.0 when:
+    - ``half_life_days`` is 0 or negative (decay disabled)
+    - ``updated_iso`` is missing/unparseable (we don't punish memories that
+      simply lack a timestamp — better to fall back to pure semantic score)
+
+    Otherwise: ``2 ** (-age_days / half_life_days)`` — true half-life decay.
+    With a 90-day half-life, a memory updated 90 days ago has its score
+    halved; 180 days ago, quartered; one updated yesterday is barely
+    affected.
+    """
+    if half_life_days is None or half_life_days <= 0:
+        return 1.0
+    if not updated_iso:
+        return 1.0
+    try:
+        dt = datetime.fromisoformat(updated_iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+    except Exception:
+        return 1.0
+    age_seconds = (datetime.now(tz=dt.tzinfo) - dt).total_seconds()
+    if age_seconds <= 0:
+        return 1.0
+    age_days = age_seconds / 86400.0
+    return 2.0 ** (-age_days / half_life_days)
 
 
 class VectorIndex:
@@ -116,21 +147,51 @@ class VectorIndex:
         merged_filters: dict[str, Any] = {"user_id": user_id}
         if filters:
             merged_filters.update(filters)
+        # Pull a wider set than the caller asked for when decay is enabled —
+        # the rerank below may shuffle older items down past the cut.
+        decay = self.config.decay_half_life_days
+        oversample = max(top_k * 3, 20) if decay > 0 else top_k
         try:
             res = self.mem0.search(
                 query=query,
-                top_k=top_k,
+                top_k=oversample,
                 filters=merged_filters,
                 threshold=threshold,
             )
         except Exception as exc:
             logger.warning("mem0 search failed (%s); returning empty list", exc)
             return []
+
         if isinstance(res, dict):
-            return list(res.get("results", []))
-        if isinstance(res, list):
-            return res
-        return []
+            hits = list(res.get("results", []))
+        elif isinstance(res, list):
+            hits = list(res)
+        else:
+            hits = []
+
+        if decay > 0 and hits:
+            for h in hits:
+                if not isinstance(h, dict):
+                    continue
+                base = h.get("score") or 0.0
+                # Prefer ``updated_at`` (mem0 native), fall back to
+                # metadata.updated, then memory.updated.
+                ts = (
+                    h.get("updated_at")
+                    or h.get("created_at")
+                    or (h.get("metadata") or {}).get("updated")
+                    or (h.get("metadata") or {}).get("created")
+                )
+                factor = time_decay_factor(ts, decay)
+                h["score_raw"] = base
+                h["decay_factor"] = factor
+                h["score"] = base * factor
+            hits.sort(
+                key=lambda h: (h.get("score") or 0.0) if isinstance(h, dict) else 0.0, reverse=True
+            )
+            hits = hits[:top_k]
+
+        return hits
 
     def delete_by_metadata(self, key: str, value: str, user_id: str) -> int:
         """Delete every mem0 entry whose metadata[key] == value. Returns count."""

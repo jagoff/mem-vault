@@ -105,6 +105,8 @@ auto_extract_default = false      # opt-in LLM dedup; default off for predictabi
 | `MEM_VAULT_USER_ID` | `user_id` | `default` |
 | `MEM_VAULT_AGENT_ID` | `agent_id` | `null` |
 | `MEM_VAULT_AUTO_EXTRACT` | `auto_extract_default` | `false` |
+| `MEM_VAULT_DECAY_HALF_LIFE_DAYS` | `decay_half_life_days` | `0` (disabled) |
+| `MEM_VAULT_USERPROMPT_SCRIPTS` | (UserPromptSubmit hook) | `""` (disabled — accept all scripts) |
 
 **Vault auto-detection** (when `MEM_VAULT_PATH` is unset). First match wins:
 
@@ -476,6 +478,110 @@ The `json` and `jsonl` outputs include enough metadata to round-trip back
 into a future importer (out of scope for v0.1). The `markdown` format is
 useful for pasting the entire vault into one LLM prompt for analysis.
 
+## Time-decay scoring
+
+By default, `memory_search` ranks purely by semantic similarity — a
+relevant decision from 2 years ago beats a relevant note from yesterday.
+Set `MEM_VAULT_DECAY_HALF_LIFE_DAYS` (or `decay_half_life_days` in the
+TOML) to enable time-decay reranking:
+
+```bash
+export MEM_VAULT_DECAY_HALF_LIFE_DAYS=90
+```
+
+With a half-life of 90 days, the score multiplier is `2 ** (-age_days / 90)`:
+
+| Age of memory | Score multiplier |
+| --- | --- |
+| Today | 1.00 |
+| 30 days ago | 0.79 |
+| 90 days ago | 0.50 |
+| 180 days ago | 0.25 |
+| 365 days ago | 0.06 |
+
+Memories without an `updated` timestamp (legacy / engram imports) get
+multiplier 1.0 and aren't punished. The reranker is applied after the
+Qdrant kNN — `top_k` is oversampled 3x internally so older items can be
+shuffled down past the cut.
+
+Reasonable values: 30 (aggressive — surface-this-week wins), 90
+(moderate — last-month context wins), 365 (mild — only graveyard
+memories suffer). Set to `0` (default) to disable.
+
+## Locale-aware UserPromptSubmit
+
+By default, the `UserPromptSubmit` hook only skips short messages and
+slash-commands. If your vault is mostly written in Latin-script languages
+(English, Spanish, French, etc.) and you don't want the embedder to spend
+cycles on accidentally-pasted CJK / Arabic / Hebrew / Devanagari, set:
+
+```bash
+export MEM_VAULT_USERPROMPT_SCRIPTS="latin"
+# or, if you want Latin and Cyrillic:
+export MEM_VAULT_USERPROMPT_SCRIPTS="latin,cyrillic"
+```
+
+Available script buckets: `latin`, `cyrillic`, `greek`, `arabic`,
+`hebrew`, `devanagari`, `cjk`, `thai`, `ethiopic`. The hook detects the
+dominant Unicode script of the prompt (using `unicodedata.name()` — no
+ML model, no extra dep) and skips the search when it doesn't match the
+allowlist.
+
+Prompts that are mostly digits / emoji / punctuation return `unknown`
+and pass through (we'd rather over-search than skip a real query).
+
+## Cross-vault sync
+
+mem-vault doesn't ship its own sync engine — it leans on whatever the
+user already has in front of the vault: [iCloud Drive](https://support.apple.com/en-us/HT204025),
+[Syncthing](https://syncthing.net), [Dropbox](https://dropbox.com),
+[OneDrive](https://onedrive.live.com), [Google Drive](https://drive.google.com),
+or a `git` repo. Memories are plain markdown — every existing sync
+engine handles them natively.
+
+Two helper commands make sync sane:
+
+```bash
+mem-vault sync-status        # diff the vault vs the Qdrant index
+mem-vault sync-watch         # long-running file watcher → reindex on change
+```
+
+`sync-status` reports:
+
+```
+  vault files       : 57
+  index entries     : 55
+  stale (vault > idx): 2     ← .md edited after last embedding
+  orphans in index  : 0      ← embedding for a deleted memory
+  missing in index  : 2      ← .md exists but never embedded
+```
+
+`sync-watch` keeps them in lockstep automatically: every `.md` create /
+modify / delete event triggers a re-embed (or a removal). Designed to run
+as a long-lived process — point your `cron` / `launchd` / `systemd` at
+`mem-vault sync-watch` and forget about it.
+
+> **Important caveat**: the embedded Qdrant DB enforces single-writer.
+> `sync-status` and `sync-watch` cannot run while the MCP server is
+> active (it holds the lock). Stop your agent first, run the sync
+> command, then start the agent again. Both commands give a clear
+> error message instead of crashing if the lock is held.
+
+### Recommended sync setups
+
+| Setup | Pros | Cons |
+| --- | --- | --- |
+| **iCloud Drive** (default if your vault is in Obsidian iCloud) | zero setup, works on iPhone/iPad too | no conflict resolution; can produce `.icloud` placeholders for cold files |
+| **Syncthing** between Mac + Linux | LAN-fast, no third party, conflict files visible | one-time setup per device |
+| **`git` repo** | full history, atomic commits, conflict resolution | manual `git pull` / `git push`; not real-time |
+| **Dropbox / OneDrive / Drive** | mature, reliable | proprietary, requires account |
+
+The only directory you must NOT sync is the `state_dir` (the local
+Qdrant index + history.db). It's a derived cache, machine-specific, and
+binary — sync conflicts will corrupt it. After every fresh pull on a new
+machine, run `mem-vault reindex` to rebuild the local index from the
+synced markdown.
+
 ## Migrating from engram
 
 If you've been using [engram](https://github.com/engramhq/engram), bulk-import
@@ -569,9 +675,9 @@ is your knowledge graph** and you want the agent's memory to live inside it.
 - [x] Graph visualization (Cytoscape.js, tag co-occurrence edges) — `/graph` route
 - [x] Export to JSON / JSONL / CSV / Markdown for backup — `mem-vault export`
 - [x] PyPI release pipeline — `.github/workflows/release.yml` (Trusted Publishing on tag)
-- [ ] Cross-vault sync (sharing memories between machines beyond iCloud)
-- [ ] Time-decay scoring for `memory_search` (recent memories rank higher)
-- [ ] `UserPromptSubmit` skip rules for non-Spanish/English prompts (locale-aware)
+- [x] Cross-vault sync — `mem-vault sync-status` + `mem-vault sync-watch` (works with iCloud / Syncthing / git / Dropbox / OneDrive)
+- [x] Time-decay scoring for `memory_search` — `MEM_VAULT_DECAY_HALF_LIFE_DAYS`
+- [x] Locale-aware `UserPromptSubmit` skip — `MEM_VAULT_USERPROMPT_SCRIPTS`
 
 ## License
 

@@ -100,6 +100,16 @@ class Config(BaseModel):
         default=False,
         description="Whether memory_save uses the LLM by default. Tools can override per-call.",
     )
+    decay_half_life_days: float = Field(
+        default=0.0,
+        description=(
+            "Time-decay half-life in days for ``memory_search``. When > 0, hit "
+            "scores are multiplied by ``exp(-age_days / half_life_days)`` so "
+            "recent memories rank higher. Set to 0 (default) to disable decay "
+            "and keep pure semantic-similarity ordering. Reasonable values: "
+            "30 (aggressive), 90 (moderate), 365 (mild). Zero means no decay."
+        ),
+    )
 
     @field_validator("vault_path", "state_dir", mode="before")
     @classmethod
@@ -197,14 +207,17 @@ def load_config(config_path: Path | None = None) -> Config:
         "MEM_VAULT_USER_ID": "user_id",
         "MEM_VAULT_AGENT_ID": "agent_id",
         "MEM_VAULT_AUTO_EXTRACT": "auto_extract_default",
+        "MEM_VAULT_DECAY_HALF_LIFE_DAYS": "decay_half_life_days",
     }
     for env_var, field in env_map.items():
         if env_var in os.environ:
-            value: str | int | bool = os.environ[env_var]
+            value: str | int | bool | float = os.environ[env_var]
             if field == "embedder_dims":
                 value = int(value)
             elif field == "auto_extract_default":
                 value = str(value).lower() in {"1", "true", "yes", "on"}
+            elif field == "decay_half_life_days":
+                value = float(value)
             merged[field] = value
 
     cfg = Config(**merged)

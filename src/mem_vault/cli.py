@@ -7,6 +7,8 @@ Subcommands:
 - ``consolidate`` — detect + merge near-duplicate memories with the LLM.
 - ``import-engram`` — bulk-import memories from an ``engram export`` JSON file.
 - ``export`` — dump every memory to JSON / JSONL / CSV / Markdown for backup.
+- ``sync-status`` — diff between the markdown vault and the Qdrant index.
+- ``sync-watch`` — watch the vault dir and reindex memories on change (cross-vault sync).
 - ``hook-sessionstart`` — SessionStart lifecycle hook (reads stdin, prints JSON).
 - ``hook-userprompt`` — UserPromptSubmit lifecycle hook (semantic search per prompt).
 - ``hook-stop`` — Stop lifecycle hook (logs to <state_dir>/sessions.log).
@@ -73,6 +75,21 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         choices=["critical", "error", "warning", "info", "debug", "trace"],
     )
 
+    sub.add_parser(
+        "sync-status",
+        help="Diff between vault files and the local Qdrant index. Tells you if a reindex is needed.",
+    )
+    p_watch = sub.add_parser(
+        "sync-watch",
+        help="Watch the vault dir and reindex memories as their .md files change.",
+    )
+    p_watch.add_argument(
+        "--debounce",
+        type=float,
+        default=1.0,
+        help="Wait N seconds after the last write before reindexing (default 1.0).",
+    )
+
     p_export = sub.add_parser(
         "export",
         help="Export every memory to a portable file (json/jsonl/csv/markdown).",
@@ -104,6 +121,73 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=None,
         help="Filter by a single tag.",
     )
+    # ── direct CRUD: same calls the MCP server exposes, available from the shell ──
+    p_search = sub.add_parser(
+        "search",
+        help="Semantic search across memories (same as memory_search MCP tool).",
+    )
+    p_search.add_argument("query", help="Natural-language query.")
+    p_search.add_argument("-k", "--k", type=int, default=5)
+    p_search.add_argument("--type", default=None, help="Filter by memory type.")
+    p_search.add_argument("--threshold", type=float, default=0.1)
+    p_search.add_argument(
+        "--json",
+        action="store_true",
+        help="Print raw JSON instead of the human-readable summary.",
+    )
+
+    p_list = sub.add_parser(
+        "list",
+        help="List memories sorted by mtime (same as memory_list MCP tool).",
+    )
+    p_list.add_argument("--type", default=None)
+    p_list.add_argument("--tag", action="append", default=None, help="Repeatable.")
+    p_list.add_argument("--limit", type=int, default=20)
+    p_list.add_argument("--json", action="store_true")
+
+    p_save = sub.add_parser(
+        "save",
+        help="Save a new memory (same as memory_save MCP tool). Reads body from stdin if --content is omitted.",
+    )
+    p_save.add_argument("--content", default=None, help="Memory body (default: stdin).")
+    p_save.add_argument("--title", default=None)
+    p_save.add_argument(
+        "--type",
+        default="note",
+        choices=["feedback", "preference", "decision", "fact", "note", "bug", "todo"],
+    )
+    p_save.add_argument("--tag", action="append", default=None, help="Repeatable.")
+    p_save.add_argument(
+        "--visibility",
+        default=None,
+        help="'public' (default), 'private', or comma-separated agent ids.",
+    )
+    p_save.add_argument(
+        "--auto-extract",
+        action="store_true",
+        help="Run the LLM to extract / dedupe canonical facts.",
+    )
+    p_save.add_argument("--json", action="store_true")
+
+    p_get = sub.add_parser(
+        "get",
+        help="Read one memory by id (the file slug, e.g. 'feedback_local_free_stack').",
+    )
+    p_get.add_argument("id")
+    p_get.add_argument("--json", action="store_true")
+
+    p_delete = sub.add_parser(
+        "delete",
+        help="Delete a memory (file + index). Asks for confirmation unless --yes.",
+    )
+    p_delete.add_argument("id")
+    p_delete.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Skip the confirmation prompt.",
+    )
+
     sub.add_parser(
         "hook-sessionstart",
         help="SessionStart lifecycle hook: inject preferences into agent context.",
@@ -402,6 +486,161 @@ async def _reindex(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# direct CRUD (search / list / save / get / delete) — shell-friendly wrappers
+# ---------------------------------------------------------------------------
+
+
+def _print_human_search(payload: dict[str, Any]) -> None:
+    if not payload.get("ok"):
+        print(f"error: {payload.get('error')}", file=sys.stderr)
+        return
+    results = payload.get("results") or []
+    if not results:
+        print("no matches.")
+        return
+    print(f"found {payload.get('count', len(results))} matches for {payload.get('query')!r}:\n")
+    for r in results:
+        score = r.get("score")
+        score_tag = f"  (score {score:.3f})" if isinstance(score, (int, float)) else ""
+        mem = r.get("memory") or {}
+        print(f"· {mem.get('id') or r.get('id')}{score_tag}")
+        print(f"    {mem.get('name', '')}")
+        if mem.get("description"):
+            print(f"    {mem['description'][:160]}")
+        print()
+
+
+def _print_human_list(payload: dict[str, Any]) -> None:
+    if not payload.get("ok"):
+        print(f"error: {payload.get('error')}", file=sys.stderr)
+        return
+    memories = payload.get("memories") or []
+    print(f"{payload.get('count', len(memories))} memories:\n")
+    for m in memories:
+        tags = ",".join(m.get("tags") or [])
+        print(
+            f"· [{m.get('type', 'note'):>10}]  {m.get('id')}  ·  {m.get('updated', '')[:10]}  ·  #{tags}"
+        )
+        if m.get("description"):
+            print(f"    {m['description'][:120]}")
+
+
+def _print_human_get(payload: dict[str, Any]) -> None:
+    if not payload.get("ok"):
+        print(f"error: {payload.get('error')}", file=sys.stderr)
+        return
+    m = payload.get("memory") or {}
+    print(f"id:          {m.get('id')}")
+    print(f"name:        {m.get('name')}")
+    print(f"type:        {m.get('type')}")
+    print(f"tags:        {','.join(m.get('tags') or [])}")
+    print(f"created:     {m.get('created')}")
+    print(f"updated:     {m.get('updated')}")
+    print(f"agent_id:    {m.get('agent_id') or '—'}")
+    print(f"user_id:     {m.get('user_id')}")
+    print(f"visible_to:  {m.get('visible_to')}")
+    print()
+    print(m.get("body") or "")
+
+
+async def _crud(cmd: str, args: argparse.Namespace) -> int:
+    """Dispatch search / list / save / get / delete from the shell."""
+    config = load_config()
+    service = MemVaultService(config)
+
+    if cmd == "search":
+        payload = await service.search(
+            {
+                "query": args.query,
+                "k": args.k,
+                "type": args.type,
+                "threshold": args.threshold,
+            }
+        )
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            _print_human_search(payload)
+        return 0 if payload.get("ok") else 1
+
+    if cmd == "list":
+        payload = await service.list_(
+            {
+                "type": args.type,
+                "tags": args.tag,
+                "limit": args.limit,
+            }
+        )
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            _print_human_list(payload)
+        return 0 if payload.get("ok") else 1
+
+    if cmd == "save":
+        content = args.content
+        if content is None:
+            if sys.stdin.isatty():
+                print(
+                    "error: pass --content '...' or pipe the body via stdin.",
+                    file=sys.stderr,
+                )
+                return 2
+            content = sys.stdin.read()
+        if not content.strip():
+            print("error: empty content.", file=sys.stderr)
+            return 2
+
+        visibility: Any = args.visibility
+        if visibility and visibility not in {"public", "private"}:
+            visibility = [v.strip() for v in visibility.split(",") if v.strip()]
+
+        payload = await service.save(
+            {
+                "content": content,
+                "title": args.title,
+                "type": args.type,
+                "tags": args.tag,
+                "auto_extract": args.auto_extract,
+                "visible_to": visibility,
+            }
+        )
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            mem = payload.get("memory") or {}
+            print(
+                f"saved · id={mem.get('id')} · type={mem.get('type')} · indexed={payload.get('indexed')}"
+            )
+            print(f"path: {payload.get('path')}")
+        return 0 if payload.get("ok") else 1
+
+    if cmd == "get":
+        payload = await service.get({"id": args.id})
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            _print_human_get(payload)
+        return 0 if payload.get("ok") else 1
+
+    if cmd == "delete":
+        if not args.yes:
+            print(f"about to delete memory {args.id!r} (file + index entry).")
+            ans = input("type 'yes' to confirm: ").strip().lower()
+            if ans != "yes":
+                print("aborted.")
+                return 0
+        payload = await service.delete({"id": args.id})
+        if not payload.get("ok"):
+            print(f"error: {payload.get('error')}", file=sys.stderr)
+            return 1
+        print(f"deleted · removed_index_entries={payload.get('deleted_index_entries')}")
+        return 0
+
+    return 2
+
+
+# ---------------------------------------------------------------------------
 # consolidate
 # ---------------------------------------------------------------------------
 
@@ -510,6 +749,60 @@ def _export(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# sync
+# ---------------------------------------------------------------------------
+
+
+def _sync_status() -> int:
+    from mem_vault.sync import IndexLockedError, sync_status
+
+    config = load_config()
+    print(f"sync-status · vault={config.memory_dir}")
+    print(f"            · collection={config.qdrant_collection}")
+    try:
+        report = sync_status(config)
+    except IndexLockedError as exc:
+        print(f"\nERROR: {exc}", file=sys.stderr)
+        print(
+            "\nThe MCP server (`mem-vault-mcp`) holds an exclusive lock on the local "
+            "Qdrant DB. Stop your agent (Claude Code / Devin) or kill the process and "
+            "retry. The vault files themselves are unaffected.",
+            file=sys.stderr,
+        )
+        return 2
+    for line in report.to_lines():
+        print(line)
+    if report.needs_reindex:
+        print(
+            "\nIndex is out of sync with the vault. Run "
+            "`mem-vault reindex` to rebuild, or `mem-vault sync-watch` "
+            "to keep them in lockstep automatically (also requires the MCP server to be off)."
+        )
+        return 1
+    print("\nIndex is in sync with the vault.")
+    return 0
+
+
+def _sync_watch(args: argparse.Namespace) -> int:
+    from mem_vault.sync import VaultWatcher
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+        stream=sys.stderr,
+    )
+    config = load_config()
+    print(f"sync-watch · watching {config.memory_dir}", file=sys.stderr)
+    print(f"           · debounce={args.debounce}s", file=sys.stderr)
+    watcher = VaultWatcher(config, debounce_seconds=args.debounce)
+    try:
+        watcher.run()
+    except KeyboardInterrupt:
+        watcher.stop()
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # entrypoint
 # ---------------------------------------------------------------------------
 
@@ -547,8 +840,17 @@ def main() -> None:
     if cmd == "import-engram":
         sys.exit(asyncio.run(_import_engram(args)))
 
+    if cmd in {"search", "list", "save", "get", "delete"}:
+        sys.exit(asyncio.run(_crud(cmd, args)))
+
     if cmd == "export":
         sys.exit(_export(args))
+
+    if cmd == "sync-status":
+        sys.exit(_sync_status())
+
+    if cmd == "sync-watch":
+        sys.exit(_sync_watch(args))
 
     if cmd == "reindex":
         sys.exit(asyncio.run(_reindex(args)))
