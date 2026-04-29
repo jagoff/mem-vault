@@ -27,6 +27,15 @@ dependencies = [
     "qdrant-client>=1.7.0",
     "platformdirs>=4.9.6",
     "watchdog>=6.0.0",
+    # spaCy is required by mem0ai >= 2.0 for entity extraction + BM25
+    # lemmatization. Without it, every memory write/read in mem0 emits
+    # `Failed to load spaCy lemma model: spaCy is not installed` to
+    # stderr (graceful degradation, but spammy in long-running daemons
+    # like obsidian-rag's web server which mounts /memory). Pinning >=3.7
+    # to match mem0ai's nlp extra. The `en_core_web_sm` model (~12MB)
+    # is auto-downloaded at first use by mem0's `_ensure_model_available`,
+    # so we don't ship it as a separate dep.
+    "spacy>=3.7",
 ]
 
 [project.optional-dependencies]
