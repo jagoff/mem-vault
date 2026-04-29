@@ -1,0 +1,94 @@
+name: release
+
+# Publishes mem-vault to PyPI when you push a v*.*.* tag.
+#
+# Requires one-time setup on PyPI: configure "Trusted Publishing" pointing to
+# this repository + workflow + environment ``pypi`` (no API token needed,
+# uses OIDC). See:
+#   https://docs.pypi.org/trusted-publishers/
+#
+# Then to ship a release:
+#   1. Bump the version in pyproject.toml
+#   2. Update CHANGELOG.md
+#   3. git commit -am "release: v0.x.y"
+#   4. git tag v0.x.y && git push origin master --tags
+# This workflow does the rest: builds sdist + wheel, publishes to PyPI,
+# attaches them to the GitHub Release.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write    # for creating the GitHub Release
+  id-token: write    # for PyPI OIDC trusted publishing
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - run: uv python install 3.12
+
+      - name: Verify tag matches pyproject version
+        run: |
+          TAG="${GITHUB_REF##*/}"
+          TAG_VERSION="${TAG#v}"
+          PYPROJECT_VERSION=$(uv run python -c "import tomllib; print(tomllib.loads(open('pyproject.toml','rb').read().decode())['project']['version'])")
+          if [ "$TAG_VERSION" != "$PYPROJECT_VERSION" ]; then
+            echo "::error::tag $TAG_VERSION != pyproject.toml version $PYPROJECT_VERSION"
+            exit 1
+          fi
+          echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build sdist + wheel
+        run: uv build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: dist
+          path: dist/*
+
+  publish-pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: dist
+          path: dist
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: publish-pypi
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: dist
+          path: dist
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF##*/}"
+          # Pull the matching CHANGELOG section as the release notes (best-effort).
+          NOTES=$(awk -v ver="${TAG#v}" '
+            $0 ~ "^## \\[" ver "\\]" {flag=1; next}
+            flag && $0 ~ "^## \\[" {flag=0}
+            flag {print}
+          ' CHANGELOG.md)
+          if [ -z "$NOTES" ]; then NOTES="See CHANGELOG.md for details."; fi
+          gh release create "$TAG" dist/* \
+            --title "$TAG" \
+            --notes "$NOTES"

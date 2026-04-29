@@ -12,7 +12,6 @@ keywords = ["mcp", "memory", "obsidian", "ollama", "rag", "agents", "claude", "d
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -53,6 +52,9 @@ mem-vault-mcp = "mem_vault.server:main"
 [project.urls]
 Homepage = "https://github.com/jagoff/mem-vault"
 Issues = "https://github.com/jagoff/mem-vault/issues"
+Documentation = "https://github.com/jagoff/mem-vault#readme"
+Changelog = "https://github.com/jagoff/mem-vault/blob/master/CHANGELOG.md"
+Repository = "https://github.com/jagoff/mem-vault.git"
 
 [build-system]
 requires = ["uv_build>=0.11.3,<0.12.0"]

@@ -4,7 +4,9 @@ Subcommands:
 - ``serve`` (default) — start the MCP stdio server. Same as ``mem-vault-mcp``.
 - ``ui`` — start a browser UI (localhost) to browse / search / edit / delete.
 - ``reindex`` — re-embed every memory into Qdrant (after hand-edits / imports).
+- ``consolidate`` — detect + merge near-duplicate memories with the LLM.
 - ``import-engram`` — bulk-import memories from an ``engram export`` JSON file.
+- ``export`` — dump every memory to JSON / JSONL / CSV / Markdown for backup.
 - ``hook-sessionstart`` — SessionStart lifecycle hook (reads stdin, prints JSON).
 - ``hook-userprompt`` — UserPromptSubmit lifecycle hook (semantic search per prompt).
 - ``hook-stop`` — Stop lifecycle hook (logs to <state_dir>/sessions.log).
@@ -69,6 +71,38 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--log-level",
         default="info",
         choices=["critical", "error", "warning", "info", "debug", "trace"],
+    )
+
+    p_export = sub.add_parser(
+        "export",
+        help="Export every memory to a portable file (json/jsonl/csv/markdown).",
+    )
+    p_export.add_argument(
+        "format",
+        choices=["json", "jsonl", "csv", "markdown"],
+        help="Output format.",
+    )
+    p_export.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help="Write to this file. Defaults to stdout.",
+    )
+    p_export.add_argument(
+        "--no-body",
+        action="store_true",
+        help="Omit memory bodies (smaller / faster, useful for CSV inspection).",
+    )
+    p_export.add_argument(
+        "--type",
+        default=None,
+        help="Filter by memory type (e.g. preference, decision, fact).",
+    )
+    p_export.add_argument(
+        "--tag",
+        default=None,
+        help="Filter by a single tag.",
     )
     sub.add_parser(
         "hook-sessionstart",
@@ -442,6 +476,40 @@ def _consolidate(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# export
+# ---------------------------------------------------------------------------
+
+
+def _export(args: argparse.Namespace) -> int:
+    """Walk the vault, optionally filter, write to stdout or a file."""
+    from mem_vault.export import export as do_export
+
+    config = load_config()
+    storage = MemVaultService(config).storage
+
+    memories = storage.list(
+        type=args.type,
+        tags=[args.tag] if args.tag else None,
+        user_id=None,
+        limit=10**9,
+    )
+
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        with args.output.open("w", encoding="utf-8") as f:
+            do_export(memories, args.format, out=f, include_body=not args.no_body)
+        size = args.output.stat().st_size
+        print(
+            f"export done: {len(memories)} memor"
+            f"{'ies' if len(memories) != 1 else 'y'} → {args.output} ({size:,} bytes)",
+            file=sys.stderr,
+        )
+    else:
+        do_export(memories, args.format, out=sys.stdout, include_body=not args.no_body)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # entrypoint
 # ---------------------------------------------------------------------------
 
@@ -478,6 +546,9 @@ def main() -> None:
 
     if cmd == "import-engram":
         sys.exit(asyncio.run(_import_engram(args)))
+
+    if cmd == "export":
+        sys.exit(_export(args))
 
     if cmd == "reindex":
         sys.exit(asyncio.run(_reindex(args)))

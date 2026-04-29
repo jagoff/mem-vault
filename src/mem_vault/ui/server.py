@@ -229,6 +229,94 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
             tags.update(m.tags)
         return JSONResponse({"types": types, "tags": sorted(tags)})
 
+    # ----- Graph view -------------------------------------------------------
+
+    @app.get("/graph", response_class=HTMLResponse)
+    async def graph_page(request: Request):
+        cfg = service.config
+        return templates.TemplateResponse(
+            request,
+            "graph.html",
+            {
+                "version": __version__,
+                "vault_path": str(cfg.memory_dir),
+                "agent_id": cfg.agent_id or "—",
+                "collection": cfg.qdrant_collection,
+            },
+        )
+
+    @app.get("/api/graph")
+    async def graph_data(
+        min_shared_tags: int = Query(2, ge=1, le=10),
+        max_nodes: int = Query(200, ge=10, le=1000),
+    ):
+        """Build a node/edge graph for cytoscape.js.
+
+        Nodes  = memories (limited to ``max_nodes`` most recent).
+        Edges  = pairs of memories that share at least ``min_shared_tags``
+                 tags. Tag overlap is the cheap, deterministic signal — no
+                 Qdrant kNN needed. Edge weight = number of shared tags.
+
+        Tags shaped as ``project:foo`` / ``scope:bar`` are split on ``:`` and
+        only the suffix counts toward overlap, so two memories tagged
+        ``project:rag`` and ``project:rag-obsidian`` still cluster together.
+        """
+        memories = await asyncio.to_thread(
+            service.storage.list, type=None, tags=None, user_id=None, limit=max_nodes
+        )
+
+        def normalize_tag(t: str) -> str:
+            return t.split(":", 1)[-1].lower()
+
+        nodes = []
+        tag_index: dict[str, list[str]] = {}  # normalized_tag → [memory_id]
+        for m in memories:
+            normalized = {normalize_tag(t) for t in m.tags if t}
+            nodes.append(
+                {
+                    "data": {
+                        "id": m.id,
+                        "label": m.name,
+                        "type": m.type,
+                        "tags": m.tags,
+                        "agent_id": m.agent_id,
+                        "updated": m.updated,
+                        "description": m.description,
+                    }
+                }
+            )
+            for t in normalized:
+                tag_index.setdefault(t, []).append(m.id)
+
+        # Build edges from tag co-occurrence. We compute pair → shared-tag-set
+        # incrementally to avoid O(N²) over all memories.
+        pair_tags: dict[tuple[str, str], set[str]] = {}
+        for tag, ids in tag_index.items():
+            if len(ids) < 2 or len(ids) > 50:  # huge cliques produce noise
+                continue
+            for i, a in enumerate(ids):
+                for b in ids[i + 1 :]:
+                    key = (a, b) if a < b else (b, a)
+                    pair_tags.setdefault(key, set()).add(tag)
+
+        edges = []
+        for (a, b), tags in pair_tags.items():
+            if len(tags) < min_shared_tags:
+                continue
+            edges.append(
+                {
+                    "data": {
+                        "id": f"{a}__{b}",
+                        "source": a,
+                        "target": b,
+                        "weight": len(tags),
+                        "shared": sorted(tags),
+                    }
+                }
+            )
+
+        return JSONResponse({"nodes": nodes, "edges": edges})
+
     return app
 
 

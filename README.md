@@ -362,9 +362,23 @@ What you get:
 - save → re-indexes the memory and refreshes the row
 - delete → removes the `.md` file + every embedding pointing to it
 
-Stack: FastAPI server-rendered + HTMX (~14 KB) + Pico-style hand-rolled CSS.
-No build step, no SPA framework, no JavaScript bundler. The whole UI is
-~10 KB of HTML + ~14 KB of CSS.
+### Graph view
+
+Open `/graph` in the same UI to see the vault as a force-directed graph:
+
+- **Nodes**: every memory, colored by type.
+- **Edges**: pairs of memories that share at least N normalized tags
+  (default 2). Tags shaped as `project:foo` are split on `:` so
+  `project:rag` and `project:rag-obsidian` cluster together.
+- Sliders let you tune edge threshold (1-5 shared tags) and node cap
+  (20-500 most-recent).
+- Click a node → detail card with description, tags, agent, last update.
+- Renders [Cytoscape.js](https://js.cytoscape.org/) with the cose
+  force-directed layout. Smooth up to ~500 nodes.
+
+Stack: FastAPI server-rendered + HTMX (~14 KB) + Cytoscape.js (~250 KB,
+graph view only) + hand-rolled CSS. No build step, no SPA framework, no
+JavaScript bundler.
 
 The UI dependencies are shipped as an optional extra:
 
@@ -438,6 +452,29 @@ mem-vault reindex --limit 20       # debugging: stop after N memories
 ```
 
 A reindex of ~50 memories takes ~10 s on bge-m3 + Apple Silicon.
+
+## Export (backup, migration, or feed-the-LLM)
+
+Dump every memory to a portable file:
+
+```bash
+mem-vault export json    -o backup.json         # one JSON object, full data
+mem-vault export jsonl   -o backup.jsonl        # one memory per line
+mem-vault export csv     -o backup.csv          # spreadsheet-friendly
+mem-vault export markdown -o backup.md          # one document, all bodies
+```
+
+Filters and trimming:
+
+```bash
+mem-vault export json --type preference          # only preferences
+mem-vault export jsonl --tag rag-obsidian        # only one tag
+mem-vault export csv --no-body -o lite.csv       # drop bodies, keep metadata
+```
+
+The `json` and `jsonl` outputs include enough metadata to round-trip back
+into a future importer (out of scope for v0.1). The `markdown` format is
+useful for pasting the entire vault into one LLM prompt for analysis.
 
 ## Migrating from engram
 
@@ -529,6 +566,9 @@ is your knowledge graph** and you want the agent's memory to live inside it.
 - [x] Per-agent visibility scopes — `visible_to: ["*" | [] | ["agent-a", ...]]`
 - [x] Memory consolidation (LLM pass that merges near-duplicates) — `mem-vault consolidate`
 - [x] Browser UI for triage (FastAPI + HTMX) — `mem-vault ui`
+- [x] Graph visualization (Cytoscape.js, tag co-occurrence edges) — `/graph` route
+- [x] Export to JSON / JSONL / CSV / Markdown for backup — `mem-vault export`
+- [x] PyPI release pipeline — `.github/workflows/release.yml` (Trusted Publishing on tag)
 - [ ] Cross-vault sync (sharing memories between machines beyond iCloud)
 - [ ] Time-decay scoring for `memory_search` (recent memories rank higher)
 - [ ] `UserPromptSubmit` skip rules for non-Spanish/English prompts (locale-aware)

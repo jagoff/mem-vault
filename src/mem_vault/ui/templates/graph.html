@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>mem-vault · graph</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/graph.css" />
+  <script src="https://unpkg.com/[email protected]/dist/cytoscape.min.js" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/htmx.org@2.0.4" crossorigin="anonymous"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-name">mem-vault</span>
+      <span class="brand-version">v{{ version }}</span>
+    </div>
+    <nav class="navlinks">
+      <a href="/">list</a>
+      <span class="dot">·</span>
+      <a href="/graph" class="active">graph</a>
+    </nav>
+    <div class="meta">
+      <span class="kbd">{{ vault_path }}</span>
+      <span class="dot">·</span>
+      <span>collection · <code>{{ collection }}</code></span>
+    </div>
+  </header>
+
+  <main class="graph-main">
+    <aside class="graph-controls">
+      <div class="control-group">
+        <label for="min-shared-tags">edge threshold</label>
+        <input type="range"
+               id="min-shared-tags"
+               min="1"
+               max="5"
+               step="1"
+               value="2" />
+        <div class="control-meta">
+          ≥ <span id="min-shared-tags-value">2</span> shared tag(s)
+        </div>
+      </div>
+      <div class="control-group">
+        <label for="max-nodes">max nodes</label>
+        <input type="range"
+               id="max-nodes"
+               min="20"
+               max="500"
+               step="20"
+               value="200" />
+        <div class="control-meta">
+          <span id="max-nodes-value">200</span> most-recent
+        </div>
+      </div>
+      <button id="reload" class="primary">reload</button>
+      <button id="fit" class="ghost">fit</button>
+
+      <div class="legend">
+        <h4>type</h4>
+        <span class="leg type-feedback">feedback</span>
+        <span class="leg type-preference">preference</span>
+        <span class="leg type-decision">decision</span>
+        <span class="leg type-fact">fact</span>
+        <span class="leg type-note">note</span>
+        <span class="leg type-bug">bug</span>
+        <span class="leg type-todo">todo</span>
+      </div>
+
+      <div class="graph-stats" id="graph-stats">
+        <span class="stat-pill">loading…</span>
+      </div>
+    </aside>
+
+    <div id="cy" class="graph-canvas"></div>
+
+    <aside class="graph-detail" id="graph-detail">
+      <div class="empty">click a node to inspect a memory</div>
+    </aside>
+  </main>
+
+  <script>
+    const TYPE_COLORS = {
+      feedback:   '#fbbf24',
+      preference: '#a78bfa',
+      decision:   '#38bdf8',
+      fact:       '#4ade80',
+      note:       '#94a3b8',
+      bug:        '#f87171',
+      todo:       '#f472b6',
+      reference:  '#22d3ee',
+    };
+    const FALLBACK_COLOR = '#94a3b8';
+
+    let cy = null;
+
+    function renderGraph(payload) {
+      const { nodes, edges } = payload;
+      const elements = [...nodes, ...edges];
+
+      if (cy) cy.destroy();
+      cy = cytoscape({
+        container: document.getElementById('cy'),
+        elements,
+        wheelSensitivity: 0.2,
+        minZoom: 0.2,
+        maxZoom: 3,
+        style: [
+          {
+            selector: 'node',
+            style: {
+              'background-color': (e) => TYPE_COLORS[e.data('type')] || FALLBACK_COLOR,
+              'label': (e) => (e.data('label') || '').slice(0, 32),
+              'font-family': 'ui-sans-serif, -apple-system, Inter, sans-serif',
+              'font-size': '10px',
+              'color': '#cbd5e1',
+              'text-valign': 'bottom',
+              'text-margin-y': 6,
+              'text-wrap': 'wrap',
+              'text-max-width': 120,
+              'width': 16,
+              'height': 16,
+              'border-width': 0,
+              'transition-property': 'background-color, border-width, border-color, width, height',
+              'transition-duration': '160ms',
+            },
+          },
+          {
+            selector: 'node:selected',
+            style: {
+              'border-width': 3,
+              'border-color': '#7dd3fc',
+              'width': 22,
+              'height': 22,
+              'color': '#fff',
+            },
+          },
+          {
+            selector: 'edge',
+            style: {
+              'line-color': '#3a3a4a',
+              'opacity': (e) => Math.min(0.25 + 0.15 * e.data('weight'), 0.85),
+              'width': (e) => Math.min(0.5 + 0.4 * e.data('weight'), 3),
+              'curve-style': 'bezier',
+              'target-arrow-shape': 'none',
+              'transition-property': 'line-color, opacity',
+              'transition-duration': '160ms',
+            },
+          },
+          {
+            selector: 'edge:selected',
+            style: {
+              'line-color': '#7dd3fc',
+              'opacity': 1,
+            },
+          },
+        ],
+        layout: {
+          name: 'cose',
+          animate: false,
+          fit: true,
+          padding: 40,
+          nodeRepulsion: () => 8000,
+          idealEdgeLength: () => 80,
+          nodeOverlap: 8,
+          gravity: 0.6,
+        },
+      });
+
+      cy.on('tap', 'node', (evt) => showNodeDetail(evt.target.data()));
+      cy.on('tap', (evt) => {
+        if (evt.target === cy) clearDetail();
+      });
+
+      const stats = document.getElementById('graph-stats');
+      stats.innerHTML = `
+        <span class="stat-pill">${nodes.length} nodes</span>
+        <span class="stat-pill">${edges.length} edges</span>
+      `;
+    }
+
+    function showNodeDetail(d) {
+      const el = document.getElementById('graph-detail');
+      const tagPills = (d.tags || [])
+        .map((t) => `<span class="tag">#${t}</span>`)
+        .join(' ');
+      el.innerHTML = `
+        <div class="detail-card">
+          <header>
+            <span class="type type-${d.type}">${d.type}</span>
+            <h3>${escapeHTML(d.label)}</h3>
+          </header>
+          ${d.description ? `<p>${escapeHTML(d.description)}</p>` : ''}
+          <div class="detail-tags">${tagPills}</div>
+          <footer>
+            <code>${d.id}</code>
+            ${d.agent_id ? `<span>@${d.agent_id}</span>` : ''}
+            ${d.updated ? `<span>${d.updated.slice(0, 10)}</span>` : ''}
+          </footer>
+          <a href="/" class="open-list">open in list view →</a>
+        </div>
+      `;
+    }
+
+    function clearDetail() {
+      document.getElementById('graph-detail').innerHTML =
+        '<div class="empty">click a node to inspect a memory</div>';
+    }
+
+    function escapeHTML(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+      })[c]);
+    }
+
+    async function reload() {
+      const minTags = document.getElementById('min-shared-tags').value;
+      const maxNodes = document.getElementById('max-nodes').value;
+      document.getElementById('graph-stats').innerHTML =
+        '<span class="stat-pill">loading…</span>';
+      const res = await fetch(`/api/graph?min_shared_tags=${minTags}&max_nodes=${maxNodes}`);
+      const payload = await res.json();
+      renderGraph(payload);
+    }
+
+    document.getElementById('reload').addEventListener('click', reload);
+    document.getElementById('fit').addEventListener('click', () => cy && cy.fit(40));
+    document.getElementById('min-shared-tags').addEventListener('input', (e) => {
+      document.getElementById('min-shared-tags-value').textContent = e.target.value;
+    });
+    document.getElementById('max-nodes').addEventListener('input', (e) => {
+      document.getElementById('max-nodes-value').textContent = e.target.value;
+    });
+    document.getElementById('min-shared-tags').addEventListener('change', reload);
+    document.getElementById('max-nodes').addEventListener('change', reload);
+
+    reload();
+  </script>
+</body>
+</html>
