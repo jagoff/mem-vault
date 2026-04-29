@@ -12,10 +12,23 @@ Ollama runs on localhost. No API keys are required or read.
 from __future__ import annotations
 
 import os
+import sys
 import tomllib
 from pathlib import Path
 
+from platformdirs import user_data_dir
 from pydantic import BaseModel, Field, field_validator
+
+
+def _default_state_dir() -> Path:
+    """Cross-platform XDG-style state directory.
+
+    - macOS: ``~/Library/Application Support/mem-vault``
+    - Linux: ``~/.local/share/mem-vault`` (respects ``$XDG_DATA_HOME``)
+    - Windows: ``%LOCALAPPDATA%\\mem-vault\\mem-vault`` (the double name is
+      platformdirs' convention to namespace by author/app — we accept it)
+    """
+    return Path(user_data_dir("mem-vault", appauthor=False))
 
 
 class Config(BaseModel):
@@ -29,12 +42,23 @@ class Config(BaseModel):
         ),
     )
     memory_subdir: str = Field(
-        default="04-Archive/99-obsidian-system/99-AI/memory",
-        description="Subdir relative to ``vault_path`` where .md memory files live.",
+        default="mem-vault",
+        description=(
+            "Subdir relative to ``vault_path`` where .md memory files live. "
+            "Default ``mem-vault`` keeps memories self-contained in their own "
+            "folder. Override with whatever fits your vault structure — e.g. "
+            "``99-system/memory`` or ``inbox/agent-memories``."
+        ),
     )
     state_dir: Path = Field(
-        default_factory=lambda: Path.home() / ".local" / "share" / "mem-vault",
-        description="Local non-vault state (Qdrant collection, history sqlite, logs).",
+        default_factory=_default_state_dir,
+        description=(
+            "Local non-vault state (Qdrant collection, history sqlite, logs). "
+            "Defaults to the platform-appropriate user data dir: "
+            "``~/Library/Application Support/mem-vault`` on macOS, "
+            "``~/.local/share/mem-vault`` on Linux, "
+            "``%LOCALAPPDATA%\\\\mem-vault\\\\mem-vault`` on Windows."
+        ),
     )
     ollama_host: str = Field(
         default="http://localhost:11434",
@@ -95,18 +119,36 @@ class Config(BaseModel):
         return self.state_dir / "history.db"
 
 
-def _resolve_vault_path(raw: str | None) -> Path | None:
-    """Try a few well-known iCloud-Obsidian paths if the user didn't set one."""
-    if raw:
-        return Path(raw).expanduser()
+def _vault_candidates() -> list[Path]:
+    """Likely Obsidian vault locations to try when the user didn't set one.
+
+    Cross-platform: includes the macOS iCloud-Obsidian path, Linux/macOS
+    common manual paths, and Windows ``%USERPROFILE%`` paths (which
+    ``Path.home()`` already returns on Windows).
+    """
     home = Path.home()
     candidates = [
-        home / "Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes",
+        # macOS — iCloud-synced Obsidian vault (the most common setup)
+        home / "Library" / "Mobile Documents" / "iCloud~md~obsidian" / "Documents" / "Notes",
+        # cross-platform — user typed `~/Obsidian` or `~/Notes` themselves
         home / "Obsidian",
-        home / "Documents/Obsidian",
+        home / "Documents" / "Obsidian",
         home / "Notes",
+        home / "Documents" / "Notes",
     ]
-    for c in candidates:
+    if sys.platform.startswith("win"):
+        candidates += [
+            home / "OneDrive" / "Obsidian",
+            home / "OneDrive" / "Documents" / "Obsidian",
+        ]
+    return candidates
+
+
+def _resolve_vault_path(raw: str | None) -> Path | None:
+    """Pick a vault path: explicit value > first existing candidate > None."""
+    if raw:
+        return Path(raw).expanduser()
+    for c in _vault_candidates():
         if c.exists() and c.is_dir():
             return c
     return None
@@ -139,7 +181,7 @@ def load_config(config_path: Path | None = None) -> Config:
     if vault_path is None:
         raise ValueError(
             "No vault_path configured. Set MEM_VAULT_PATH (or OBSIDIAN_VAULT_PATH) "
-            "env var, or create ~/.config/mem-vault/config.toml with `vault_path = \"...\"`."
+            'env var, or create ~/.config/mem-vault/config.toml with `vault_path = "..."`.'
         )
 
     merged: dict = {**file_data, "vault_path": str(vault_path)}
@@ -167,9 +209,7 @@ def load_config(config_path: Path | None = None) -> Config:
 
     cfg = Config(**merged)
     if cfg.qdrant_collection is None:
-        cfg.qdrant_collection = (
-            f"mem_vault_{cfg.agent_id}" if cfg.agent_id else "mem_vault"
-        )
+        cfg.qdrant_collection = f"mem_vault_{cfg.agent_id}" if cfg.agent_id else "mem_vault"
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.qdrant_path.mkdir(parents=True, exist_ok=True)
     cfg.memory_dir.mkdir(parents=True, exist_ok=True)

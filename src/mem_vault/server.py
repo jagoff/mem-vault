@@ -281,12 +281,16 @@ class MemVaultService:
                 continue
             seen_ids.add(mem_id)
             mem = await self._to_thread(self.storage.get, mem_id)
-            results.append({
-                "id": mem_id,
-                "score": hit.get("score") if isinstance(hit, dict) else None,
-                "memory": mem.to_dict() if mem else None,
-                "snippet": hit.get("memory") or hit.get("text") if isinstance(hit, dict) else None,
-            })
+            results.append(
+                {
+                    "id": mem_id,
+                    "score": hit.get("score") if isinstance(hit, dict) else None,
+                    "memory": mem.to_dict() if mem else None,
+                    "snippet": hit.get("memory") or hit.get("text")
+                    if isinstance(hit, dict)
+                    else None,
+                }
+            )
 
         return {"ok": True, "query": query, "count": len(results), "results": results}
 
@@ -331,9 +335,7 @@ class MemVaultService:
         if args.get("content") is not None:
             user_id = self.config.user_id
             try:
-                await self._to_thread(
-                    self.index.delete_by_metadata, "memory_id", mem.id, user_id
-                )
+                await self._to_thread(self.index.delete_by_metadata, "memory_id", mem.id, user_id)
                 await self._to_thread(
                     self.index.add,
                     mem.body,
@@ -395,7 +397,9 @@ def _build_server(service: MemVaultService) -> Server:
             except Exception as exc:
                 logger.exception("tool %s failed", name)
                 payload = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        return [types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
+        return [
+            types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))
+        ]
 
     return server
 

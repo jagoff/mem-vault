@@ -26,7 +26,10 @@ slug — they round-trip cleanly through the MCP tools and double as filenames.
 
 from __future__ import annotations
 
+import io
+import os
 import re
+import tempfile
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -103,6 +106,62 @@ def slugify(text: str, max_len: int = 64) -> str:
 
 def _now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` atomically.
+
+    Strategy: write to a temp file in the same directory, ``fsync`` it, then
+    ``os.replace`` it to the final name. ``os.replace`` is atomic on POSIX
+    (single ``rename(2)`` syscall) and "as atomic as the OS allows" on
+    Windows (``MoveFileExW`` with ``REPLACE_EXISTING``). Because the temp
+    file lives in the same directory as the target, the rename never crosses
+    filesystem boundaries (which would silently degrade to copy+unlink).
+
+    Why this matters: without it, a process crash mid-write can leave a
+    half-written ``.md`` on disk — frontmatter truncated, body cut off mid-
+    line. With ``os.replace``, the target either points at the old contents
+    or the fully-written new contents, never something in between.
+
+    Notes for syncing filesystems (iCloud, Syncthing, Dropbox):
+    - The temp file is named ``.<target>.<random>.tmp`` (leading dot) so
+      most sync clients ignore it as a hidden file. Some clients still
+      upload it briefly before the rename — that's harmless, just noisy.
+    - We don't ``fsync`` the parent directory after the rename. On Linux
+      that's recommended for full crash-durability, but it costs a
+      noticeable I/O hit on iCloud-mounted dirs and the use case here
+      (memory snapshot, recoverable from `mem-vault reindex`) doesn't need
+      strict durability.
+    """
+    path = Path(path)
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(parent),
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                # fsync can fail on some network/synced FSes (e.g. SMB,
+                # certain iCloud edge cases). Keep going — we still get
+                # the rename atomicity, just without strict durability.
+                pass
+        os.replace(tmp_path, path)
+    except Exception:
+        # On any failure, try to remove the temp file so we don't leak
+        # ``.something.tmp`` files into the user's vault.
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 class VaultStorage:
@@ -246,8 +305,17 @@ class VaultStorage:
         meta = dict(post.metadata)
         # Strip well-known keys; everything else lands in `extra`.
         known = {
-            "name", "description", "type", "tags", "created", "updated",
-            "agent_id", "user_id", "origin_session_id", "originSessionId", "contradicts",
+            "name",
+            "description",
+            "type",
+            "tags",
+            "created",
+            "updated",
+            "agent_id",
+            "user_id",
+            "origin_session_id",
+            "originSessionId",
+            "contradicts",
         }
         # accept legacy "originSessionId" camelCase from existing files
         origin = meta.pop("origin_session_id", None) or meta.pop("originSessionId", None)
@@ -270,7 +338,8 @@ class VaultStorage:
 
     def _write(self, mem: Memory) -> None:
         post = frontmatter.Post(content=mem.body, **mem.to_frontmatter())
-        path = self.path_for(mem.id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("wb") as f:
-            frontmatter.dump(post, f)
+        # Serialize to bytes first so an exception while rendering the
+        # frontmatter doesn't leave a partially-written file behind.
+        buf = io.BytesIO()
+        frontmatter.dump(post, buf)
+        atomic_write_bytes(self.path_for(mem.id), buf.getvalue())

@@ -80,23 +80,23 @@ export MEM_VAULT_PATH="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documen
 Or the TOML version:
 
 ```toml
-# ~/.config/mem-vault/config.toml
-vault_path = "/Users/fer/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes"
-memory_subdir = "04-Archive/99-obsidian-system/99-AI/memory"  # default
-llm_model = "qwen2.5:3b"          # override with qwen2.5:7b for sharper extraction
+# ~/.config/mem-vault/config.toml  (or %APPDATA%\mem-vault\config.toml on Windows)
+vault_path = "/path/to/your/Obsidian/Vault"
+memory_subdir = "mem-vault"       # subfolder inside the vault — change to taste
+llm_model = "qwen2.5:3b"          # bump to qwen2.5:7b for sharper extraction
 embedder_model = "bge-m3:latest"
 embedder_dims = 1024
-qdrant_collection = "mem_vault"
+qdrant_collection = "mem_vault"   # auto: "mem_vault_<agent_id>" if agent_id set
 user_id = "default"
-agent_id = "devin"                # optional — stamped on every memory
+agent_id = "claude-code"          # optional — stamped on every memory
 auto_extract_default = false      # opt-in LLM dedup; default off for predictability
 ```
 
 | Env var | Field | Default |
 | --- | --- | --- |
-| `MEM_VAULT_PATH` (or `OBSIDIAN_VAULT_PATH`) | `vault_path` | auto-detect iCloud vault |
-| `MEM_VAULT_MEMORY_SUBDIR` | `memory_subdir` | `04-Archive/99-obsidian-system/99-AI/memory` |
-| `MEM_VAULT_STATE_DIR` | `state_dir` | `~/.local/share/mem-vault` |
+| `MEM_VAULT_PATH` (or `OBSIDIAN_VAULT_PATH`) | `vault_path` | auto-detected from common locations (see below) |
+| `MEM_VAULT_MEMORY_SUBDIR` | `memory_subdir` | `mem-vault` |
+| `MEM_VAULT_STATE_DIR` | `state_dir` | platform user-data dir (see below) |
 | `MEM_VAULT_OLLAMA_HOST` | `ollama_host` | `http://localhost:11434` |
 | `MEM_VAULT_LLM_MODEL` | `llm_model` | `qwen2.5:3b` |
 | `MEM_VAULT_EMBEDDER_MODEL` | `embedder_model` | `bge-m3:latest` |
@@ -105,6 +105,21 @@ auto_extract_default = false      # opt-in LLM dedup; default off for predictabi
 | `MEM_VAULT_USER_ID` | `user_id` | `default` |
 | `MEM_VAULT_AGENT_ID` | `agent_id` | `null` |
 | `MEM_VAULT_AUTO_EXTRACT` | `auto_extract_default` | `false` |
+
+**Vault auto-detection** (when `MEM_VAULT_PATH` is unset). First match wins:
+
+- `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes` (macOS, iCloud-synced Obsidian)
+- `~/Obsidian`
+- `~/Documents/Obsidian`
+- `~/Notes`
+- `~/Documents/Notes`
+- `~/OneDrive/Obsidian`, `~/OneDrive/Documents/Obsidian` (Windows)
+
+**State dir** (where the Qdrant index + audit log live):
+
+- macOS: `~/Library/Application Support/mem-vault`
+- Linux: `~/.local/share/mem-vault` (respects `$XDG_DATA_HOME`)
+- Windows: `%LOCALAPPDATA%\mem-vault\mem-vault`
 
 ## Connect your agent
 
@@ -275,7 +290,17 @@ Each engram observation becomes one `.md` file in your vault, tagged
 trace it back. Pass `--auto-extract` to additionally run the LLM extractor and
 let mem0 dedupe against any memories you already had.
 
-## Smoke test
+## Tests
+
+Unit tests covering storage atomicity, slugify normalization, config
+resolution, and concurrency safety:
+
+```bash
+uv run pytest tests/ -v
+# 40 passed in ~1.4s
+```
+
+End-to-end smoke test against a live Ollama:
 
 ```bash
 uv run python scripts/smoketest.py            # full cycle, including LLM
@@ -284,24 +309,34 @@ uv run python scripts/smoketest.py --skip-llm # skip auto_extract path
 
 Expected output ends with `ALL CHECKS PASSED`.
 
+### Atomic writes
+
+Every memory write goes through `atomic_write_bytes` (`storage.py`): the
+file is written to a sibling temp file, `fsync`'d, then `os.replace`'d into
+place. On POSIX this is a single `rename(2)` syscall — guaranteed atomic.
+On Windows it maps to `MoveFileExW` with `REPLACE_EXISTING`. A reader
+that opens the file mid-write sees either the old contents or the new
+contents, never a partial mix. Verified by `test_atomic_write_no_partial_on_concurrent_reads`.
+
 ## Storage layout
 
 ```
-<vault>/04-Archive/99-obsidian-system/99-AI/memory/
+<vault>/<memory_subdir>/        # e.g. <vault>/mem-vault/  (default)
 ├── feedback_local_free_stack.md
 ├── preference_idioma_rioplatense.md
 ├── decision_100_local_stack.md
 └── …
 
-~/.local/share/mem-vault/
-├── qdrant/                      # embedded vector store (one collection per agent_id is possible)
-│   └── collection/mem_vault/
+<state_dir>/                    # platform-appropriate user-data dir
+├── qdrant/                      # embedded vector store (one collection per agent_id)
+│   └── collection/<qdrant_collection>/
 └── history.db                   # mem0 audit log of ADD/UPDATE/DELETE events
 ```
 
 The vault stores the **source of truth** in markdown. The local Qdrant
-collection is a **derived index** — if it ever gets corrupted, delete
-`~/.local/share/mem-vault/qdrant` and re-save the memories.
+collection is a **derived index** — if it ever gets corrupted, run
+`mem-vault reindex --purge` and the index rebuilds from the markdown
+files in seconds.
 
 ## Comparison with neighbours
 

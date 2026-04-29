@@ -29,8 +29,8 @@ from typing import Any
 
 from mem_vault import __version__
 from mem_vault.config import load_config
-from mem_vault.server import MemVaultService, main as serve_main
-
+from mem_vault.server import MemVaultService
+from mem_vault.server import main as serve_main
 
 _ENGRAM_TYPE_MAP = {
     "setup": "fact",
@@ -355,16 +355,19 @@ def main() -> None:
 
     if cmd == "hook-sessionstart":
         from mem_vault.hooks import sessionstart  # local import to keep startup fast
+
         sessionstart.run()
         return
 
     if cmd == "hook-userprompt":
         from mem_vault.hooks import userprompt  # local import to keep startup fast
+
         userprompt.run()
         return
 
     if cmd == "hook-stop":
         from mem_vault.hooks import stop  # local import to keep startup fast
+
         stop.run()
         return
 

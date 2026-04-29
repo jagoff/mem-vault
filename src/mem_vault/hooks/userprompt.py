@@ -63,11 +63,13 @@ async def _gather_context(prompt: str) -> str:
 
     service = MemVaultService(config)
     try:
-        result = await service.search({
-            "query": prompt,
-            "k": TOP_K,
-            "threshold": THRESHOLD,
-        })
+        result = await service.search(
+            {
+                "query": prompt,
+                "k": TOP_K,
+                "threshold": THRESHOLD,
+            }
+        )
     except Exception as exc:
         print(f"mem-vault: search failed: {exc}", file=sys.stderr)
         return ""
@@ -87,9 +89,7 @@ async def _gather_context(prompt: str) -> str:
 
     if len(lines) <= 1:
         return ""
-    lines.append(
-        "\n_Si necesitás el cuerpo completo de alguna, llamá a `memory_get` con su id._"
-    )
+    lines.append("\n_Si necesitás el cuerpo completo de alguna, llamá a `memory_get` con su id._")
     return "\n".join(lines)
 
 

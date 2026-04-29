@@ -1,0 +1,50 @@
+name: tests
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Sync dependencies (with dev extras)
+        run: uv sync --extra dev
+
+      - name: Run unit tests
+        run: uv run pytest tests/ -v --tb=short
+        # No Ollama on CI, so we skip the live smoketest. The unit tests
+        # cover storage atomicity, slugify, config resolution, and
+        # concurrency safety — none of which need a model server.
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --extra dev
+      - name: Ruff format check
+        run: uv run ruff format --check src tests
+      - name: Ruff lint
+        run: uv run ruff check src tests
