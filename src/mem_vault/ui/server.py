@@ -229,6 +229,73 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
             tags.update(m.tags)
         return JSONResponse({"types": types, "tags": sorted(tags)})
 
+    # ----- API v1: JSON endpoints for the MCP / CLI remote client ----------
+    # These exist alongside the HTMX endpoints above. They expose the exact
+    # same shape that ``MemVaultService`` returns when called in-process, so
+    # ``mem_vault.remote.RemoteMemVaultService`` can be a drop-in HTTP-backed
+    # replacement when the MCP server has its own Qdrant locked out by the
+    # web server.
+
+    @app.get("/api/v1/search")
+    async def api_v1_search(
+        query: str,
+        k: int = Query(5, ge=1, le=50),
+        type: str | None = None,
+        threshold: float = Query(0.1, ge=0.0, le=1.0),
+        user_id: str | None = None,
+        viewer_agent_id: str | None = None,
+    ):
+        return JSONResponse(
+            await service.search(
+                {
+                    "query": query,
+                    "k": k,
+                    "type": type,
+                    "threshold": threshold,
+                    "user_id": user_id,
+                    "viewer_agent_id": viewer_agent_id,
+                }
+            )
+        )
+
+    @app.get("/api/v1/list")
+    async def api_v1_list(
+        type: str | None = None,
+        tag: list[str] | None = Query(default=None),
+        user_id: str | None = None,
+        viewer_agent_id: str | None = None,
+        limit: int = Query(20, ge=1, le=200),
+    ):
+        return JSONResponse(
+            await service.list_(
+                {
+                    "type": type,
+                    "tags": tag,
+                    "user_id": user_id,
+                    "viewer_agent_id": viewer_agent_id,
+                    "limit": limit,
+                }
+            )
+        )
+
+    @app.get("/api/v1/memories/{mem_id}")
+    async def api_v1_get(mem_id: str):
+        return JSONResponse(await service.get({"id": mem_id}))
+
+    @app.post("/api/v1/memories")
+    async def api_v1_save(payload: dict[str, Any]):
+        return JSONResponse(await service.save(payload))
+
+    @app.patch("/api/v1/memories/{mem_id}")
+    async def api_v1_update(mem_id: str, payload: dict[str, Any]):
+        payload = dict(payload)
+        payload["id"] = mem_id
+        return JSONResponse(await service.update(payload))
+
+    @app.delete("/api/v1/memories/{mem_id}")
+    async def api_v1_delete(mem_id: str):
+        return JSONResponse(await service.delete({"id": mem_id}))
+
     # ----- Graph view -------------------------------------------------------
 
     @app.get("/graph", response_class=HTMLResponse)

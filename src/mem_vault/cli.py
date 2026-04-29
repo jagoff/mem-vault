@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import sys
 from pathlib import Path
 from typing import Any
@@ -544,9 +545,15 @@ def _print_human_get(payload: dict[str, Any]) -> None:
 
 
 async def _crud(cmd: str, args: argparse.Namespace) -> int:
-    """Dispatch search / list / save / get / delete from the shell."""
-    config = load_config()
-    service = MemVaultService(config)
+    """Dispatch search / list / save / get / delete from the shell.
+
+    Respects ``MEM_VAULT_REMOTE_URL`` — when set, talks to the remote web
+    server instead of opening Qdrant locally. That means the same commands
+    work even when the obsidian-rag web server is holding the Qdrant lock.
+    """
+    from mem_vault.server import build_service
+
+    service = build_service()
 
     if cmd == "search":
         payload = await service.search(

@@ -20,19 +20,16 @@ import sys
 
 async def _gather_context() -> str:
     try:
-        from mem_vault.config import load_config
-        from mem_vault.server import MemVaultService
+        from mem_vault.server import build_service
     except Exception as exc:
         print(f"mem-vault: import failed: {exc}", file=sys.stderr)
         return ""
 
     try:
-        config = load_config()
+        service = build_service()
     except Exception as exc:
-        print(f"mem-vault: config load failed: {exc}", file=sys.stderr)
+        print(f"mem-vault: service init failed: {exc}", file=sys.stderr)
         return ""
-
-    service = MemVaultService(config)
 
     sections: dict[str, list[dict]] = {"preferences": [], "recent": []}
     try:

@@ -408,7 +408,7 @@ class MemVaultService:
 # ---------------------------------------------------------------------------
 
 
-def _build_server(service: MemVaultService) -> Server:
+def _build_server(service: Any) -> Server:
     server: Server = Server(SERVER_NAME, version=SERVER_VERSION)
 
     handlers = {
@@ -443,22 +443,56 @@ def _build_server(service: MemVaultService) -> Server:
     return server
 
 
+def build_service(config: Any | None = None):
+    """Pick between in-process MemVaultService and the HTTP RemoteMemVaultService.
+
+    When ``MEM_VAULT_REMOTE_URL`` is set we route every call through HTTP to
+    a long-lived web server that owns the Qdrant lock. This is what makes
+    the MCP server (spawned per tool call by Devin) coexist peacefully with
+    the obsidian-rag web server's mounted ``/memory`` UI.
+
+    The function is the single dispatch point for the CLI, the MCP server,
+    and the lifecycle hooks — keep it that way.
+    """
+    remote = os.environ.get("MEM_VAULT_REMOTE_URL", "").strip()
+    if remote:
+        from mem_vault.remote import RemoteMemVaultService  # local import: optional dep
+
+        return RemoteMemVaultService(remote, config=config)
+    if config is None:
+        config = load_config()
+    return MemVaultService(config)
+
+
 async def _amain() -> None:
     logging.basicConfig(
         level=os.environ.get("MEM_VAULT_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s — %(message)s",
         stream=sys.stderr,
     )
-    config = load_config()
-    logger.info(
-        "mem-vault starting · vault=%s · ollama=%s · llm=%s · embedder=%s · collection=%s",
-        config.vault_path,
-        config.ollama_host,
-        config.llm_model,
-        config.embedder_model,
-        config.qdrant_collection,
-    )
-    service = MemVaultService(config)
+    remote = os.environ.get("MEM_VAULT_REMOTE_URL", "").strip()
+    if remote:
+        # Remote mode: we don't need vault config at all — the remote
+        # server is the one that holds it. We still try to ``load_config``
+        # so the user gets a clear error if something is missing, but we
+        # tolerate the failure (vault path is irrelevant to remote calls).
+        logger.info("mem-vault starting (remote mode) · base_url=%s", remote)
+        try:
+            config = load_config()
+        except Exception:
+            config = None
+        service = build_service(config)
+    else:
+        config = load_config()
+        logger.info(
+            "mem-vault starting (local mode) · vault=%s · ollama=%s · llm=%s · embedder=%s · collection=%s",
+            config.vault_path,
+            config.ollama_host,
+            config.llm_model,
+            config.embedder_model,
+            config.qdrant_collection,
+        )
+        service = build_service(config)
     server = _build_server(service)
     async with mcp.server.stdio.stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())

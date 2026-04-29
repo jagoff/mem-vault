@@ -67,7 +67,9 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
-ignore = ["E501"]
+# E501 — line length is enforced softly by ruff format; we don't fail on it.
+# B008 — fastapi/typer/click APIs commonly use `param=Query(...)` as defaults.
+ignore = ["E501", "B008"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
