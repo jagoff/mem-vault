@@ -50,42 +50,55 @@ async def run(skip_llm: bool = False) -> int:
         service = MemVaultService(config)
 
         # 1) literal save (no LLM)
-        save1, took = await _timed("save literal", service.save({
-            "content": "Fer prefers Spanish rioplatense in agent replies; technical jargon stays English.",
-            "title": "Idioma preferido para agents",
-            "type": "preference",
-            "tags": ["language", "rioplatense"],
-            "auto_extract": False,
-        }))
+        save1, took = await _timed(
+            "save literal",
+            service.save(
+                {
+                    "content": "Fer prefers Spanish rioplatense in agent replies; technical jargon stays English.",
+                    "title": "Idioma preferido para agents",
+                    "type": "preference",
+                    "tags": ["language", "rioplatense"],
+                    "auto_extract": False,
+                }
+            ),
+        )
         _print("save (literal)", save1, took)
         assert save1.get("ok") and save1.get("indexed"), "literal save+index failed"
         mid1 = save1["memory"]["id"]
 
         # 2) LLM-assisted save (auto_extract=True). Skipped if --skip-llm passed.
         if not skip_llm:
-            save2, took = await _timed("save auto_extract", service.save({
-                "content": (
-                    "Decision: mem-vault uses Ollama as the only LLM provider and bge-m3 as embedder. "
-                    "Vector store is Qdrant in embedded mode at ~/.local/share/mem-vault/qdrant. "
-                    "No external API keys are read or required."
+            save2, took = await _timed(
+                "save auto_extract",
+                service.save(
+                    {
+                        "content": (
+                            "Decision: mem-vault uses Ollama as the only LLM provider and bge-m3 as embedder. "
+                            "Vector store is Qdrant in embedded mode at ~/.local/share/mem-vault/qdrant. "
+                            "No external API keys are read or required."
+                        ),
+                        "title": "Decision: 100% local stack for mem-vault",
+                        "type": "decision",
+                        "tags": ["architecture", "local-first"],
+                        "auto_extract": True,
+                    }
                 ),
-                "title": "Decision: 100% local stack for mem-vault",
-                "type": "decision",
-                "tags": ["architecture", "local-first"],
-                "auto_extract": True,
-            }))
+            )
             _print("save (auto_extract=True)", save2, took)
             if save2.get("indexed") is False:
-                print("WARNING: auto_extract path failed to index — likely Ollama unreachable. Continuing.")
+                print(
+                    "WARNING: auto_extract path failed to index — likely Ollama unreachable. Continuing."
+                )
 
         # 3) search
-        srch, took = await _timed("search", service.search(
-            {"query": "what language should the agent use?", "k": 5}
-        ))
+        srch, took = await _timed(
+            "search", service.search({"query": "what language should the agent use?", "k": 5})
+        )
         _print("search", srch, took)
         assert srch.get("ok"), "search failed"
-        assert any(r.get("id") == mid1 for r in srch.get("results", [])), \
+        assert any(r.get("id") == mid1 for r in srch.get("results", [])), (
             f"expected hit on {mid1} not in {[r.get('id') for r in srch.get('results', [])]}"
+        )
 
         # 4) get
         got, took = await _timed("get", service.get({"id": mid1}))
@@ -93,9 +106,10 @@ async def run(skip_llm: bool = False) -> int:
         assert got.get("ok") and got["memory"]["id"] == mid1
 
         # 5) update
-        upd, took = await _timed("update", service.update(
-            {"id": mid1, "tags": ["language", "rioplatense", "preference"]}
-        ))
+        upd, took = await _timed(
+            "update",
+            service.update({"id": mid1, "tags": ["language", "rioplatense", "preference"]}),
+        )
         _print("update", upd, took)
         assert upd.get("ok") and "preference" in upd["memory"]["tags"]
 

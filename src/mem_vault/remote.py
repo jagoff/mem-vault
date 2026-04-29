@@ -21,6 +21,7 @@ methods produce in-process.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import httpx
@@ -53,6 +54,7 @@ class RemoteMemVaultService:
         *,
         timeout: float = DEFAULT_TIMEOUT_S,
         config: Any | None = None,
+        token: str | None = None,
     ):
         # Strip trailing slash so we can join endpoints with f-strings safely.
         self.base_url = base_url.rstrip("/")
@@ -61,10 +63,23 @@ class RemoteMemVaultService:
         # doesn't really need a vault path. We keep an optional reference
         # to the config so those code paths still work.
         self.config = config
+        # Bearer token resolution order: explicit ``token`` arg > Config
+        # field > env var. The env-var fallback exists so the hooks (which
+        # build the client without seeing the user's local config) can
+        # still authenticate against a token-protected web server.
+        resolved_token = token
+        if resolved_token is None and config is not None:
+            resolved_token = getattr(config, "http_token", None)
+        if resolved_token is None:
+            resolved_token = os.environ.get("MEM_VAULT_HTTP_TOKEN")
+        headers: dict[str, str] = {}
+        if resolved_token:
+            headers["Authorization"] = f"Bearer {resolved_token.strip()}"
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=timeout,
             follow_redirects=False,
+            headers=headers,
         )
 
     # ---- shape-compatible "service" API ----------------------------------
@@ -151,6 +166,16 @@ class RemoteMemVaultService:
             logger.exception("remote request failed: %s %s", method, path)
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
+        if resp.status_code in (401, 403):
+            return {
+                "ok": False,
+                "error": (
+                    f"mem-vault remote rejected request ({resp.status_code}). "
+                    "The server requires a bearer token — set MEM_VAULT_HTTP_TOKEN "
+                    "or pass `token=...` to RemoteMemVaultService."
+                ),
+                "code": "unauthorized",
+            }
         if resp.status_code >= 500:
             return {
                 "ok": False,

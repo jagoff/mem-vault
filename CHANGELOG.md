@@ -6,6 +6,50 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-29
+
+Robustness pass — three latent failure modes that could either hang the MCP
+server or silently expose memories on a LAN are now closed.
+
+### Added
+- **LLM timeout** (`MEM_VAULT_LLM_TIMEOUT_S`, default `60`): every
+  Ollama-backed call (embeddings + auto-extractor) is wrapped in
+  `asyncio.wait_for`. When Ollama hangs (model loading, OOM, dead host)
+  the MCP server now returns a structured `indexing_error_code:
+  "llm_timeout"` instead of blocking the call indefinitely. The `.md`
+  file is still saved on disk; only the index step degrades. Set to `0`
+  to disable the timeout (legacy behavior).
+- **Circuit breaker** in `index.py`: after three consecutive Ollama
+  failures the breaker opens for 30 s, short-circuiting `add` and
+  `search` with `CircuitBreakerOpenError` so a dead Ollama doesn't keep
+  stacking 60 s timeouts. Heals on the first success after the cooldown.
+- **Content size limit** (`MEM_VAULT_MAX_CONTENT_SIZE`, default
+  `1_000_000` chars): `memory_save` and `memory_update` reject oversized
+  bodies with `ok: false, code: "content_too_large"` before touching
+  the vault or the index. Set to `0` to disable.
+- **Optional bearer-token auth** for the UI / JSON HTTP server
+  (`MEM_VAULT_HTTP_TOKEN`): when set, every endpoint except `/healthz`
+  requires `Authorization: Bearer <token>`. Constant-time comparison
+  via `secrets.compare_digest`. The startup helper `serve()` now refuses
+  to bind to a non-loopback host without a token, preventing accidental
+  LAN exposure of the unauthenticated CRUD API.
+- **`RemoteMemVaultService` token support**: the HTTP client picks up
+  the bearer token from an explicit `token=...` arg, the `Config`
+  field, or `MEM_VAULT_HTTP_TOKEN` (in that order) and attaches it to
+  every request. 401 / 403 responses now return a structured
+  `code: "unauthorized"` with a hint, instead of looking like a 5xx.
+
+### Tests
+- 60+ new unit tests across `test_breaker.py`, `test_robustness.py`,
+  and `test_ui_auth.py` covering: breaker state machine, oversized
+  content rejection, hung-Ollama timeout (via stub `time.sleep` in a
+  fake `VectorIndex`), middleware auth (missing / wrong scheme / wrong
+  token / valid / runtime rotation), `_is_loopback_host` parametric
+  table, `serve()` startup guards. Total suite is now 132 tests, still
+  zero Ollama / Qdrant required for CI.
+
+## [0.1.x preview] - 2026-04-28
+
 ### Added
 - **Export**: new `mem-vault export {json,jsonl,csv,markdown}` subcommand
   for backups, migration, or feeding the whole vault to an LLM as one
@@ -64,5 +108,6 @@ Initial public release. Everything below shipped between commits
 - **CI** (GitHub Actions): matrix Ubuntu × macOS × Windows × Python
   3.11 / 3.12; lint job with `ruff check` + `ruff format --check`.
 
-[Unreleased]: https://github.com/jagoff/mem-vault/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/jagoff/mem-vault/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/jagoff/mem-vault/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jagoff/mem-vault/releases/tag/v0.1.0

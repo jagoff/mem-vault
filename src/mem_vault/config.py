@@ -110,6 +110,39 @@ class Config(BaseModel):
             "30 (aggressive), 90 (moderate), 365 (mild). Zero means no decay."
         ),
     )
+    llm_timeout_s: float = Field(
+        default=60.0,
+        description=(
+            "Wall-clock timeout (in seconds) for the embedding/LLM calls that "
+            "back ``memory_save`` and ``memory_search``. Protects the MCP "
+            "server from hanging indefinitely when Ollama is loading a model, "
+            "OOM, or unreachable. ``auto_extract=True`` calls can be slow "
+            "(5-15 s typical, occasionally 30 s+); 60 s leaves a healthy margin. "
+            "Set to 0 to disable the timeout entirely (legacy behavior)."
+        ),
+    )
+    max_content_size: int = Field(
+        default=1_000_000,
+        description=(
+            "Maximum size (in characters) accepted by ``memory_save`` and "
+            "``memory_update``. Calls with content larger than this are "
+            "rejected with a structured error before touching the vault or "
+            "the index. 1 MiB-ish is a sane upper bound for human-written "
+            "memories; raise it if you intentionally store large dumps. Set "
+            "to 0 to disable the limit."
+        ),
+    )
+    http_token: str | None = Field(
+        default=None,
+        description=(
+            "Bearer token required by the optional UI / JSON HTTP server when "
+            "set. Clients must send ``Authorization: Bearer <token>`` on every "
+            "request other than ``/healthz``. Leaving this null disables auth "
+            "(safe only when the server is bound to a loopback interface). "
+            "Binding to a non-loopback host without a token causes startup to "
+            "abort with a clear error."
+        ),
+    )
 
     @field_validator("vault_path", "state_dir", mode="before")
     @classmethod
@@ -208,15 +241,18 @@ def load_config(config_path: Path | None = None) -> Config:
         "MEM_VAULT_AGENT_ID": "agent_id",
         "MEM_VAULT_AUTO_EXTRACT": "auto_extract_default",
         "MEM_VAULT_DECAY_HALF_LIFE_DAYS": "decay_half_life_days",
+        "MEM_VAULT_LLM_TIMEOUT_S": "llm_timeout_s",
+        "MEM_VAULT_MAX_CONTENT_SIZE": "max_content_size",
+        "MEM_VAULT_HTTP_TOKEN": "http_token",
     }
     for env_var, field in env_map.items():
         if env_var in os.environ:
             value: str | int | bool | float = os.environ[env_var]
-            if field == "embedder_dims":
+            if field in {"embedder_dims", "max_content_size"}:
                 value = int(value)
             elif field == "auto_extract_default":
                 value = str(value).lower() in {"1", "true", "yes", "on"}
-            elif field == "decay_half_life_days":
+            elif field in {"decay_half_life_days", "llm_timeout_s"}:
                 value = float(value)
             merged[field] = value
 

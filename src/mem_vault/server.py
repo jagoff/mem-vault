@@ -28,13 +28,25 @@ import mcp.types as types
 from mcp.server import Server
 
 from mem_vault.config import Config, load_config
-from mem_vault.index import VectorIndex
+from mem_vault.index import CircuitBreakerOpenError, VectorIndex
 from mem_vault.storage import VaultStorage, slugify
 
 logger = logging.getLogger("mem_vault.server")
 
 SERVER_NAME = "mem-vault"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
+
+
+class _ContentTooLargeError(ValueError):
+    """Raised when ``content`` exceeds ``Config.max_content_size``."""
+
+
+class _LLMTimeoutError(TimeoutError):
+    """Raised when an Ollama-backed mem0 call exceeded ``Config.llm_timeout_s``.
+
+    Distinct from :class:`asyncio.TimeoutError` so handlers can render a
+    user-friendly message instead of a bare ``TimeoutError`` on the wire.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -210,8 +222,51 @@ class MemVaultService:
     async def _to_thread(self, fn, *args, **kwargs):
         return await asyncio.to_thread(fn, *args, **kwargs)
 
+    async def _index_call(self, fn, *args, **kwargs):
+        """Run an Ollama-backed index call with the configured wall-clock timeout.
+
+        ``Config.llm_timeout_s == 0`` disables the timeout (legacy behavior).
+        On timeout we raise :class:`_LLMTimeoutError` so handlers can return
+        a structured error rather than letting the MCP call hang on a dead
+        Ollama. The underlying thread will keep running in the background
+        until Ollama responds or dies — Python can't kill threads — but the
+        caller is unblocked immediately.
+        """
+        timeout = float(self.config.llm_timeout_s or 0)
+        if timeout <= 0:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(fn, *args, **kwargs),
+                timeout=timeout,
+            )
+        except TimeoutError as exc:
+            # Tick the breaker so a dead Ollama trips it after a few attempts.
+            self.index.breaker.record_failure()
+            raise _LLMTimeoutError(
+                f"Ollama call exceeded {timeout:.0f}s timeout. "
+                "Check `ollama serve` is running and the model is loaded."
+            ) from exc
+
+    def _check_content_size(self, content: str | None) -> None:
+        """Reject oversized content before it reaches the vault or the index."""
+        if content is None:
+            return
+        limit = int(self.config.max_content_size or 0)
+        if limit <= 0:
+            return
+        if len(content) > limit:
+            raise _ContentTooLargeError(
+                f"content too large: {len(content)} chars exceeds limit of {limit}. "
+                "Raise MEM_VAULT_MAX_CONTENT_SIZE or split the memory."
+            )
+
     async def save(self, args: dict[str, Any]) -> dict[str, Any]:
         content: str = args["content"]
+        try:
+            self._check_content_size(content)
+        except _ContentTooLargeError as exc:
+            return {"ok": False, "error": str(exc), "code": "content_too_large"}
         title = args.get("title")
         description = args.get("description")
         mtype = args.get("type", "note")
@@ -242,7 +297,7 @@ class MemVaultService:
 
         index_results: list[dict[str, Any]] = []
         try:
-            index_results = await self._to_thread(
+            index_results = await self._index_call(
                 self.index.add,
                 content,
                 user_id=user_id,
@@ -250,6 +305,26 @@ class MemVaultService:
                 metadata={"memory_id": mem.id, "type": mtype, "tags": tags},
                 auto_extract=auto_extract,
             )
+        except _LLMTimeoutError as exc:
+            logger.warning("indexing timed out for memory %s: %s", mem.id, exc)
+            return {
+                "ok": True,
+                "indexed": False,
+                "indexing_error": str(exc),
+                "indexing_error_code": "llm_timeout",
+                "memory": mem.to_dict(),
+                "path": str(self.storage.path_for(mem.id)),
+            }
+        except CircuitBreakerOpenError as exc:
+            logger.warning("indexing short-circuited for memory %s: %s", mem.id, exc)
+            return {
+                "ok": True,
+                "indexed": False,
+                "indexing_error": str(exc),
+                "indexing_error_code": "circuit_breaker_open",
+                "memory": mem.to_dict(),
+                "path": str(self.storage.path_for(mem.id)),
+            }
         except Exception as exc:
             logger.exception("indexing failed for memory %s: %s", mem.id, exc)
             return {
@@ -289,14 +364,20 @@ class MemVaultService:
 
         # Over-fetch so visibility filtering doesn't leave us short.
         raw_k = max(k, k * 3, 20)
-        hits = await self._to_thread(
-            self.index.search,
-            query,
-            user_id=user_id,
-            top_k=raw_k,
-            filters=filters or None,
-            threshold=threshold,
-        )
+        try:
+            hits = await self._index_call(
+                self.index.search,
+                query,
+                user_id=user_id,
+                top_k=raw_k,
+                filters=filters or None,
+                threshold=threshold,
+            )
+        except _LLMTimeoutError as exc:
+            # search() catches its own breaker errors and returns []; we
+            # only end up here if the asyncio.wait_for tripped first.
+            logger.warning("search timed out: %s", exc)
+            return {"ok": True, "query": query, "count": 0, "results": [], "warning": str(exc)}
 
         # Resolve hits → full memory bodies from the vault.
         results: list[dict[str, Any]] = []
@@ -359,6 +440,10 @@ class MemVaultService:
 
     async def update(self, args: dict[str, Any]) -> dict[str, Any]:
         try:
+            self._check_content_size(args.get("content"))
+        except _ContentTooLargeError as exc:
+            return {"ok": False, "error": str(exc), "code": "content_too_large"}
+        try:
             mem = await self._to_thread(
                 self.storage.update,
                 args["id"],
@@ -375,7 +460,7 @@ class MemVaultService:
             user_id = self.config.user_id
             try:
                 await self._to_thread(self.index.delete_by_metadata, "memory_id", mem.id, user_id)
-                await self._to_thread(
+                await self._index_call(
                     self.index.add,
                     mem.body,
                     user_id=user_id,
@@ -383,6 +468,11 @@ class MemVaultService:
                     metadata={"memory_id": mem.id, "type": mem.type, "tags": mem.tags},
                     auto_extract=False,
                 )
+            except (_LLMTimeoutError, CircuitBreakerOpenError) as exc:
+                # The .md file is updated; only the index is stale. The
+                # caller can `mem-vault reindex` later, or the next save
+                # will trip the breaker shut anyway.
+                logger.warning("re-index after update degraded: %s", exc)
             except Exception as exc:
                 logger.warning("re-index after update failed: %s", exc)
 

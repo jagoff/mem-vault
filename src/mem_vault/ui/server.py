@@ -7,21 +7,25 @@ Routes:
 - ``PATCH /api/memories/{id}`` → save edits (returns refreshed row)
 - ``DELETE /api/memories/{id}``→ delete (HTMX swaps the row out)
 - ``GET /api/stats``        → header stats badges
-- ``GET /healthz``          → liveness probe
+- ``GET /healthz``          → liveness probe (always unauthenticated)
 
 The server keeps a single ``MemVaultService`` instance — Qdrant + mem0 are
 expensive to spin up, so we boot once and reuse. All filesystem ops are
 async-safe via ``asyncio.to_thread``.
 
-The server binds to ``127.0.0.1`` by default, never to ``0.0.0.0``. Pass
-``--host 0.0.0.0`` if you really want network exposure (no auth — local
-use only).
+The server binds to ``127.0.0.1`` by default. When you bind to a non-
+loopback address (``--host 0.0.0.0`` or a LAN IP) you **must** set
+``MEM_VAULT_HTTP_TOKEN``: the startup helper :func:`serve` refuses to
+launch otherwise. Authenticated requests pass ``Authorization: Bearer
+<token>``; ``/healthz`` is exempt so external monitors keep working.
 """
 
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
+import secrets
 from collections import Counter
 from datetime import UTC
 from pathlib import Path
@@ -37,6 +41,28 @@ from mem_vault.config import load_config
 from mem_vault.server import MemVaultService
 
 logger = logging.getLogger("mem_vault.ui")
+
+# Endpoints that bypass auth even when a token is configured. Keep the list
+# tight — every entry is a chunk of attack surface someone can hit anonymously.
+_AUTH_EXEMPT_PATHS = {"/healthz"}
+
+
+def _is_loopback_host(host: str) -> bool:
+    """Returns True iff ``host`` resolves to the loopback interface.
+
+    Accepts ``127.0.0.1``, ``::1``, ``localhost``, and anything else inside
+    the IPv4/IPv6 loopback ranges (``127.0.0.0/8``, ``::1/128``). Treats
+    unknown hostnames as non-loopback (safe default — auth required).
+    """
+    if not host:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
 
 _HERE = Path(__file__).resolve().parent
 _TEMPLATES_DIR = _HERE / "templates"
@@ -81,6 +107,35 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
         docs_url=None,  # disable /docs by default — local-only tool
         redoc_url=None,
     )
+
+    # Bearer-token auth is **opt-in** via ``MEM_VAULT_HTTP_TOKEN``. We attach
+    # the middleware unconditionally so the token can be rotated at runtime
+    # (mutate ``service.config.http_token`` and the next request honors it),
+    # but the middleware short-circuits when the token is empty.
+    @app.middleware("http")
+    async def _bearer_auth(request: Request, call_next):
+        token = (service.config.http_token or "").strip()
+        if not token:
+            return await call_next(request)
+        if request.url.path in _AUTH_EXEMPT_PATHS:
+            return await call_next(request)
+        # Static assets shouldn't require auth either — they're public CSS/JS,
+        # leaking nothing about the user's memories. Keeping them open also
+        # means a browser can fetch them with a plain ``<script src>`` after
+        # the user authenticates the main page (e.g. via a ``token`` query
+        # param wired up in templates if you go that route).
+        if request.url.path.startswith("/static/"):
+            return await call_next(request)
+        header = request.headers.get("authorization", "")
+        scheme, _, value = header.partition(" ")
+        if scheme.lower() != "bearer" or not secrets.compare_digest(value, token):
+            return JSONResponse(
+                {"detail": "Unauthorized"},
+                status_code=401,
+                headers={"WWW-Authenticate": 'Bearer realm="mem-vault"'},
+            )
+        return await call_next(request)
+
     if _STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
     templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
@@ -393,9 +448,26 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
 
 
 def serve(host: str = "127.0.0.1", port: int = 7880, log_level: str = "info") -> None:
-    """Run the UI server with uvicorn. Blocks until killed."""
+    """Run the UI server with uvicorn. Blocks until killed.
+
+    Refuses to start when binding to a non-loopback host without
+    ``MEM_VAULT_HTTP_TOKEN`` set — that combination would expose an
+    unauthenticated CRUD API to whatever network the address reaches.
+    Set the env var (and pass the same token in the ``Authorization``
+    header on every request) to opt in to LAN/remote exposure.
+    """
     import uvicorn
 
-    app = create_app()
-    print(f"\n  mem-vault UI · http://{host}:{port}\n")
+    config = load_config()
+    if not _is_loopback_host(host) and not (config.http_token or "").strip():
+        raise SystemExit(
+            f"Refusing to bind to non-loopback host {host!r} without "
+            "MEM_VAULT_HTTP_TOKEN set. Set the env var or pass --host 127.0.0.1."
+        )
+    service = MemVaultService(config)
+    app = create_app(service)
+    banner = f"\n  mem-vault UI · http://{host}:{port}"
+    if (config.http_token or "").strip():
+        banner += "  [auth: bearer token required]"
+    print(banner + "\n")
     uvicorn.run(app, host=host, port=port, log_level=log_level)

@@ -21,7 +21,18 @@ class _FakeService:
     """Minimal MemVaultService stub recording calls and returning canned data."""
 
     def __init__(self):
+        import types
+
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        # Bare-bones config so the bearer-auth middleware can read
+        # ``service.config.http_token`` (None ⇒ auth disabled by default).
+        self.config = types.SimpleNamespace(
+            http_token=None,
+            memory_dir="/tmp/fake",
+            agent_id=None,
+            user_id="default",
+            qdrant_collection="test",
+        )
 
     async def save(self, args):
         self.calls.append(("save", args))
