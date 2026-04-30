@@ -13,6 +13,7 @@ lives in its own file under :mod:`mem_vault.cli`:
 - :mod:`mem_vault.cli.export_cmd`     — ``mem-vault export``
 - :mod:`mem_vault.cli.sync_cmd`       — ``mem-vault sync-status`` / ``sync-watch``
 - :mod:`mem_vault.cli.hooks_cmd`      — ``mem-vault hook-*``
+- :mod:`mem_vault.cli.install_skill`  — ``mem-vault install-skill`` (Devin /mv slash)
 
 The default (no subcommand) preserves the legacy behavior: bare
 ``mem-vault`` boots the MCP stdio server, same as ``mem-vault-mcp``. This
@@ -44,6 +45,9 @@ from mem_vault.cli import (
 )
 from mem_vault.cli import (
     import_engram as _import_engram_mod,
+)
+from mem_vault.cli import (
+    install_skill as _install_skill_mod,
 )
 from mem_vault.cli import (
     reindex as _reindex_mod,
@@ -78,6 +82,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _reindex_mod.add_subparser(sub)
     _consolidate_mod.add_subparser(sub)
     _import_engram_mod.add_subparser(sub)
+    _install_skill_mod.add_subparser(sub)
 
     return parser
 
@@ -123,6 +128,9 @@ def main() -> None:
 
     if cmd == "consolidate":
         sys.exit(_consolidate_mod.run(args))
+
+    if cmd == "install-skill":
+        sys.exit(_install_skill_mod.run(args))
 
     if cmd in {"hook-sessionstart", "hook-userprompt", "hook-stop"}:
         _hooks_mod.run(cmd)

@@ -6,6 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`mem-vault install-skill`**: new subcommand that drops a bundled
+  `SKILL.md` template into Devin's user skills directory under three
+  alias names (`/mv`, `/mem_vault`, `/memory`), all routing to the same
+  MCP tools. Cross-platform (macOS / Linux / Windows). Flags:
+  `--target` (custom dir, useful for `.devin/skills` in a repo),
+  `--force` (overwrite existing), `--dry-run` (preview), `--no-aliases`
+  (install only `/mv`), `--uninstall` (remove). Solves the previous
+  manual-symlink dance on a fresh install — `pip install mem-vault &&
+  mem-vault install-skill` now leaves the slash commands ready.
+- **Bundled SKILL.md**: shipped at `mem_vault/skills/SKILL.md` inside
+  the wheel, accessible via `importlib.resources` with an
+  editable-install fallback.
+
+### Tests
+- 19 new tests across `test_install_skill.py` covering: cross-platform
+  default skills dir resolution (POSIX with/without `XDG_CONFIG_HOME`,
+  Windows with/without `APPDATA`), template reading via
+  `importlib.resources` and the FS fallback, frontmatter `name:`
+  rewriting, install (3 aliases / `--no-aliases` / `--force` /
+  `--dry-run` / nested target), uninstall (full / dry-run / preserves
+  user-extra files / no-op when empty). Total suite is now 233 tests.
+
 ## [0.2.0] - 2026-04-29
 
 Robustness pass — three latent failure modes that could either hang the MCP

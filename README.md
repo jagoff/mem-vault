@@ -246,6 +246,35 @@ separate sync to maintain.
 
 Same shape — point any MCP-compatible client at `mem-vault-mcp`.
 
+### Slash commands `/mv` · `/mem_vault` · `/memory` (Devin)
+
+Once mem-vault is installed (`uv tool install mem-vault` or `pip install mem-vault`),
+register the slash command skill so you can invoke the MCP from the Devin
+prompt without typing the full tool name:
+
+```bash
+mem-vault install-skill
+```
+
+This drops three alias copies of the bundled `SKILL.md` into Devin's user
+skills dir (`~/.config/devin/skills/{mv,mem_vault,memory}/SKILL.md` on
+macOS/Linux, `%APPDATA%\devin\skills\...\SKILL.md` on Windows). Open a
+new Devin session and try:
+
+```
+/mv tests para mem-vault         # semantic search (default)
+/mv list                          # last 20 memories
+/mv save -e Hoy descubrí que…     # save with LLM extractor
+/mv get <id>                      # show one memory
+/mv delete <id>                   # delete (asks for confirmation)
+```
+
+`/mem_vault` and `/memory` are aliases — pick whichever the dedo te tira
+más rápido. Re-running `mem-vault install-skill` is idempotent (skips
+existing files); pass `--force` to overwrite, `--dry-run` to preview,
+`--no-aliases` to install only `/mv`, `--target <dir>` to install into a
+project-local `.devin/skills` instead, or `--uninstall` to clean up.
+
 ## Lifecycle hooks (Devin / Claude Code)
 
 mem-vault ships two optional [lifecycle hooks](https://docs.anthropic.com/en/docs/claude-code/hooks)
