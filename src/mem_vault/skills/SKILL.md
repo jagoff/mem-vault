@@ -4,11 +4,11 @@ description: "Search/save/list/update/delete memorias en mem-vault — el MCP lo
 argument-hint: "<query> | list | save [-e] <text> | get <id> | update <id> <text> | delete <id>"
 ---
 
-# /mem_vault · /memory · /mv — router para mem-vault MCP
+# /mv · /mem_vault · /memory — router para mem-vault MCP
 
-Los tres triggers (`/mem_vault`, `/memory`, `/mv`) son **alias-equivalentes**: invocan el mismo flow, parsean los mismos subcomandos, devuelven el mismo formato. El user puede usar el que más rápido le salga del dedo.
+Los tres triggers (`/mv`, `/mem_vault`, `/memory`) son **alias-equivalentes**: invocan el mismo flow, parsean los mismos subcomandos, devuelven el mismo formato. El user puede usar el que más rápido le salga del dedo.
 
-[mem-vault](https://github.com/jagoff/mem-vault) es un MCP local que da memoria persistente backed by Obsidian. Memorias = `.md` planas en el vault (típicamente `04-Archive/99-obsidian-system/99-AI/memory/<id>.md`), index semántico en Qdrant embedded (`~/.local/share/mem-vault/qdrant/`), embeddings via Ollama (bge-m3, 1024d). El user te invocó con `/mem_vault $ARGUMENTS` (o `/memory $ARGUMENTS` o `/mv $ARGUMENTS`) y vos ruteás al MCP tool que corresponde.
+[mem-vault](https://github.com/jagoff/mem-vault) es un MCP local que da memoria persistente respaldada por un vault de Obsidian. Las memorias son archivos `.md` planos guardados bajo el subdirectorio configurado en el vault (por default `<vault>/mem-vault/<id>.md`, override con `MEM_VAULT_MEMORY_SUBDIR`); el índice semántico vive en Qdrant embebido (`~/.local/share/mem-vault/qdrant/` en Linux, `~/Library/Application Support/mem-vault/qdrant/` en macOS); los embeddings los genera Ollama localmente (`bge-m3`, 1024 dims). El user te invocó con `/mv $ARGUMENTS` (o `/mem_vault $ARGUMENTS` o `/memory $ARGUMENTS`) y vos ruteás al MCP tool que corresponde.
 
 ## Routing — parseá la PRIMERA palabra de `$ARGUMENTS`
 
@@ -20,7 +20,7 @@ Los tres triggers (`/mem_vault`, `/memory`, `/mv`) son **alias-equivalentes**: i
 | `get` + id | mostrar memoria completa | `mcp__mem-vault__memory_get({id: <id>})` |
 | `update` + id + texto | replace content | `mcp__mem-vault__memory_update({id: <id>, content: <texto>})` |
 | `delete` + id | borrar (CON confirmación) | ver "Delete flow" abajo |
-| cualquier otra cosa | search semántico | `mcp__mem-vault__memory_search({query: $ARGUMENTS, k: 5, threshold: 0.05})` |
+| cualquier otra cosa | search semántico | `mcp__mem-vault__memory_search({query: $ARGUMENTS, k: 5, threshold: 0.1})` |
 
 ## Delete flow (irreversible — pidan confirmación)
 
@@ -42,7 +42,7 @@ Mostrá top-5 (cantidad real si hay menos), uno por bloque:
 
 Score: `≥0.70` = alto, `0.40-0.70` = medio, `<0.40` = bajo. Si todos los hits están bajo 0.40, agregá al final: `(matches débiles — quizás no tenés memoria sobre esto)`.
 
-Si `count: 0`, decí: `No encontré nada para «<query>». ¿Querés guardarla con `/memory save <texto>`?`.
+Si `count: 0`, decí: `No encontré nada para «<query>». ¿Querés guardarla con `/mv save <texto>`?`.
 
 ### List
 
@@ -54,19 +54,19 @@ Una línea por memoria, sorted by recency (el MCP ya lo ordena):
 
 ### Save
 
-`Guardada como `<id>`.` + link `obsidian://` al archivo. Si pasaron `-e`, agregá: `(LLM extract + dedup activo — verificá que no haya pisado memoria existente).`
+`Guardada como `<id>`.` + link `obsidian://` al archivo si la ruta del vault está disponible. Si pasaron `-e`, agregá: `(LLM extract + dedup activo — verificá que no haya pisado memoria existente).`
 
 ### Get / Update
 
 Para `get`: body completo, sin truncar. Para `update`: confirmá con `Actualizada `<id>` (`updated` bumped).`.
 
-### Wikilinks a notas
+### Wikilinks a otras notas del vault
 
-Si el body de una memoria contiene rutas tipo `01-Projects/...md` o similares, renderizá como `obsidian://` link según la regla del CLAUDE.md global. URL-encode `/` como `%2F`, omití `.md` del param `file`.
+Si el body de una memoria menciona rutas a archivos `.md` del vault (típicamente paths relativos como `<carpeta>/<nota>.md`), podés renderizarlas como links `obsidian://open?vault=<NOMBRE>&file=<PATH>` para que el user las abra con un click. URL-encode `/` como `%2F`, omití el `.md` final del parámetro `file`. Solo aplicá esto cuando claramente sea una ruta de nota, no para ejemplos de código o comentarios.
 
 ## Reglas duras
 
-1. **NUNCA escribas el `.md` directo en el vault** — el MCP es el único path autorizado (mantiene frontmatter, index Qdrant, history).
+1. **NUNCA escribas el `.md` directo en el vault** — el MCP es el único path autorizado (mantiene frontmatter, índice Qdrant, history).
 2. **Si el MCP devuelve `ok: false`**, mostrá el `error` literal del MCP. NO inventes mensajes de error.
-3. **Después del comando, frená** — el user invocó `/memory` para algo puntual. NO retomes tareas previas automáticamente.
-4. **Si los argumentos son ambiguos** (ej. `/memory get` sin id), pedí el dato faltante en una línea: `Pasame el `<id>` (uno de los slugs que aparecen en `/memory list`).`.
+3. **Después del comando, frená** — el user invocó el slash command para algo puntual. NO retomes tareas previas automáticamente.
+4. **Si los argumentos son ambiguos** (ej. `/mv get` sin id), pedí el dato faltante en una línea: `Pasame el `<id>` (uno de los slugs que aparecen en `/mv list`).`.
