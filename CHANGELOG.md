@@ -6,6 +6,147 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-30
+
+**Beta release.** Project bumps from "Alpha" → "Beta" in pyproject classifiers.
+658 tests at v0.3.0 grew to 736 tests, +6 commits of features +
+1 audit pass + 1 robustness pass + 1 Beta-readiness sprint.
+
+### Added — RemoteMemVaultService remote-mode handler symmetry
+
+When `MEM_VAULT_REMOTE_URL` was set the MCP server crashed at boot
+with `AttributeError: Service RemoteMemVaultService is missing
+handler 'briefing' for tool 'memory_briefing'.`. Cause: the in-process
+`MemVaultService` had grown 9 new tools (briefing, derive_metadata,
+stats, duplicates, lint, related, history, feedback, synthesize)
+across recent commits while the HTTP-backed `RemoteMemVaultService`
+was left at the original 6 (save/search/list/get/update/delete).
+The MCP boot-time symmetry check (`_build_handlers`) refused to
+start.
+
+Fix: 9 new `/api/v1/*` endpoints in `mem_vault/ui/server.py` (plus
+3 Pydantic request models for the POST bodies), and 9 matching
+delegating methods in `RemoteMemVaultService`. The contract test
+described below would have caught this before it shipped.
+
+### Added — Schema↔implementation contract tests
+
+New `tests/test_contracts.py` (11 tests) parametrically guards 4
+contracts that have caused regressions in this repo:
+
+1. Every tool in `_TOOLS` resolves to a callable on `MemVaultService`.
+2. Every tool in `_TOOLS` resolves to a callable on `RemoteMemVaultService`.
+3. Every entry in `ENV_TO_CONFIG_FIELD` references a real `Config` field.
+4. Every Pydantic request model field (`MemoryCreate.visible_to`,
+   `MemoryUpdate.tags`, …) is consumed by the matching service method.
+
+Caught a real bug on first run: `MemoryUpdate.visible_to` was declared
+in the schema but `MemVaultService.update` never forwarded it to
+`storage.update`, silently dropping visibility changes. Fixed in same
+commit + 4 new regression tests in `test_visibility.py`.
+
+For introspection (and the test), `ENV_TO_CONFIG_FIELD` is now a
+module-level dict in `mem_vault.config` instead of buried inline
+inside `load_config`.
+
+### Added — `mem-vault metrics` CLI
+
+The JSONL metrics sink (added in 0.3.0) was write-only — users couldn't
+see their own performance data without external tooling. New
+`mem-vault metrics` reads `<state_dir>/metrics.jsonl` and reports:
+
+```
+mem-vault metrics
+───────────────────────────────────────────────────────────────────
+  total: 142    errors: 3    error rate:  2.11%
+
+  tool                        count   err     p50     p95     p99
+  ─────────────────────────────────────────────────────────────────
+  memory_briefing                12    0      216     232     234
+  memory_save                    34    0       78   4.72s   5.13s
+  memory_search                  91    3!     234     1.07s  1.20s
+```
+
+Filters: `--since 24h|7d|30m|2w|<ISO>`, `--tool <name>` (repeatable),
+`--errors-only` / `--ok-only`, `--top-slow N` (default 5),
+`--json` (machine output). Process-safe (read-while-server-writes is
+fine, append-only sink), tolerates malformed lines (warn + skip).
+
+30 tests on the pure helpers (`parse_since`, `percentile`, `aggregate`,
+`top_slow_calls`, `filter_lines`) + 4 E2E.
+
+### Added — PT/galego → ES post-filter for `memory_synthesize`
+
+`memory_synthesize` was returning Portuguese-leaked output ~5-15% of
+the time when source memorias contained technical vocabulary that
+overlapped with PT roots — even though the system prompt asked for
+"español rioplatense". Three coordinated fixes:
+
+1. **Filter port**: new `mem_vault/iberian_filter.py` with 100+
+   high-confidence regex pairs ported from `obsidian-rag` (commit
+   `582406f`). Catches months (`março` → `marzo`), pronouns
+   (`você` → `vos`, `essa` → `esa`), demonstratives, articles
+   (`à` → `a la`, `os ` + lowercase → `los `), `-ção/-ência/-ância`
+   suffixes, and the PT-only verb forms observed in real leaks
+   (`fazer`, `feito`, `vou`, `tem` + lowercase, `foram`, …).
+   Conservative — never rewrites words shared between PT and rioplatense.
+
+2. **Aggressive REGLA 0 prompt anchor**: the synthesis prompt now
+   opens with an explicit deny list of the most-common leak words
+   ("Si te encontrás escribiendo 'feito', 'fazer', 'tem'… es BUG"),
+   demands voseo argentino, repeats the rule at close.
+
+3. **`Config.synthesis_model`**: new field (env
+   `MEM_VAULT_SYNTHESIS_MODEL`) so users can route synthesis through
+   a larger model (recommended: `qwen2.5:7b`) without changing the
+   3b default for the auto-extract/dedup path. Smaller models drift
+   to PT more aggressively under the same prompt.
+
+End-to-end on the same source corpus, with `MEM_VAULT_SYNTHESIS_MODEL=qwen2.5:7b`:
+zero PT leaks observed. Tests: 25 new in `test_iberian_filter.py`
+including idempotency, pure-Spanish round-trip, and the regression
+corpus from the actual 2026-04-30 leak.
+
+### Refactored — `_TOOLS` extracted to `mem_vault/tool_schemas.py`
+
+The 425-line block of declarative MCP tool schemas (every
+`types.Tool(name=..., inputSchema=...)` for the 15 verbs) lived
+inline in `server.py`. Moved to a dedicated module so the wiring
+file (`_build_handlers`, `call_tool` dispatch, `MemVaultService`)
+stays focused on mechanism. `server.py` drops from 2148 → ~1755 LOC.
+
+`from mem_vault.server import _TOOLS` continues to work via re-export
+for backwards compat with existing tests / external scripts.
+
+### Performance — corpus-list cache
+
+5 service verbs (briefing, stats, duplicates, lint, related) walked
+the entire vault on every call (`storage.list(limit=∞)`). At 80
+memorias each call took <50 ms; at 1000+ it became the bottleneck
+of the boot briefing the `/mv` skill renders on every session start.
+
+Added `MemVaultService._list_corpus(tags=...)` — TTL=30 s memoized
+wrapper keyed by `frozenset(tags)`. Mutating verbs (save/update/delete
++ auto-link/auto-contradict secondary writes) call
+`_invalidate_corpus_cache()` so a fresh write is visible on the next
+discovery call without waiting for the TTL to lapse.
+
+The 5 affected verbs now go through the cache. Discovery batches
+(briefing + stats + lint fired back-to-back) hit storage once instead
+of three times. 8 new tests in `test_corpus_cache.py` covering
+memoization, invalidation, per-tag bucketing, TTL expiration, and
+the cross-verb sharing invariant.
+
+### Added — `MemVaultService.update` honors `visible_to`
+
+The HTTP endpoint and the local Python service signature both
+accepted `visible_to` (with `"private"` / `"public"` shorthands and
+explicit allowlists), but `service.update` was silently dropping the
+field. PATCH requests changed nothing. Now forwarded to
+`storage.update` exactly like `save` does, with the same shorthand
+normalization. The MCP tool schema for `memory_update` also gains
+the `visible_to` property so MCP clients can change visibility.
+
 ### Added — project-scoped metadata + search filter
 
 ``memory_save`` now stamps a ``project`` field into the Qdrant payload
