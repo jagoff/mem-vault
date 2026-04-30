@@ -1,0 +1,136 @@
+"""Top-level CLI for mem-vault.
+
+This module is intentionally thin: it builds the argparse tree by asking
+each subcommand module to register its own subparsers, then dispatches
+the parsed ``args.cmd`` to the module that owns it. Each subcommand body
+lives in its own file under :mod:`mem_vault.cli`:
+
+- :mod:`mem_vault.cli.crud`           — search / list / save / get / delete
+- :mod:`mem_vault.cli.ui`             — ``mem-vault ui``
+- :mod:`mem_vault.cli.reindex`        — ``mem-vault reindex``
+- :mod:`mem_vault.cli.consolidate`    — ``mem-vault consolidate``
+- :mod:`mem_vault.cli.import_engram`  — ``mem-vault import-engram``
+- :mod:`mem_vault.cli.export_cmd`     — ``mem-vault export``
+- :mod:`mem_vault.cli.sync_cmd`       — ``mem-vault sync-status`` / ``sync-watch``
+- :mod:`mem_vault.cli.hooks_cmd`      — ``mem-vault hook-*``
+
+The default (no subcommand) preserves the legacy behavior: bare
+``mem-vault`` boots the MCP stdio server, same as ``mem-vault-mcp``. This
+keeps existing Devin / Claude Code MCP configs working unchanged.
+
+Subcommand modules also import their heavy deps lazily (inside ``run``)
+so ``mem-vault --help`` stays fast even with the optional extras
+installed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import sys
+
+from mem_vault import __version__
+from mem_vault.cli import (
+    consolidate as _consolidate_mod,
+)
+from mem_vault.cli import (
+    crud as _crud_mod,
+)
+from mem_vault.cli import (
+    export_cmd as _export_mod,
+)
+from mem_vault.cli import (
+    hooks_cmd as _hooks_mod,
+)
+from mem_vault.cli import (
+    import_engram as _import_engram_mod,
+)
+from mem_vault.cli import (
+    reindex as _reindex_mod,
+)
+from mem_vault.cli import (
+    sync_cmd as _sync_mod,
+)
+from mem_vault.cli import (
+    ui as _ui_mod,
+)
+from mem_vault.server import main as serve_main
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="mem-vault",
+        description="Local MCP server with infinite memory backed by an Obsidian vault.",
+    )
+    sub = parser.add_subparsers(dest="cmd")
+
+    # Default + version are simple enough to register inline.
+    sub.add_parser("serve", help="Start the MCP stdio server (default).")
+    sub.add_parser("version", help="Print package version.")
+
+    # Each module registers its own subparsers — keeps argparse setup colocated
+    # with the implementation.
+    _ui_mod.add_subparser(sub)
+    _sync_mod.add_subparsers(sub)
+    _export_mod.add_subparser(sub)
+    _crud_mod.add_subparsers(sub)
+    _hooks_mod.add_subparsers(sub)
+    _reindex_mod.add_subparser(sub)
+    _consolidate_mod.add_subparser(sub)
+    _import_engram_mod.add_subparser(sub)
+
+    return parser
+
+
+def main() -> None:
+    argv = sys.argv[1:]
+    if not argv:
+        # Backwards-compat: bare `mem-vault` boots the MCP server, like
+        # `mem-vault-mcp` does. This keeps the existing Devin / Claude Code
+        # MCP configs working unchanged.
+        return serve_main()
+
+    args = _build_parser().parse_args(argv)
+    cmd = args.cmd or "serve"
+
+    if cmd == "version":
+        print(__version__)
+        return
+
+    if cmd == "serve":
+        return serve_main()
+
+    if cmd == "ui":
+        return _ui_mod.run(args)
+
+    if cmd == "import-engram":
+        sys.exit(asyncio.run(_import_engram_mod.run(args)))
+
+    if cmd in {"search", "list", "save", "get", "delete"}:
+        sys.exit(asyncio.run(_crud_mod.run(cmd, args)))
+
+    if cmd == "export":
+        sys.exit(_export_mod.run(args))
+
+    if cmd == "sync-status":
+        sys.exit(_sync_mod.run_status())
+
+    if cmd == "sync-watch":
+        sys.exit(_sync_mod.run_watch(args))
+
+    if cmd == "reindex":
+        sys.exit(asyncio.run(_reindex_mod.run(args)))
+
+    if cmd == "consolidate":
+        sys.exit(_consolidate_mod.run(args))
+
+    if cmd in {"hook-sessionstart", "hook-userprompt", "hook-stop"}:
+        _hooks_mod.run(cmd)
+        return
+
+    print(f"error: unknown subcommand: {cmd}", file=sys.stderr)
+    sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
