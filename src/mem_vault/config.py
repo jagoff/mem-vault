@@ -256,6 +256,19 @@ class Config(BaseModel):
             "0.0 treats all documents as equal length."
         ),
     )
+    auto_contradict_default: bool = Field(
+        default=False,
+        description=(
+            "When True, every ``memory_save`` runs a small LLM pass over the "
+            "top-5 most similar existing memorias and asks whether the new "
+            "content contradicts any of them. Matches are stamped in the "
+            "``contradicts`` frontmatter field, letting the Obsidian graph "
+            "surface tensions in the vault over time. Off by default "
+            "(adds ~3-5 s latency to saves). Opt in per-call with "
+            "``auto_contradict=true`` or globally via "
+            "``MEM_VAULT_AUTO_CONTRADICT=1``."
+        ),
+    )
 
     @field_validator("vault_path", "state_dir", mode="before")
     @classmethod
@@ -375,6 +388,7 @@ def load_config(config_path: Path | None = None) -> Config:
         "MEM_VAULT_HYBRID_RRF_K": "hybrid_rrf_k",
         "MEM_VAULT_HYBRID_BM25_K1": "hybrid_bm25_k1",
         "MEM_VAULT_HYBRID_BM25_B": "hybrid_bm25_b",
+        "MEM_VAULT_AUTO_CONTRADICT": "auto_contradict_default",
     }
     for env_var, field in env_map.items():
         if env_var in os.environ:
@@ -389,6 +403,7 @@ def load_config(config_path: Path | None = None) -> Config:
                 "usage_boost_enabled",
                 "usage_tracking_enabled",
                 "hybrid_enabled",
+                "auto_contradict_default",
             }:
                 value = str(value).lower() in {"1", "true", "yes", "on"}
             elif field in {

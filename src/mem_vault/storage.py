@@ -377,6 +377,7 @@ class VaultStorage:
         tags: list[str] | None = None,
         visible_to: list[str] | None = None,
         related: list[str] | None = None,
+        contradicts: list[str] | None = None,
     ) -> Memory:
         mem = self.get(memory_id)
         if mem is None:
@@ -393,6 +394,8 @@ class VaultStorage:
             mem.visible_to = list(visible_to)
         if related is not None:
             mem.related = list(related)
+        if contradicts is not None:
+            mem.contradicts = list(contradicts)
         mem.updated = _now_iso()
         self._write(mem)
         return mem

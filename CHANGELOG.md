@@ -6,6 +6,54 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — `contradicts:` auto-detection on save
+
+The `contradicts` frontmatter field has existed in the `Memory` schema
+since v0.1 but was never populated — there was no mechanism to decide
+which memorias conflict. `memory_save` now optionally runs a local LLM
+pass over the top-5 most similar existing memorias and asks which (if
+any) the new body directly contradicts. Matches get stamped in the new
+memory's `contradicts:` list.
+
+**Prompt contract** (strict JSON, no prose):
+
+```
+{"contradicts": ["<id1>", "<id2>"]}
+```
+
+Rules in the prompt stress "direct contradiction" (incompatible claims
+about the same subject), NOT "related" or "weaker version of" — that
+distinction keeps the field signal-rich. Empty list is the common
+correct answer.
+
+**Safety**:
+
+- Prompt sanitizes + truncates each body (same helpers as
+  `memory_synthesize`) so injection attempts in memory bodies can't
+  redirect the classifier.
+- Response parser accepts list or comma-separated string, filters
+  hallucinated ids (not in the candidate set), dedupes, preserves order.
+- Every failure path (LLM timeout, breaker open, non-JSON output,
+  storage write fail) degrades to `contradicts=[]` without breaking
+  the save.
+
+**Opt-in** via `auto_contradict=true` per-call or `auto_contradict_default`
+(env `MEM_VAULT_AUTO_CONTRADICT=1`) globally. Off by default — adds
+3-5 s latency. Composes with auto-link: both fields populate in the
+same save (related + contradicts are orthogonal signals).
+
+`storage.update()` now accepts a `contradicts=[...]` kwarg for the
+same round-trip contract as `related=[...]`.
+
+**Tests**: 20 new unit tests in `test_contradict.py`: prompt builder
+(block wrapping, STRICT JSON instruction, long-body truncation),
+response parser (standard list, comma-string variant, hallucination
+filter, dedup, missing key, alternate key `contradictions`, empty/non-
+JSON/non-object edge cases, non-string items), service integration
+(default off, LLM match stamps frontmatter, no match leaves empty,
+LLM failure degrades, hallucinated ids filtered, config default
+triggers LLM). Suite grows to 459.
+
 ### Added — real hybrid retrieval (BM25 + dense + Reciprocal Rank Fusion)
 
 `memory_search` now optionally runs a BM25 sparse retriever in parallel
