@@ -54,16 +54,24 @@ def test_sessionstart_emits_context_with_preferences(monkeypatch, capsys):
             }
         if args.get("type") == "feedback":
             return {"ok": True, "memories": []}
+        # Tag-filtered listings used by _fetch_project_memories return empty.
+        if args.get("tags"):
+            return {"ok": True, "memories": []}
         return {"ok": True, "memories": [{"id": "r1", "name": "Reciente", "description": "x"}]}
 
     service.list_ = _list
+    service.search = AsyncMock(return_value={"ok": True, "results": []})
 
+    # Force ``_resolve_cwd`` to return None so this legacy test stays focused
+    # on the prefs+recent path. The cwd-aware branch is exercised separately.
+    monkeypatch.setattr("mem_vault.hooks.sessionstart._resolve_cwd", lambda payload: None)
     _patch_stdin(monkeypatch, {})
     _patch_build_service(monkeypatch, "sessionstart", service)
 
     from mem_vault.hooks import sessionstart
 
     importlib.reload(sessionstart)
+    monkeypatch.setattr("mem_vault.hooks.sessionstart._resolve_cwd", lambda payload: None)
     sessionstart.run()
 
     captured = capsys.readouterr()
@@ -76,9 +84,136 @@ def test_sessionstart_emits_context_with_preferences(monkeypatch, capsys):
     assert "Reciente" in additional
 
 
+# ---------------------------------------------------------------------------
+# SessionStart cwd-aware (project signals from path)
+# ---------------------------------------------------------------------------
+
+
+def test_project_signals_from_cwd_extracts_leaf():
+    from mem_vault.hooks.sessionstart import project_signals_from_cwd
+
+    signals = project_signals_from_cwd("/Users/fer/repositories/mem-vault")
+    assert signals[0] == "mem-vault"
+
+
+def test_project_signals_skips_filesystem_noise():
+    from mem_vault.hooks.sessionstart import project_signals_from_cwd
+
+    # ``Users`` and ``repositories`` are noise; ``fer`` is a username-style
+    # short component. None of those should appear in the signals output.
+    signals = project_signals_from_cwd("/Users/fer/repositories/mem-vault")
+    assert "Users" not in signals
+    assert "repositories" not in signals
+    assert "fer" not in signals
+
+
+def test_project_signals_handles_empty_or_root():
+    from mem_vault.hooks.sessionstart import project_signals_from_cwd
+
+    assert project_signals_from_cwd(None) == []
+    assert project_signals_from_cwd("") == []
+    assert project_signals_from_cwd("/") == []
+
+
+def test_project_signals_keeps_compound_names():
+    from mem_vault.hooks.sessionstart import project_signals_from_cwd
+
+    # Names with ``-`` or ``_`` or ``.`` always stay (those are real project names).
+    signals = project_signals_from_cwd("/home/dev/work/big-data-pipeline")
+    assert signals[0] == "big-data-pipeline"
+
+
+def test_sessionstart_uses_cwd_for_project_memories(monkeypatch, capsys):
+    """When cwd resolves to a project, memorias relevantes go to the top section."""
+    service = AsyncMock()
+
+    async def _list(args):
+        if args.get("type") in ("preference", "feedback"):
+            return {"ok": True, "memories": []}
+        if args.get("tags") == ["project:mem-vault"]:
+            return {
+                "ok": True,
+                "memories": [
+                    {
+                        "id": "proj-1",
+                        "name": "Decisión arquitectura mem-vault",
+                        "description": "...",
+                    }
+                ],
+            }
+        return {"ok": True, "memories": []}
+
+    service.list_ = _list
+    service.search = AsyncMock(return_value={"ok": True, "results": []})
+
+    monkeypatch.setattr(
+        "mem_vault.hooks.sessionstart._resolve_cwd",
+        lambda payload: "/Users/fer/repositories/mem-vault",
+    )
+    _patch_stdin(monkeypatch, {})
+    _patch_build_service(monkeypatch, "sessionstart", service)
+
+    from mem_vault.hooks import sessionstart
+
+    importlib.reload(sessionstart)
+    monkeypatch.setattr(
+        "mem_vault.hooks.sessionstart._resolve_cwd",
+        lambda payload: "/Users/fer/repositories/mem-vault",
+    )
+    sessionstart.run()
+
+    captured = capsys.readouterr()
+    additional = json.loads(captured.out)["hookSpecificOutput"]["additionalContext"]
+    assert "Memorias del proyecto (`mem-vault`)" in additional
+    assert "Decisión arquitectura mem-vault" in additional
+
+
+def test_sessionstart_falls_back_to_semantic_search_when_no_tag_matches(monkeypatch, capsys):
+    """If no project:<leaf> tag exists, a semantic search on the leaf still pulls memorias."""
+    service = AsyncMock()
+
+    async def _list(args):
+        if args.get("tags"):
+            return {"ok": True, "memories": []}
+        if args.get("type") in ("preference", "feedback"):
+            return {"ok": True, "memories": []}
+        return {"ok": True, "memories": []}
+
+    service.list_ = _list
+    service.search = AsyncMock(
+        return_value={
+            "ok": True,
+            "results": [
+                {
+                    "memory": {
+                        "id": "sem-1",
+                        "name": "Semantic match for foo",
+                        "description": "...",
+                    }
+                }
+            ],
+        }
+    )
+
+    monkeypatch.setattr("mem_vault.hooks.sessionstart._resolve_cwd", lambda p: "/path/to/foo")
+    _patch_stdin(monkeypatch, {})
+    _patch_build_service(monkeypatch, "sessionstart", service)
+
+    from mem_vault.hooks import sessionstart
+
+    importlib.reload(sessionstart)
+    monkeypatch.setattr("mem_vault.hooks.sessionstart._resolve_cwd", lambda p: "/path/to/foo")
+    sessionstart.run()
+
+    additional = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
+    assert "Memorias del proyecto (`foo`)" in additional
+    assert "Semantic match for foo" in additional
+
+
 def test_sessionstart_empty_vault_writes_nothing(monkeypatch, capsys):
     service = AsyncMock()
     service.list_ = AsyncMock(return_value={"ok": True, "memories": []})
+    service.search = AsyncMock(return_value={"ok": True, "results": []})
 
     _patch_stdin(monkeypatch, {})
     _patch_build_service(monkeypatch, "sessionstart", service)
@@ -115,6 +250,7 @@ def test_sessionstart_invalid_stdin_does_not_crash(monkeypatch, capsys):
     """Garbage JSON on stdin must be tolerated — best-effort design."""
     service = AsyncMock()
     service.list_ = AsyncMock(return_value={"ok": True, "memories": []})
+    service.search = AsyncMock(return_value={"ok": True, "results": []})
 
     monkeypatch.setattr("sys.stdin", io.StringIO("not valid json {{"))
     _patch_build_service(monkeypatch, "sessionstart", service)
