@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -252,434 +253,12 @@ def _insert_wikilinks_section(body: str, related: list[tuple[str, str]]) -> str:
 # ---------------------------------------------------------------------------
 # Tool schemas
 # ---------------------------------------------------------------------------
+#
+# Moved to ``mem_vault.tool_schemas`` so the wiring file stays focused on
+# mechanism. Imported here under the legacy ``_TOOLS`` name; tests and
+# external consumers can still ``from mem_vault.server import _TOOLS``.
 
-_TOOLS: list[types.Tool] = [
-    types.Tool(
-        name="memory_save",
-        description=(
-            "Persist a memory in the user's Obsidian vault as a markdown file with "
-            "YAML frontmatter, then index it locally for semantic search. Use this "
-            "to remember decisions, preferences, bug fixes, conventions, or any "
-            "piece of context that should survive the current session.\n\n"
-            "Set auto_extract=true to let an Ollama LLM extract canonical facts "
-            "and dedupe against existing memories (slower, smarter). Default "
-            "(false) saves the literal content (faster, deterministic)."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "content": {
-                    "type": "string",
-                    "description": "The full memory body in markdown.",
-                },
-                "title": {
-                    "type": "string",
-                    "description": "Short human-readable title (defaults to first line of content).",
-                },
-                "description": {
-                    "type": "string",
-                    "description": "One-line synopsis (defaults to first ~200 chars of content).",
-                },
-                "type": {
-                    "type": "string",
-                    "enum": ["feedback", "preference", "decision", "fact", "note", "bug", "todo"],
-                    "default": "note",
-                },
-                "tags": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional tags for filtering later.",
-                },
-                "auto_extract": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "If true, run the LLM extractor + dedup. If false, save literally.",
-                },
-                "auto_link": {
-                    "type": "boolean",
-                    "description": (
-                        "If true, after a successful save, run a semantic search "
-                        "for similar memorias and stamp their IDs in this memory's "
-                        "``related`` frontmatter. Defaults to ``Config.auto_link_default`` "
-                        "(true unless globally disabled via MEM_VAULT_AUTO_LINK=0)."
-                    ),
-                },
-                "auto_contradict": {
-                    "type": "boolean",
-                    "description": (
-                        "If true, after a successful save, ask a local LLM whether "
-                        "the new body contradicts any of the top-5 semantically "
-                        "similar memorias; IDs of contradicting memorias are "
-                        "stamped in this memory's ``contradicts`` frontmatter. "
-                        "Adds ~3-5 s latency. Defaults to "
-                        "``Config.auto_contradict_default`` (false unless "
-                        "MEM_VAULT_AUTO_CONTRADICT=1)."
-                    ),
-                },
-                "visible_to": {
-                    "description": (
-                        "Which agents can see this memory. Defaults to public. Pass "
-                        "the string 'private' to scope it to the saving agent only, "
-                        "'public' for everyone (default), or a list of agent ids "
-                        "(['claude-code', 'cursor']) for explicit allowlist. The "
-                        "saving agent is always implicitly included."
-                    ),
-                    "oneOf": [
-                        {"type": "string", "enum": ["public", "private"]},
-                        {"type": "array", "items": {"type": "string"}},
-                    ],
-                },
-                "project": {
-                    "type": "string",
-                    "description": (
-                        "Project scope stamped in the index metadata. "
-                        "``memory_search`` uses it to filter results to "
-                        "memorias from the same project — faster than a "
-                        "tag filter because Qdrant indexes the payload. "
-                        "When omitted, inferred from the first "
-                        "``project:X`` tag or ``Config.project_default``."
-                    ),
-                },
-                "user_id": {"type": "string"},
-                "agent_id": {"type": "string"},
-            },
-            "required": ["content"],
-        },
-    ),
-    types.Tool(
-        name="memory_search",
-        description=(
-            "Semantic search across all memories using local embeddings. Returns "
-            "the top-k most relevant memories with their full content. Useful at "
-            "the start of a session to recover relevant context, or before "
-            "answering questions that depend on past decisions."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Natural-language query."},
-                "k": {"type": "integer", "default": 5, "minimum": 1, "maximum": 50},
-                "type": {
-                    "type": "string",
-                    "description": "Optional type filter.",
-                    "enum": ["feedback", "preference", "decision", "fact", "note", "bug", "todo"],
-                },
-                "user_id": {"type": "string"},
-                "threshold": {
-                    "type": "number",
-                    "default": 0.1,
-                    "description": "Minimum similarity score (0-1). Lower = more lenient.",
-                },
-                "project": {
-                    "type": "string",
-                    "description": (
-                        "Filter to memorias stamped with this project scope. "
-                        "Pass ``*`` (or empty string) to bypass "
-                        "``Config.project_default`` and search globally."
-                    ),
-                },
-            },
-            "required": ["query"],
-        },
-    ),
-    types.Tool(
-        name="memory_list",
-        description=(
-            "List memories sorted by most-recently-modified. Optional filters by "
-            "type, tags, or user_id. Use this to browse without a specific query."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "type": {
-                    "type": "string",
-                    "enum": ["feedback", "preference", "decision", "fact", "note", "bug", "todo"],
-                },
-                "tags": {"type": "array", "items": {"type": "string"}},
-                "user_id": {"type": "string"},
-                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 200},
-            },
-        },
-    ),
-    types.Tool(
-        name="memory_get",
-        description="Read a single memory by id (the file slug, e.g. `feedback_local_free_stack`).",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "id": {"type": "string", "description": "Memory id (filename without .md)."}
-            },
-            "required": ["id"],
-        },
-    ),
-    types.Tool(
-        name="memory_update",
-        description=(
-            "Replace fields on an existing memory. Any field omitted is left "
-            "unchanged. The `updated` timestamp is bumped automatically."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "content": {"type": "string"},
-                "title": {"type": "string"},
-                "description": {"type": "string"},
-                "tags": {"type": "array", "items": {"type": "string"}},
-                "visible_to": {
-                    "description": (
-                        "Change visibility scope. Pass 'private' to scope "
-                        "to the owner agent, 'public' for everyone, or a "
-                        "list of agent ids for an explicit allowlist. "
-                        "Omit to leave unchanged."
-                    ),
-                    "oneOf": [
-                        {"type": "string", "enum": ["public", "private"]},
-                        {"type": "array", "items": {"type": "string"}},
-                    ],
-                },
-            },
-            "required": ["id"],
-        },
-    ),
-    types.Tool(
-        name="memory_delete",
-        description=(
-            "Permanently delete a memory (its .md file + every embedding pointing "
-            "to it). This is irreversible — confirm with the user before calling "
-            "in agent flows."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {"id": {"type": "string"}},
-            "required": ["id"],
-        },
-    ),
-    types.Tool(
-        name="memory_briefing",
-        description=(
-            "Compose a project-aware boot briefing: total memorias of the "
-            "current project (resolved from ``cwd``) + total global, last 3 "
-            "by recency, top 5 co-tags, lint summary. Designed for the skill "
-            "to render the 6-line summary on the first ``/mv`` of a session "
-            "so the agent enters the conversation knowing what's in the vault."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "cwd": {
-                    "type": "string",
-                    "description": "Absolute path to the project root. Used to derive the project_tag.",
-                },
-            },
-        },
-    ),
-    types.Tool(
-        name="memory_derive_metadata",
-        description=(
-            "Run the keyword-priority classifiers on a memory body and "
-            "return a suggested ``{title, type, tags, missing_tags}``. "
-            "Intended to be called by the skill *before* ``memory_save`` "
-            "so the user only types the body and the metadata is filled "
-            "in automatically. ``missing_tags > 0`` means the body didn't "
-            "match enough patterns to reach 3 tags — the skill should ask "
-            "the user for one more before saving."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "content": {"type": "string"},
-                "cwd": {"type": "string"},
-            },
-            "required": ["content"],
-        },
-    ),
-    types.Tool(
-        name="memory_stats",
-        description=(
-            "Aggregate counts over the memory corpus: by ``type``, by "
-            "``agent_id``, top tags, and age histogram (today / week / "
-            "month / older). When ``cwd`` is provided, scopes to memorias "
-            "tagged with the resolved ``project_tag``."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {"cwd": {"type": "string"}},
-        },
-    ),
-    types.Tool(
-        name="memory_duplicates",
-        description=(
-            "Surface pairs of memorias with high tag-overlap Jaccard — cheap "
-            "candidate duplicate detection without hitting Qdrant. Use this "
-            "when the user asks 'tengo dos memorias parecidas?' for a quick "
-            "answer; for deep semantic dedup use ``mem-vault consolidate``."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "threshold": {
-                    "type": "number",
-                    "default": 0.7,
-                    "description": "Jaccard threshold; pairs with score < this are skipped.",
-                },
-                "cwd": {"type": "string"},
-            },
-        },
-    ),
-    types.Tool(
-        name="memory_lint",
-        description=(
-            "List memorias with structural issues: <3 tags, missing "
-            "``description``, body shorter than 100 chars, body without "
-            "``## Aprendido el YYYY-MM-DD`` line. Useful before "
-            "``mem-vault consolidate`` to spot underdeveloped entries."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {"cwd": {"type": "string"}},
-        },
-    ),
-    types.Tool(
-        name="memory_related",
-        description=(
-            "Walk the local knowledge graph around one memory and return its "
-            "neighbors, grouped by relationship type:\n\n"
-            "- ``related``: the explicit ``related:`` frontmatter list "
-            "(wikilinks stamped by auto-link).\n"
-            "- ``contradicts``: the ``contradicts:`` frontmatter list "
-            "(populated by auto-contradict).\n"
-            "- ``cotag_neighbors``: memorias that share ≥ ``min_shared_tags`` "
-            "normalized tags (``project:foo`` splits on colon).\n"
-            "- ``semantic_neighbors``: top-``k`` results from a semantic "
-            "search over the memory's body. Skipped when ``include_semantic`` "
-            "is false (no LLM / Qdrant call).\n\n"
-            "Use this to explore what the vault knows around a single node "
-            "without reconstructing the graph yourself."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "id": {"type": "string", "description": "Memory id (filename slug without .md)."},
-                "min_shared_tags": {
-                    "type": "integer",
-                    "default": 2,
-                    "minimum": 1,
-                    "maximum": 10,
-                    "description": "Threshold for co-tag neighbor edges.",
-                },
-                "k": {
-                    "type": "integer",
-                    "default": 5,
-                    "minimum": 1,
-                    "maximum": 50,
-                    "description": "How many semantic neighbors to include.",
-                },
-                "include_semantic": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": (
-                        "If false, skip the semantic search step (cheaper, "
-                        "deterministic — relies on tag structure only)."
-                    ),
-                },
-            },
-            "required": ["id"],
-        },
-    ),
-    types.Tool(
-        name="memory_history",
-        description=(
-            "Return the edit history of a memory — every snapshot taken "
-            "before an ``update`` (body, title, description, tags, related, "
-            "contradicts). Entries are ordered newest-first. Useful when you "
-            "want to see what a memory said last week, or to recover a field "
-            "that got overwritten. Memorias with no updates return an empty "
-            "list."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "id": {"type": "string", "description": "Memory id (filename slug without .md)."},
-                "limit": {
-                    "type": "integer",
-                    "default": 20,
-                    "minimum": 1,
-                    "maximum": 500,
-                    "description": "Cap the number of entries returned.",
-                },
-            },
-            "required": ["id"],
-        },
-    ),
-    types.Tool(
-        name="memory_feedback",
-        description=(
-            "Record thumbs up/down on a memory. Bumps ``helpful_count`` or "
-            "``unhelpful_count`` in the memory's frontmatter and updates "
-            "``last_used``. ``memory_search`` uses these counters to lift "
-            "memorias that were positively judged above neutral peers. "
-            "Call this right after the agent actually relied on a memory "
-            "in its response (manual), or let the Stop hook infer it from "
-            "citations (automatic). Set ``helpful`` to null to record a "
-            "plain 'I used this' event without a polarity vote."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "id": {
-                    "type": "string",
-                    "description": "Memory id (filename slug without .md).",
-                },
-                "helpful": {
-                    "type": ["boolean", "null"],
-                    "description": (
-                        "true = thumbs up (bumps helpful_count); false = "
-                        "thumbs down (bumps unhelpful_count); null / omitted "
-                        "= just mark 'used' without polarity."
-                    ),
-                },
-            },
-            "required": ["id"],
-        },
-    ),
-    types.Tool(
-        name="memory_synthesize",
-        description=(
-            "Compose an LLM-written summary of what the system knows about "
-            "``query``. Internally runs a wide semantic search (default k=10) "
-            "and asks the local LLM (Ollama) to weave the matched memorias "
-            "into a coherent answer in español rioplatense, citing the source "
-            "IDs inline. Use this when the user asks an open-ended question "
-            '("resumime todo lo que sé sobre X") — it\'s the difference '
-            "between dumping a list of bullets and getting an interlocutor "
-            "that actually responds."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Topic or question to synthesize an answer for.",
-                },
-                "k": {
-                    "type": "integer",
-                    "default": 10,
-                    "minimum": 1,
-                    "maximum": 30,
-                    "description": "How many memorias to feed into the LLM.",
-                },
-                "threshold": {
-                    "type": "number",
-                    "default": 0.1,
-                    "description": "Minimum similarity for a memory to be included.",
-                },
-            },
-            "required": ["query"],
-        },
-    ),
-]
-
+from mem_vault.tool_schemas import _TOOLS  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Tool handlers
@@ -708,9 +287,55 @@ class MemVaultService:
                 k1=config.hybrid_bm25_k1,
                 b=config.hybrid_bm25_b,
             )
+        # Corpus cache: short-TTL memoization of ``storage.list(limit=∞)``
+        # for the discovery verbs (briefing / stats / duplicates / lint /
+        # related). Each one walks the entire vault to compute aggregates;
+        # at 1k+ memorias the repeated parse-from-disk is the bottleneck
+        # of every ``/mv`` boot briefing. Caching by ``frozenset(tags)``
+        # because the verbs vary their filter (briefing/related: no tag
+        # filter; stats/duplicates/lint: project-tag filter when ``cwd``
+        # was passed). Mutating verbs (save/update/delete) invalidate by
+        # clearing the dict outright — simpler than tracking which keys
+        # an edit touched, and the next read repopulates lazily.
+        self._corpus_cache: dict[frozenset[str], tuple[float, list[Any]]] = {}
+        # 30 s is short enough that an out-of-band edit (manual ``.md``
+        # write, ``mem-vault reindex``, another process saving) is visible
+        # within one tick of any caller, while still covering the burst
+        # case of "5 discovery tools called back-to-back during ``/mv`` boot".
+        self._corpus_cache_ttl_s: float = 30.0
 
     async def _to_thread(self, fn, *args, **kwargs):
         return await asyncio.to_thread(fn, *args, **kwargs)
+
+    async def _list_corpus(self, *, tags: list[str] | None = None) -> list[Any]:
+        """Cached wrapper over ``storage.list(type=None, user_id=None, limit=∞)``.
+
+        Used by every "scan-the-whole-vault" verb (briefing, stats,
+        duplicates, lint, related). The cache key is the optional tag
+        filter (the only varying parameter across these calls). TTL is
+        ``self._corpus_cache_ttl_s``; mutating verbs blow the entire
+        cache via :py:meth:`_invalidate_corpus_cache` so a save/update/
+        delete in one tool call shows up in a discovery call on the
+        next without waiting for the TTL to lapse.
+        """
+        key: frozenset[str] = frozenset(tags or ())
+        now = time.monotonic()
+        entry = self._corpus_cache.get(key)
+        if entry is not None and (now - entry[0]) < self._corpus_cache_ttl_s:
+            return entry[1]
+        result = await self._to_thread(
+            self.storage.list,
+            type=None,
+            tags=tags,
+            user_id=None,
+            limit=10**9,
+        )
+        self._corpus_cache[key] = (now, result)
+        return result
+
+    def _invalidate_corpus_cache(self) -> None:
+        """Drop every cached corpus snapshot. Called after writes."""
+        self._corpus_cache.clear()
 
     def _resolve_project_scope(
         self,
@@ -1011,6 +636,7 @@ class MemVaultService:
             visible_to=visible_to,
         )
         self._invalidate_hybrid()
+        self._invalidate_corpus_cache()
 
         # Derive the project scope: explicit ``project`` arg > the first
         # ``project:X`` tag > ``config.project_default``. Stamped into the
@@ -1119,6 +745,7 @@ class MemVaultService:
                     )
                     # Auto-link rewrote the body → invalidate BM25 again.
                     self._invalidate_hybrid()
+                    self._invalidate_corpus_cache()
                     # Only claim the cross-links once they hit disk. If the
                     # write failed, ``related`` would point at IDs that are
                     # *not* actually persisted in the frontmatter — the
@@ -1144,6 +771,7 @@ class MemVaultService:
                         contradicts=contradict_ids,
                     )
                     self._invalidate_hybrid()
+                    self._invalidate_corpus_cache()
                 except Exception as exc:
                     logger.warning("contradict-stamp write failed for %s: %s", mem.id, exc)
                     # Don't claim we stamped them if the write failed.
@@ -1561,6 +1189,7 @@ class MemVaultService:
         except FileNotFoundError as exc:
             return {"ok": False, "error": str(exc)}
         self._invalidate_hybrid()
+        self._invalidate_corpus_cache()
 
         # We re-index when *anything* the index keeps in metadata changes,
         # not only ``content``: the index payload carries ``tags`` (used to
@@ -1627,6 +1256,7 @@ class MemVaultService:
         if not existed:
             return {"ok": False, "error": f"Memory not found: {mem_id}"}
         self._invalidate_hybrid()
+        self._invalidate_corpus_cache()
         try:
             removed = await self._to_thread(
                 self.index.delete_by_metadata, "memory_id", mem_id, self.config.user_id
@@ -1651,13 +1281,7 @@ class MemVaultService:
         cwd = args.get("cwd")
         project_tag = derive_project_tag(cwd, content="") if cwd else None
 
-        all_memories = await self._to_thread(
-            self.storage.list,
-            type=None,
-            tags=None,
-            user_id=None,
-            limit=10**9,
-        )
+        all_memories = await self._list_corpus()
         if project_tag:
             project_memories = [m for m in all_memories if project_tag in (m.tags or [])]
         else:
@@ -1745,13 +1369,7 @@ class MemVaultService:
         """Aggregate counts (by type, by agent, top tags, age buckets) over the corpus."""
         cwd = args.get("cwd")
         project_tag = derive_project_tag(cwd, content="") if cwd else None
-        memories = await self._to_thread(
-            self.storage.list,
-            type=None,
-            tags=[project_tag] if project_tag else None,
-            user_id=None,
-            limit=10**9,
-        )
+        memories = await self._list_corpus(tags=[project_tag] if project_tag else None)
         result = compute_stats(memories)
         result["ok"] = True
         result["scope"] = project_tag or "global"
@@ -1767,13 +1385,7 @@ class MemVaultService:
         threshold = float(args.get("threshold", 0.7))
         cwd = args.get("cwd")
         project_tag = derive_project_tag(cwd, content="") if cwd else None
-        memories = await self._to_thread(
-            self.storage.list,
-            type=None,
-            tags=[project_tag] if project_tag else None,
-            user_id=None,
-            limit=10**9,
-        )
+        memories = await self._list_corpus(tags=[project_tag] if project_tag else None)
         pairs = find_duplicate_pairs_by_tag_overlap(memories, threshold=threshold)
         return {
             "ok": True,
@@ -1787,13 +1399,7 @@ class MemVaultService:
         """List memorias with structural issues (few tags, no body, etc.)."""
         cwd = args.get("cwd")
         project_tag = derive_project_tag(cwd, content="") if cwd else None
-        memories = await self._to_thread(
-            self.storage.list,
-            type=None,
-            tags=[project_tag] if project_tag else None,
-            user_id=None,
-            limit=10**9,
-        )
+        memories = await self._list_corpus(tags=[project_tag] if project_tag else None)
         problems: list[dict[str, Any]] = []
         for m in memories:
             issues = lint_memory(m)
@@ -1837,11 +1443,11 @@ class MemVaultService:
                 "code": "not_found",
             }
 
-        # Grab the full corpus once — cheap for the size the vault usually is,
-        # and we need it for co-tag computation anyway.
-        corpus = await self._to_thread(
-            self.storage.list, type=None, tags=None, user_id=None, limit=10**9
-        )
+        # Grab the full corpus once — needed for co-tag computation. Goes
+        # through ``_list_corpus`` so back-to-back ``related`` calls in
+        # the same /mv session reuse the cached snapshot instead of
+        # re-walking the vault each time.
+        corpus = await self._list_corpus()
         by_id = {m.id: m for m in corpus}
 
         def _mini(m_id: str) -> dict[str, Any]:
