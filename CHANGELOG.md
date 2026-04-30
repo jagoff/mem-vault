@@ -6,6 +6,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed — bundled `SKILL.md` syncs with the in-use richer version
+
+The `SKILL.md` shipped via `mem-vault install-skill` (175 lines) was
+materially leaner than the version several users were already running
+locally (544 lines). Synced the bundled template with the latter so a
+fresh `install-skill` lands the same flow that drove the past few
+months of mem-vault usage:
+
+- **Discovery verbs** documented inline: `/mv stats`, `/mv recent [n]`,
+  `/mv top <tag>`, `/mv duplicates`, `/mv timeline <project>`,
+  `/mv lint`, `/mv merge <id1> <id2>`.
+- **Auto-context injection** spec — silent `memory_search` on the first
+  tool call of each task when the user message is >20 chars, with
+  threshold + skip rules.
+- **Auto-save triggers** numbered (10 categories), each with a type
+  hint and a real-world example, plus an explicit anti-spam clause
+  (no auto-save in the last 10 min, body <200 chars, etc.).
+- **Title / type / tags classifier** documented inline as a fallback
+  for callers that don't have access to `memory_derive_metadata`. The
+  ≥3-tag rule is hard, with a one-line ask-the-user prompt when
+  derivation falls short.
+- **Project-tag override table** for memories about agent configs
+  (`~/.config/devin/skills`, `~/.claude/...`) so they don't pick up
+  the cwd's repo tag by mistake.
+- **Cross-linking** (`## Memorias relacionadas` + `[[wikilinks]]`)
+  spelled out as part of the save flow.
+- **Output formatting** examples per verb.
+
+The `test_skill_template_contains_auto_capture_directive` test was
+loosened to probe the *contract* (proactive section + main triggers +
+opt-out) rather than specific phrasing, so future copy edits don't
+trigger false negatives.
+
 ### Fixed — loop-closure audit (11 bugs)
 
 Full audit of the eight learning loops (save → index → search → update →
