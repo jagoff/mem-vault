@@ -163,6 +163,47 @@ class MemoryUpdate(BaseModel):
     project: str | None = None
 
 
+class DeriveMetadataRequest(BaseModel):
+    """Request body for ``POST /api/v1/derive_metadata``.
+
+    The body is a tiny JSON wrapper around the in-process call so the remote
+    client doesn't have to URL-encode multi-KB ``content`` payloads.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = Field(..., min_length=1)
+    cwd: str | None = None
+
+
+class FeedbackRequest(BaseModel):
+    """Request body for ``POST /api/v1/memories/{id}/feedback``.
+
+    ``helpful`` is a tri-state: ``true`` (thumbs up), ``false`` (thumbs down),
+    ``null``/omitted (just record a 'used' event). Mirrors the in-process
+    ``MemVaultService.feedback`` contract.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    helpful: bool | None = None
+
+
+class SynthesizeRequest(BaseModel):
+    """Request body for ``POST /api/v1/synthesize``.
+
+    Accepts the same ``{query, k, threshold}`` shape that ``memory_synthesize``
+    takes. POST instead of GET because the LLM can chew on multi-paragraph
+    questions that would be ugly as a query string.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(..., min_length=1)
+    k: int = Field(10, ge=1, le=30)
+    threshold: float = Field(0.1, ge=0.0, le=1.0)
+
+
 def create_app(service: MemVaultService | None = None) -> FastAPI:
     """Build the FastAPI application. Accepts an optional pre-built service for tests."""
     if service is None:
@@ -528,6 +569,71 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
     @app.delete("/api/v1/memories/{mem_id}")
     async def api_v1_delete(mem_id: str):
         return JSONResponse(await service.delete({"id": mem_id}))
+
+    # ----- API v1: discovery / introspection tools -------------------------
+    # Mirror the 9 ``MemVaultService`` methods that aren't basic CRUD so
+    # ``RemoteMemVaultService`` can route every MCP tool through HTTP. Each
+    # endpoint forwards its query/path/body params into a plain ``dict`` and
+    # returns whatever the service returns — the JSON shape is the same the
+    # in-process call would produce, by design.
+
+    @app.get("/api/v1/briefing")
+    async def api_v1_briefing(cwd: str | None = None):
+        return JSONResponse(await service.briefing({"cwd": cwd}))
+
+    @app.post("/api/v1/derive_metadata")
+    async def api_v1_derive_metadata(payload: DeriveMetadataRequest):
+        return JSONResponse(await service.derive_metadata(payload.model_dump(exclude_none=True)))
+
+    @app.get("/api/v1/stats")
+    async def api_v1_stats(cwd: str | None = None):
+        return JSONResponse(await service.stats({"cwd": cwd}))
+
+    @app.get("/api/v1/duplicates")
+    async def api_v1_duplicates(
+        threshold: float = Query(0.7, ge=0.0, le=1.0),
+        cwd: str | None = None,
+    ):
+        return JSONResponse(await service.duplicates({"threshold": threshold, "cwd": cwd}))
+
+    @app.get("/api/v1/lint")
+    async def api_v1_lint(cwd: str | None = None):
+        return JSONResponse(await service.lint({"cwd": cwd}))
+
+    @app.get("/api/v1/memories/{mem_id}/related")
+    async def api_v1_related(
+        mem_id: str,
+        min_shared_tags: int = Query(2, ge=1, le=10),
+        k: int = Query(5, ge=1, le=50),
+        include_semantic: bool = True,
+    ):
+        return JSONResponse(
+            await service.related(
+                {
+                    "id": mem_id,
+                    "min_shared_tags": min_shared_tags,
+                    "k": k,
+                    "include_semantic": include_semantic,
+                }
+            )
+        )
+
+    @app.get("/api/v1/memories/{mem_id}/history")
+    async def api_v1_history(
+        mem_id: str,
+        limit: int = Query(20, ge=1, le=500),
+    ):
+        return JSONResponse(await service.history({"id": mem_id, "limit": limit}))
+
+    @app.post("/api/v1/memories/{mem_id}/feedback")
+    async def api_v1_feedback(mem_id: str, payload: FeedbackRequest):
+        # Use ``model_dump`` (NOT ``exclude_none``): ``helpful=None`` is a
+        # legitimate "just record usage" signal, not a missing field.
+        return JSONResponse(await service.feedback({"id": mem_id, "helpful": payload.helpful}))
+
+    @app.post("/api/v1/synthesize")
+    async def api_v1_synthesize(payload: SynthesizeRequest):
+        return JSONResponse(await service.synthesize(payload.model_dump()))
 
     # ----- Graph view -------------------------------------------------------
 

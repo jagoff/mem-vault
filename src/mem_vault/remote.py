@@ -154,6 +154,85 @@ class RemoteMemVaultService:
         mem_id = args["id"]
         return await self._delete(f"/api/v1/memories/{mem_id}")
 
+    # ---- discovery / introspection (mirror MemVaultService) --------------
+    #
+    # Each of these maps 1:1 to a tool declared in ``server._TOOLS`` so the
+    # ``_build_handlers`` symmetry check passes when the MCP server runs in
+    # remote mode. The endpoints they hit are defined in
+    # ``mem_vault/ui/server.py`` under the same ``/api/v1/*`` prefix as the
+    # CRUD endpoints above.
+
+    async def briefing(self, args: dict[str, Any]) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if args.get("cwd"):
+            params["cwd"] = args["cwd"]
+        return await self._get("/api/v1/briefing", params=params)
+
+    async def derive_metadata(self, args: dict[str, Any]) -> dict[str, Any]:
+        # ``content`` can be multi-KB, so this is a POST body — mirror
+        # the in-process arg shape and let the server's Pydantic model
+        # do the validation.
+        body: dict[str, Any] = {"content": args.get("content", "")}
+        if args.get("cwd"):
+            body["cwd"] = args["cwd"]
+        return await self._post("/api/v1/derive_metadata", json=body)
+
+    async def stats(self, args: dict[str, Any]) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if args.get("cwd"):
+            params["cwd"] = args["cwd"]
+        return await self._get("/api/v1/stats", params=params)
+
+    async def duplicates(self, args: dict[str, Any]) -> dict[str, Any]:
+        params: dict[str, Any] = {"threshold": float(args.get("threshold", 0.7))}
+        if args.get("cwd"):
+            params["cwd"] = args["cwd"]
+        return await self._get("/api/v1/duplicates", params=params)
+
+    async def lint(self, args: dict[str, Any]) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if args.get("cwd"):
+            params["cwd"] = args["cwd"]
+        return await self._get("/api/v1/lint", params=params)
+
+    async def related(self, args: dict[str, Any]) -> dict[str, Any]:
+        mem_id = args.get("id")
+        if not mem_id:
+            # Mirror the in-process service's validation envelope so the
+            # MCP dispatcher gets a consistent error shape regardless of
+            # which side of the HTTP boundary the check fires on.
+            return {"ok": False, "error": "id is required", "code": "validation_failed"}
+        params: dict[str, Any] = {
+            "min_shared_tags": int(args.get("min_shared_tags", 2)),
+            "k": int(args.get("k", 5)),
+            "include_semantic": bool(args.get("include_semantic", True)),
+        }
+        return await self._get(f"/api/v1/memories/{mem_id}/related", params=params)
+
+    async def history(self, args: dict[str, Any]) -> dict[str, Any]:
+        mem_id = args.get("id")
+        if not mem_id:
+            return {"ok": False, "error": "id is required", "code": "validation_failed"}
+        params: dict[str, Any] = {"limit": int(args.get("limit", 20))}
+        return await self._get(f"/api/v1/memories/{mem_id}/history", params=params)
+
+    async def feedback(self, args: dict[str, Any]) -> dict[str, Any]:
+        mem_id = args.get("id")
+        if not mem_id:
+            return {"ok": False, "error": "id is required", "code": "validation_failed"}
+        # ``helpful`` may be ``None`` ("just record usage") — preserve it
+        # explicitly (don't strip with ``exclude_none``).
+        body: dict[str, Any] = {"helpful": args.get("helpful")}
+        return await self._post(f"/api/v1/memories/{mem_id}/feedback", json=body)
+
+    async def synthesize(self, args: dict[str, Any]) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "query": args.get("query", ""),
+            "k": int(args.get("k", 10)),
+            "threshold": float(args.get("threshold", 0.1)),
+        }
+        return await self._post("/api/v1/synthesize", json=body)
+
     # ---- low-level helpers -----------------------------------------------
 
     async def _get(self, path: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:

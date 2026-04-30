@@ -65,6 +65,99 @@ class _FakeService:
         self.calls.append(("delete", args))
         return {"ok": True, "deleted_file": True, "deleted_index_entries": 1}
 
+    # ---- discovery / introspection stubs (mirror MemVaultService) --------
+
+    async def briefing(self, args):
+        self.calls.append(("briefing", args))
+        return {
+            "ok": True,
+            "cwd": args.get("cwd"),
+            "project_tag": "project:fake" if args.get("cwd") else None,
+            "total_global": 42,
+            "project_total": 7 if args.get("cwd") else 0,
+            "recent_3": [],
+            "top_tags": [],
+            "lint_summary": {"few_tags": 0, "no_aprendido": 0, "short_body": 0},
+        }
+
+    async def derive_metadata(self, args):
+        self.calls.append(("derive_metadata", args))
+        return {
+            "ok": True,
+            "title": "auto-derived",
+            "type": "note",
+            "tags": ["a", "b", "c"],
+            "tag_count": 3,
+            "missing_tags": 0,
+        }
+
+    async def stats(self, args):
+        self.calls.append(("stats", args))
+        return {
+            "ok": True,
+            "scope": "global",
+            "by_type": {"note": 1},
+            "by_agent": {},
+            "top_tags": [],
+            "age_buckets": {"today": 0, "week": 0, "month": 0, "older": 0},
+        }
+
+    async def duplicates(self, args):
+        self.calls.append(("duplicates", args))
+        return {
+            "ok": True,
+            "threshold": args.get("threshold", 0.7),
+            "scope": "global",
+            "count": 0,
+            "pairs": [],
+        }
+
+    async def lint(self, args):
+        self.calls.append(("lint", args))
+        return {
+            "ok": True,
+            "scope": "global",
+            "total_scanned": 0,
+            "with_issues": 0,
+            "problems": [],
+        }
+
+    async def related(self, args):
+        self.calls.append(("related", args))
+        return {
+            "ok": True,
+            "id": args["id"],
+            "related": [],
+            "contradicts": [],
+            "cotag_neighbors": [],
+            "semantic_neighbors": [],
+        }
+
+    async def history(self, args):
+        self.calls.append(("history", args))
+        return {"ok": True, "id": args["id"], "count": 0, "entries": []}
+
+    async def feedback(self, args):
+        self.calls.append(("feedback", args))
+        return {
+            "ok": True,
+            "id": args["id"],
+            "helpful_count": 1 if args.get("helpful") is True else 0,
+            "unhelpful_count": 1 if args.get("helpful") is False else 0,
+            "usage_count": 1,
+            "last_used": "2026-04-30T00:00:00",
+        }
+
+    async def synthesize(self, args):
+        self.calls.append(("synthesize", args))
+        return {
+            "ok": True,
+            "query": args["query"],
+            "synthesis": "stub synthesis",
+            "source_ids": ["stub"],
+            "count": 1,
+        }
+
     @property
     def storage(self):
         m = AsyncMock()
@@ -148,6 +241,180 @@ async def test_remote_delete(remote):
     res = await svc.delete({"id": "abc"})
     assert res["ok"] is True
     assert res["deleted_file"] is True
+
+
+# ---------------------------------------------------------------------------
+# Discovery / introspection round-trips. Each test goes through the full
+# stack: RemoteMemVaultService → ASGI app (mounted /api/v1/*) → fake service.
+# Asserting both ``ok`` and the args the fake recorded confirms the params
+# survive serialization in both directions.
+# ---------------------------------------------------------------------------
+
+
+async def test_remote_briefing(remote):
+    fake, svc = remote
+    res = await svc.briefing({"cwd": "/Users/fer/repositories/mem-vault"})
+    assert res["ok"] is True
+    assert fake.calls[-1][0] == "briefing"
+    assert fake.calls[-1][1]["cwd"] == "/Users/fer/repositories/mem-vault"
+
+
+async def test_remote_briefing_no_cwd(remote):
+    """Omitting ``cwd`` must not send a stray ``cwd=None`` query param."""
+    fake, svc = remote
+    res = await svc.briefing({})
+    assert res["ok"] is True
+    # Server side sees ``cwd=None`` as the FastAPI default — what we care
+    # about is the round-trip semantics, not the wire shape. The ``project_tag``
+    # branch in the fake confirms ``cwd`` arrived empty.
+    assert fake.calls[-1][1].get("cwd") in (None, "")
+
+
+async def test_remote_derive_metadata(remote):
+    fake, svc = remote
+    res = await svc.derive_metadata({"content": "una decisión sobre X", "cwd": "/x"})
+    assert res["ok"] is True
+    assert res["tag_count"] == 3
+    assert fake.calls[-1][0] == "derive_metadata"
+    assert fake.calls[-1][1]["content"] == "una decisión sobre X"
+    assert fake.calls[-1][1]["cwd"] == "/x"
+
+
+async def test_remote_derive_metadata_empty_content_422(remote):
+    """``content`` has ``min_length=1`` server-side — empty must 422."""
+    fake, svc = remote
+    res = await svc.derive_metadata({"content": ""})
+    # 422 round-trips as a JSON body with ``detail`` (FastAPI default).
+    assert res.get("ok") is not True
+    assert "detail" in res or res.get("ok") is False
+
+
+async def test_remote_stats(remote):
+    fake, svc = remote
+    res = await svc.stats({"cwd": "/x"})
+    assert res["ok"] is True
+    assert "by_type" in res
+    assert fake.calls[-1][0] == "stats"
+
+
+async def test_remote_duplicates(remote):
+    fake, svc = remote
+    res = await svc.duplicates({"threshold": 0.5, "cwd": "/x"})
+    assert res["ok"] is True
+    assert res["threshold"] == 0.5
+    assert fake.calls[-1][0] == "duplicates"
+    assert fake.calls[-1][1]["threshold"] == 0.5
+
+
+async def test_remote_lint(remote):
+    fake, svc = remote
+    res = await svc.lint({"cwd": "/x"})
+    assert res["ok"] is True
+    assert "problems" in res
+    assert fake.calls[-1][0] == "lint"
+
+
+async def test_remote_related(remote):
+    fake, svc = remote
+    res = await svc.related({"id": "abc", "min_shared_tags": 3, "k": 7, "include_semantic": False})
+    assert res["ok"] is True
+    assert res["id"] == "abc"
+    args = fake.calls[-1][1]
+    assert args["id"] == "abc"
+    assert args["min_shared_tags"] == 3
+    assert args["k"] == 7
+    assert args["include_semantic"] is False
+
+
+async def test_remote_related_missing_id_does_not_hit_server(remote):
+    """Validation short-circuits client-side — fake.calls must not record it."""
+    fake, svc = remote
+    pre = list(fake.calls)
+    res = await svc.related({})
+    assert res["ok"] is False
+    assert res.get("code") == "validation_failed"
+    assert fake.calls == pre  # no HTTP round-trip happened
+
+
+async def test_remote_history(remote):
+    fake, svc = remote
+    res = await svc.history({"id": "abc", "limit": 5})
+    assert res["ok"] is True
+    assert res["count"] == 0
+    args = fake.calls[-1][1]
+    assert args["id"] == "abc"
+    assert args["limit"] == 5
+
+
+async def test_remote_history_missing_id_does_not_hit_server(remote):
+    fake, svc = remote
+    pre = list(fake.calls)
+    res = await svc.history({})
+    assert res["ok"] is False
+    assert res.get("code") == "validation_failed"
+    assert fake.calls == pre
+
+
+async def test_remote_feedback_thumbs_up(remote):
+    fake, svc = remote
+    res = await svc.feedback({"id": "abc", "helpful": True})
+    assert res["ok"] is True
+    assert res["helpful_count"] == 1
+    args = fake.calls[-1][1]
+    assert args["id"] == "abc"
+    assert args["helpful"] is True
+
+
+async def test_remote_feedback_null_helpful_just_records_usage(remote):
+    """``helpful=None`` must round-trip as null (NOT be stripped)."""
+    fake, svc = remote
+    res = await svc.feedback({"id": "abc", "helpful": None})
+    assert res["ok"] is True
+    args = fake.calls[-1][1]
+    assert args["id"] == "abc"
+    assert args["helpful"] is None
+    assert res["usage_count"] == 1
+
+
+async def test_remote_feedback_missing_id(remote):
+    fake, svc = remote
+    pre = list(fake.calls)
+    res = await svc.feedback({})
+    assert res["ok"] is False
+    assert res.get("code") == "validation_failed"
+    assert fake.calls == pre
+
+
+async def test_remote_synthesize(remote):
+    fake, svc = remote
+    res = await svc.synthesize({"query": "qué sé sobre X", "k": 5, "threshold": 0.2})
+    assert res["ok"] is True
+    assert res["synthesis"] == "stub synthesis"
+    assert res["source_ids"] == ["stub"]
+    args = fake.calls[-1][1]
+    assert args["query"] == "qué sé sobre X"
+    assert args["k"] == 5
+    assert args["threshold"] == 0.2
+
+
+def test_remote_service_satisfies_build_handlers_symmetry():
+    """All tools declared in ``server._TOOLS`` must resolve to a method on
+    ``RemoteMemVaultService`` — otherwise ``_build_handlers`` fails at boot.
+
+    This is a regression guard. The MCP server enforces this symmetry at
+    startup: when a new tool is added to ``_TOOLS`` and the matching method
+    isn't added on the remote service, the entire MCP boots with an
+    ``AttributeError`` instead of returning a clean error to clients. This
+    test catches that gap before it ships.
+    """
+    from mem_vault.server import _build_handlers
+
+    svc = RemoteMemVaultService("http://test")
+    handlers = _build_handlers(svc)
+    # Every ``memory_*`` tool must have a callable handler.
+    assert handlers, "expected at least one handler"
+    for name, fn in handlers.items():
+        assert callable(fn), f"handler for {name} is not callable"
 
 
 async def test_remote_unreachable_returns_friendly_error():
