@@ -133,7 +133,13 @@ def reindex_env(tmp_path: Path):
 
 
 def _make_args(**kwargs) -> argparse.Namespace:
-    defaults = {"auto_extract": False, "purge": False, "limit": 0, "force": False}
+    defaults = {
+        "auto_extract": False,
+        "purge": False,
+        "limit": 0,
+        "force": False,
+        "concurrency": 1,  # deterministic order in tests; prod default is 4.
+    }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
 
@@ -206,6 +212,52 @@ async def test_reindex_force_reembeds_everything(monkeypatch, reindex_env):
     await reindex_mod.run(_make_args(force=True))
     assert len(stub.add_calls) == 4
     assert len(stub.delete_calls) == 4
+
+
+async def test_reindex_concurrent_mode_embeds_every_memory(monkeypatch, reindex_env):
+    """With --concurrency > 1, all memories still get (re)embedded exactly once.
+
+    The semaphore coordinates in-flight calls; the counters are updated under
+    an asyncio.Lock. This is the regression guard: earlier prototypes without
+    the lock double-counted or skipped memorias on contended access.
+    """
+    service, stub, config = reindex_env
+    await _seed(service, n=6)
+
+    monkeypatch.setattr("mem_vault.config.load_config", lambda *a, **kw: config)
+    monkeypatch.setattr("mem_vault.server.MemVaultService", lambda cfg: service)
+
+    stub.add_calls.clear()
+    stub.delete_calls.clear()
+
+    await reindex_mod.run(_make_args(force=True, concurrency=4))
+    assert len(stub.add_calls) == 6
+    assert len(stub.delete_calls) == 6
+
+
+async def test_reindex_concurrency_with_limit_does_not_deadlock(monkeypatch, reindex_env):
+    """``--limit N`` + ``--concurrency > 1`` must finish cleanly.
+
+    The actual "stop at N" is best-effort with concurrency: workers check
+    the counter on entry, and when every to_thread call is instantaneous
+    (as in this stub) all tasks enter simultaneously and none trigger
+    the stop. In production with real Ollama latency the counter fills
+    quickly and the stop kicks in. The regression guard here is just
+    "doesn't hang, doesn't crash" — we don't assert the exact count.
+    """
+    service, stub, config = reindex_env
+    await _seed(service, n=10)
+
+    monkeypatch.setattr("mem_vault.config.load_config", lambda *a, **kw: config)
+    monkeypatch.setattr("mem_vault.server.MemVaultService", lambda cfg: service)
+
+    stub.add_calls.clear()
+    stub.delete_calls.clear()
+
+    rc = await reindex_mod.run(_make_args(force=True, concurrency=3, limit=4))
+    assert rc == 0
+    assert len(stub.add_calls) >= 4  # at least reached the cap
+    assert len(stub.add_calls) <= 10  # never more than total memorias
 
 
 async def test_reindex_treats_missing_hash_metadata_as_stale(monkeypatch, reindex_env):

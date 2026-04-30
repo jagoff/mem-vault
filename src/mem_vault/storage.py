@@ -1,5 +1,13 @@
 """Vault storage backend for memories.
 
+Also owns the history sidecar (``<id>.history.jsonl``): every
+``VaultStorage.update`` snapshots the pre-update state so
+``memory_history`` can show what a memory looked like at a past point.
+The sidecar lives next to the ``.md`` (same directory), is JSONL
+(append-only, corruption-resilient), and is deleted alongside the
+``.md`` on ``storage.delete``. History is never loaded by ``_read`` —
+it's a separate read path, so memorias stay cheap to list.
+
 Each memory is a single ``.md`` file inside ``<vault>/<memory_subdir>``. The
 schema mirrors the existing 99-AI/memory format already produced by other
 agents, so files written by mem-vault are interchangeable with manual notes:
@@ -27,6 +35,8 @@ slug — they round-trip cleanly through the MCP tools and double as filenames.
 from __future__ import annotations
 
 import io
+import json
+import logging
 import os
 import re
 import tempfile
@@ -37,6 +47,8 @@ from pathlib import Path
 from typing import Any
 
 import frontmatter
+
+logger = logging.getLogger(__name__)
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _VALID_TYPES = {"feedback", "preference", "decision", "fact", "note", "bug", "todo"}
@@ -282,8 +294,82 @@ class VaultStorage:
     def path_for(self, memory_id: str) -> Path:
         return self.memory_dir / f"{memory_id}.md"
 
+    def history_path_for(self, memory_id: str) -> Path:
+        """Return the sidecar history file path for a memory id.
+
+        Convention: same directory as the ``.md``, named ``<id>.history.jsonl``.
+        The ``.jsonl`` suffix keeps it outside the ``*.md`` glob used by
+        ``list()`` / ``reindex`` / ``sync_status`` so existing walkers
+        ignore it natively. Plain JSONL (one entry per line) means a
+        partial write (crash mid-append) at worst loses the tail line,
+        never corrupts older history.
+        """
+        return self.memory_dir / f"{memory_id}.history.jsonl"
+
     def exists(self, memory_id: str) -> bool:
         return self.path_for(memory_id).exists()
+
+    def _snapshot_to_history(self, mem: Memory, *, reason: str = "update") -> None:
+        """Append the CURRENT state of ``mem`` to its history sidecar.
+
+        Called BEFORE an update mutates the memory, so the snapshot
+        captures the pre-update state. Best-effort: any IO error is
+        swallowed with a warning — history is a nice-to-have, never a
+        reason to fail the main write.
+
+        We keep the snapshot shape stable: body, name, description,
+        tags, contradicts, related (the frontmatter fields that change
+        via ``update``). ``created`` / ``id`` are invariants and omitted
+        for brevity; ``updated`` is captured as ``ts`` on each entry.
+        Usage counters (``usage_count``, ``helpful_count``, …) are
+        intentionally NOT snapshotted — they churn on every search and
+        would bloat the sidecar without much value.
+        """
+        entry = {
+            "ts": _now_iso(),
+            "reason": reason,
+            "body": mem.body,
+            "name": mem.name,
+            "description": mem.description,
+            "tags": list(mem.tags),
+            "contradicts": list(mem.contradicts),
+            "related": list(mem.related),
+        }
+        path = self.history_path_for(mem.id)
+        try:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            logger.warning("history snapshot for %s failed: %s", mem.id, exc)
+
+    def read_history(self, memory_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Return the history entries for a memory, newest first.
+
+        Corrupt lines (incomplete JSON from a crashed write) are silently
+        skipped. An absent sidecar returns ``[]`` — memorias that never
+        got updated have no history, which is valid.
+        """
+        path = self.history_path_for(memory_id)
+        if not path.exists():
+            return []
+        entries: list[dict[str, Any]] = []
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        except Exception as exc:
+            logger.warning("history read for %s failed: %s", memory_id, exc)
+            return []
+        entries.reverse()
+        if limit > 0:
+            entries = entries[:limit]
+        return entries
 
     def _reserve_unique_id(self, base_slug: str) -> str:
         """Atomically claim an unused slug by creating an empty placeholder.
@@ -382,6 +468,23 @@ class VaultStorage:
         mem = self.get(memory_id)
         if mem is None:
             raise FileNotFoundError(f"Memory not found: {memory_id}")
+        # Snapshot BEFORE mutating. We only record a history entry when a
+        # meaningful field actually changed — ``related`` / ``contradicts``
+        # only set to the same list would be a spurious snapshot,
+        # especially under the auto-link / auto-contradict paths that
+        # often write the same value back.
+        meaningful_change = any(
+            [
+                content is not None and content.strip() != mem.body,
+                title is not None and title != mem.name,
+                description is not None and description != mem.description,
+                tags is not None and list(tags) != list(mem.tags),
+                related is not None and list(related) != list(mem.related),
+                contradicts is not None and list(contradicts) != list(mem.contradicts),
+            ]
+        )
+        if meaningful_change:
+            self._snapshot_to_history(mem, reason="update")
         if content is not None:
             mem.body = content.strip()
         if title is not None:
@@ -465,6 +568,16 @@ class VaultStorage:
         if not path.exists():
             return False
         path.unlink()
+        # Clean up the history sidecar if it exists — we don't keep
+        # orphaned history for a deleted memory (would confuse reindex
+        # + sync_status by carrying a ghost id). Best-effort: if the
+        # unlink fails, log and continue (leftover file is benign).
+        history_path = self.history_path_for(memory_id)
+        if history_path.exists():
+            try:
+                history_path.unlink()
+            except OSError as exc:
+                logger.warning("failed to remove history sidecar for %s: %s", memory_id, exc)
         return True
 
     def get(self, memory_id: str) -> Memory | None:

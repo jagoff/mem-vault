@@ -72,6 +72,12 @@ class _RecordingService:
     async def feedback(self, args):
         return await self._dispatch("feedback", args)
 
+    async def history(self, args):
+        return await self._dispatch("history", args)
+
+    async def related(self, args):
+        return await self._dispatch("related", args)
+
 
 # ---------------------------------------------------------------------------
 # _build_server — list_tools and call_tool dispatch

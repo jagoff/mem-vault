@@ -269,6 +269,20 @@ class Config(BaseModel):
             "``MEM_VAULT_AUTO_CONTRADICT=1``."
         ),
     )
+    redact_secrets: bool = Field(
+        default=True,
+        description=(
+            "When True (default), every ``memory_save`` body is scanned for "
+            "credential-shaped substrings (AWS/GitHub/OpenAI/Anthropic/Slack/"
+            "Google keys, JWTs, Bearer tokens, PEM private keys, and "
+            "``password=/secret=/token=`` assignments). Matches are "
+            "replaced with ``[REDACTED:<kind>]`` before the ``.md`` hits "
+            "disk or the index. The response envelope surfaces a "
+            "``redactions`` summary so the caller can warn the user. "
+            "Disable via ``MEM_VAULT_REDACT_SECRETS=0`` (not recommended — "
+            "the vault likely syncs to iCloud/Dropbox/git)."
+        ),
+    )
 
     @field_validator("vault_path", "state_dir", mode="before")
     @classmethod
@@ -389,6 +403,7 @@ def load_config(config_path: Path | None = None) -> Config:
         "MEM_VAULT_HYBRID_BM25_K1": "hybrid_bm25_k1",
         "MEM_VAULT_HYBRID_BM25_B": "hybrid_bm25_b",
         "MEM_VAULT_AUTO_CONTRADICT": "auto_contradict_default",
+        "MEM_VAULT_REDACT_SECRETS": "redact_secrets",
     }
     for env_var, field in env_map.items():
         if env_var in os.environ:
@@ -404,6 +419,7 @@ def load_config(config_path: Path | None = None) -> Config:
                 "usage_tracking_enabled",
                 "hybrid_enabled",
                 "auto_contradict_default",
+                "redact_secrets",
             }:
                 value = str(value).lower() in {"1", "true", "yes", "on"}
             elif field in {

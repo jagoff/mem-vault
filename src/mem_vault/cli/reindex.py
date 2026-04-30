@@ -36,6 +36,7 @@ walk every memory, so we can't tell what's orphaned vs unwalked) is set.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
 
 
@@ -67,6 +68,18 @@ def add_subparser(sub: argparse._SubParsersAction) -> None:
             "Re-embed every memory unconditionally. Without this flag, "
             "memories whose content_hash already matches the indexed one "
             "are skipped (incremental reindex)."
+        ),
+    )
+    p_reindex.add_argument(
+        "--concurrency",
+        type=int,
+        default=4,
+        help=(
+            "Max concurrent embed calls to Ollama (default 4). Each memory "
+            "triggers one embedding roundtrip; parallelism speeds up "
+            "cold reindex roughly linearly with value. Set to 1 for "
+            "strictly-sequential behavior (debug, low-memory). Higher "
+            "than ~8 usually starts bottlenecking on Ollama itself."
         ),
     )
 
@@ -114,81 +127,110 @@ async def run(args: argparse.Namespace) -> int:
         except Exception as exc:
             print(f"  WARNING: purge failed (continuing): {exc}", file=sys.stderr)
 
-    indexed = 0
-    skipped = 0
-    failed = 0
-    for i, mem in enumerate(memories, start=1):
-        if args.limit and indexed >= args.limit:
-            print(f"  --limit {args.limit} reached, stopping early.")
-            break
+    # Concurrency: bound the number of in-flight embed calls to Ollama.
+    # Ollama happily serves several embedding requests in parallel, but too
+    # many just bottleneck on the model backend. Default 4 is the empirical
+    # sweet spot on a laptop with bge-m3; raise via ``--concurrency``.
+    # ``concurrency=1`` degrades to strictly-sequential (the old behavior).
+    concurrency = max(1, int(args.concurrency))
+    sem = asyncio.Semaphore(concurrency)
+    counters = {"indexed": 0, "skipped": 0, "failed": 0, "stopped": False}
+    counters_lock = asyncio.Lock()
+
+    async def _process_one(i: int, mem) -> None:
+        # Under --limit, stop once we've reached the cap. Concurrent workers
+        # coordinate via the ``stopped`` flag so pending tasks don't keep
+        # going after the cap was hit. Accurate bookkeeping: we count the
+        # *indexed* items under lock, not just the attempted ones.
+        async with counters_lock:
+            if args.limit and counters["indexed"] >= args.limit:
+                counters["stopped"] = True
+                return
+            if counters["stopped"]:
+                return
 
         body = mem.body or mem.description or mem.name
         current_hash = compute_content_hash(body)
 
-        # Incremental skip: if the index already has an entry for this
-        # memory_id with the same content_hash, there is nothing to do.
-        if not args.force and not args.purge:
-            try:
-                existing = await service._to_thread(
-                    service.index.get_by_metadata, "memory_id", mem.id, mem.user_id
-                )
-            except Exception as exc:
-                # Treat the cache-miss as "needs reindex" rather than fail.
-                print(
-                    f"  hash lookup failed for {mem.id}: {exc} (will re-embed)",
-                    file=sys.stderr,
-                )
-                existing = []
-            if existing and any(
-                (e.get("metadata") or {}).get("content_hash") == current_hash for e in existing
-            ):
-                skipped += 1
-                if i % 25 == 0 or i == total:
-                    print(f"  [{i:>3}/{total}] indexed={indexed} skipped={skipped} failed={failed}")
-                continue
-
-        try:
-            # Drop any stale entry for this memory_id before re-embedding.
-            await service._to_thread(
-                service.index.delete_by_metadata, "memory_id", mem.id, mem.user_id
-            )
-            metadata = {
-                "memory_id": mem.id,
-                "type": mem.type,
-                "tags": mem.tags,
-                "content_hash": current_hash,
-            }
-            results = await service._to_thread(
-                service.index.add,
-                body,
-                user_id=mem.user_id,
-                agent_id=mem.agent_id,
-                metadata=metadata,
-                auto_extract=args.auto_extract,
-            )
-            # auto_extract=True can NOOP when mem0 thinks the memory is a
-            # duplicate of another entry. Without ADD under our memory_id,
-            # the .md becomes invisible to search until the next reindex.
-            # Fall back to a literal embed so the vault → index invariant
-            # holds. Mirrors the same guard in ``MemVaultService.save``.
-            if args.auto_extract:
-                from mem_vault.server import _has_added_event
-
-                if not _has_added_event(list(results) if results else []):
-                    await service._to_thread(
-                        service.index.add,
-                        body,
-                        user_id=mem.user_id,
-                        agent_id=mem.agent_id,
-                        metadata=metadata,
-                        auto_extract=False,
+        async with sem:
+            # Incremental skip.
+            if not args.force and not args.purge:
+                try:
+                    existing = await service._to_thread(
+                        service.index.get_by_metadata, "memory_id", mem.id, mem.user_id
                     )
-            indexed += 1
-            if i % 10 == 0 or i == total:
-                print(f"  [{i:>3}/{total}] indexed={indexed} skipped={skipped} failed={failed}")
-        except Exception as exc:
-            failed += 1
-            print(f"  FAILED on {mem.id}: {exc}", file=sys.stderr)
+                except Exception as exc:
+                    print(
+                        f"  hash lookup failed for {mem.id}: {exc} (will re-embed)",
+                        file=sys.stderr,
+                    )
+                    existing = []
+                if existing and any(
+                    (e.get("metadata") or {}).get("content_hash") == current_hash for e in existing
+                ):
+                    async with counters_lock:
+                        counters["skipped"] += 1
+                        if i % 25 == 0 or i == total:
+                            print(
+                                f"  [{i:>3}/{total}] "
+                                f"indexed={counters['indexed']} "
+                                f"skipped={counters['skipped']} "
+                                f"failed={counters['failed']}"
+                            )
+                    return
+
+            try:
+                await service._to_thread(
+                    service.index.delete_by_metadata, "memory_id", mem.id, mem.user_id
+                )
+                metadata = {
+                    "memory_id": mem.id,
+                    "type": mem.type,
+                    "tags": mem.tags,
+                    "content_hash": current_hash,
+                }
+                results = await service._to_thread(
+                    service.index.add,
+                    body,
+                    user_id=mem.user_id,
+                    agent_id=mem.agent_id,
+                    metadata=metadata,
+                    auto_extract=args.auto_extract,
+                )
+                if args.auto_extract:
+                    from mem_vault.server import _has_added_event
+
+                    if not _has_added_event(list(results) if results else []):
+                        await service._to_thread(
+                            service.index.add,
+                            body,
+                            user_id=mem.user_id,
+                            agent_id=mem.agent_id,
+                            metadata=metadata,
+                            auto_extract=False,
+                        )
+                async with counters_lock:
+                    counters["indexed"] += 1
+                    if i % 10 == 0 or i == total:
+                        print(
+                            f"  [{i:>3}/{total}] "
+                            f"indexed={counters['indexed']} "
+                            f"skipped={counters['skipped']} "
+                            f"failed={counters['failed']}"
+                        )
+            except Exception as exc:
+                async with counters_lock:
+                    counters["failed"] += 1
+                print(f"  FAILED on {mem.id}: {exc}", file=sys.stderr)
+
+    print(f"  concurrency={concurrency}")
+    await asyncio.gather(*(_process_one(i, m) for i, m in enumerate(memories, start=1)))
+    if counters["stopped"]:
+        print(f"  --limit {args.limit} reached, stopping early.")
+
+    indexed = counters["indexed"]
+    skipped = counters["skipped"]
+    failed = counters["failed"]
 
     # Orphan sweep: remove index entries whose memory_id has no .md anymore.
     # We only run it when we've actually walked every file (no --limit) and

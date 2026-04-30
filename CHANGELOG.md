@@ -6,6 +6,113 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — secret redaction on save (default on)
+
+Memorias often capture commands, configs, or tracebacks carrying
+credentials. Once a body is written it can sync to iCloud / Syncthing
+/ Dropbox / git — each one a potential leak path. Every `memory_save`
+now scans the body through a regex-based redactor before the `.md`
+hits disk or the index. Matches are replaced with `[REDACTED:<kind>]`
+and counted in a `redactions` field on the response envelope.
+
+Patterns covered:
+
+- AWS Access Key Id (`AKIA…` / `ASIA…`) and Secret Access Key
+  (after `aws_secret_access_key=`)
+- GitHub tokens (`ghp_` / `gho_` / `ghu_` / `ghr_` / `ghs_` prefixes)
+- Anthropic keys (`sk-ant-…`) — **listed before** the generic
+  OpenAI pattern so the superset doesn't swallow them
+- OpenAI keys (`sk-…`)
+- Slack tokens (`xox[baprs]-…`)
+- Google API keys (`AIza…`)
+- JWT (three base64url segments)
+- `Authorization: Bearer <token>`
+- PEM private-key blocks (`-----BEGIN … PRIVATE KEY-----` … `END`)
+- Assignment shapes: `password=`, `passwd:`, `secret=`, `api_key:`,
+  `api_token:`, `api_secret:`, `access_token:`, `auth_token:`,
+  `client_secret:`, bare `token=`
+
+Idempotent — running `redact` on already-redacted text is a no-op
+(values starting with `[REDACTED:` are skipped via a negative
+lookahead). Extensible via `redaction.EXTRA_PATTERNS` for
+org-specific prefixes.
+
+Opt out via `MEM_VAULT_REDACT_SECRETS=0` (not recommended).
+
+Tests: 18 new in `test_redaction.py` covering each pattern, clean
+text (no mutation), idempotence, empty input, the fast-check helper,
+and integration with `MemVaultService.save` (body on disk + index
+both see the redacted version, summary surfaced in the response).
+
+### Added — `memory_related` MCP tool (walk the graph)
+
+Takes a memory id and returns its neighbors grouped by relationship
+type — all four sources in one call:
+
+```
+{
+  "related":            [...],     # frontmatter `related:`
+  "contradicts":        [...],     # frontmatter `contradicts:`
+  "cotag_neighbors":    [...],     # ≥N shared normalized tags
+  "semantic_neighbors": [...],     # top-k semantic search
+}
+```
+
+Co-tag normalization splits `project:foo` on colon so
+`project:rag` / `project:rag-obsidian` cluster naturally. Semantic
+step is opt-out via `include_semantic=false` to keep the call cheap
+and deterministic.
+
+Tests: 9 new in `test_related.py` covering each neighbor source,
+self-exclusion, the include_semantic flag, and the standard
+validation / not-found contracts.
+
+### Added — `memory_history` MCP tool + JSONL sidecar snapshots
+
+Every `VaultStorage.update` now snapshots the pre-update state to
+`<id>.history.jsonl` next to the `.md`. The new `memory_history` MCP
+tool reads that sidecar and returns entries newest-first. Useful for
+"what did this memory say last week?" and for recovering a field
+that got overwritten.
+
+Snapshot shape: body, name, description, tags, related, contradicts,
+plus a timestamp. Usage counters (which churn on every search) are
+deliberately NOT snapshotted to keep the sidecar lean. No-op updates
+(same value written back) skip the snapshot so the auto-link /
+auto-contradict paths don't bloat history with identical entries.
+
+Storage contract:
+- `history_path_for(id)` — returns `<memory_dir>/<id>.history.jsonl`.
+  Suffix is `.jsonl` so existing `*.md` globs don't pick it up.
+- `read_history(id, limit=50)` — newest-first, corrupt lines skipped.
+- `delete(id)` also unlinks the sidecar (no orphan history).
+
+Tests: 16 new in `test_history.py` covering snapshot path, first
+update creates one entry, multiple updates order correctly, no-op
+update skips snapshot, related-only / contradicts-only changes
+still snapshot, limit caps output, delete cleans up, corrupt lines
+are skipped, sidecar ignored by `list()`, tool envelope validation.
+
+### Added — concurrent `mem-vault reindex` (`--concurrency`)
+
+`reindex` now runs embed calls in parallel via `asyncio.Semaphore`
+(default `--concurrency=4`). Cold reindex on a laptop goes from ~2
+memorias/sec to ~7-8/sec against `bge-m3`. Counters are protected by
+an `asyncio.Lock` so the progress summary stays accurate under
+contention. `--concurrency=1` preserves the legacy strictly-
+sequential behavior for debug / low-memory environments.
+
+Notes:
+- The `--limit N` stop is best-effort with concurrency: when the
+  embed call is near-instantaneous (e.g. in tests) all workers enter
+  simultaneously and none trip the stop. In production with Ollama
+  latency the counter fills quickly and the stop kicks in.
+- No change to the content-hash skip logic or the orphan-sweep pass.
+
+Tests: 2 new in `test_hash_reindex.py` (concurrent path indexes all,
+limit + concurrency doesn't deadlock). Existing sequential tests
+pass via `concurrency=1` default in the test helper.
+
 ### Added — `contradicts:` auto-detection on save
 
 The `contradicts` frontmatter field has existed in the `Memory` schema

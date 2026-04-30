@@ -510,6 +510,78 @@ _TOOLS: list[types.Tool] = [
         },
     ),
     types.Tool(
+        name="memory_related",
+        description=(
+            "Walk the local knowledge graph around one memory and return its "
+            "neighbors, grouped by relationship type:\n\n"
+            "- ``related``: the explicit ``related:`` frontmatter list "
+            "(wikilinks stamped by auto-link).\n"
+            "- ``contradicts``: the ``contradicts:`` frontmatter list "
+            "(populated by auto-contradict).\n"
+            "- ``cotag_neighbors``: memorias that share ≥ ``min_shared_tags`` "
+            "normalized tags (``project:foo`` splits on colon).\n"
+            "- ``semantic_neighbors``: top-``k`` results from a semantic "
+            "search over the memory's body. Skipped when ``include_semantic`` "
+            "is false (no LLM / Qdrant call).\n\n"
+            "Use this to explore what the vault knows around a single node "
+            "without reconstructing the graph yourself."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Memory id (filename slug without .md)."},
+                "min_shared_tags": {
+                    "type": "integer",
+                    "default": 2,
+                    "minimum": 1,
+                    "maximum": 10,
+                    "description": "Threshold for co-tag neighbor edges.",
+                },
+                "k": {
+                    "type": "integer",
+                    "default": 5,
+                    "minimum": 1,
+                    "maximum": 50,
+                    "description": "How many semantic neighbors to include.",
+                },
+                "include_semantic": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": (
+                        "If false, skip the semantic search step (cheaper, "
+                        "deterministic — relies on tag structure only)."
+                    ),
+                },
+            },
+            "required": ["id"],
+        },
+    ),
+    types.Tool(
+        name="memory_history",
+        description=(
+            "Return the edit history of a memory — every snapshot taken "
+            "before an ``update`` (body, title, description, tags, related, "
+            "contradicts). Entries are ordered newest-first. Useful when you "
+            "want to see what a memory said last week, or to recover a field "
+            "that got overwritten. Memorias with no updates return an empty "
+            "list."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Memory id (filename slug without .md)."},
+                "limit": {
+                    "type": "integer",
+                    "default": 20,
+                    "minimum": 1,
+                    "maximum": 500,
+                    "description": "Cap the number of entries returned.",
+                },
+            },
+            "required": ["id"],
+        },
+    ),
+    types.Tool(
         name="memory_feedback",
         description=(
             "Record thumbs up/down on a memory. Bumps ``helpful_count`` or "
@@ -840,6 +912,24 @@ class MemVaultService:
             self._check_content_size(content)
         except _ContentTooLargeError as exc:
             return {"ok": False, "error": str(exc), "code": "content_too_large"}
+
+        # Secret redaction — runs BEFORE anything else touches the body.
+        # The vault syncs to iCloud / Dropbox / git in most setups, so a
+        # leaked credential lands in a lot of places at once. Default is
+        # ON; user can opt out via ``MEM_VAULT_REDACT_SECRETS=0``.
+        redactions: list[dict[str, Any]] = []
+        if self.config.redact_secrets and content:
+            from mem_vault.redaction import redact
+
+            redacted_content, hits = redact(content)
+            if hits:
+                logger.info(
+                    "redacted %d credential(s) from save: %s",
+                    sum(h.count for h in hits),
+                    [h.kind for h in hits],
+                )
+                content = redacted_content
+                redactions = [{"kind": h.kind, "count": h.count} for h in hits]
         title = args.get("title")
         description = args.get("description")
         mtype = args.get("type", "note")
@@ -1006,6 +1096,7 @@ class MemVaultService:
             "auto_extract": auto_extract,
             "related": related_ids,
             "contradicts": contradict_ids,
+            "redactions": redactions,
         }
         if auto_extract_skipped:
             # Caller asked for LLM extraction but mem0 chose NOOP/UPDATE; we
@@ -1580,6 +1671,143 @@ class MemVaultService:
             "problems": problems[:100],
         }
 
+    async def related(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Walk the knowledge graph around one memory.
+
+        Composes three cheap local signals:
+        1. Explicit ``related:`` / ``contradicts:`` frontmatter fields
+           (populated by auto-link and auto-contradict at save time).
+        2. Co-tag neighbors via the same tag-normalization the ``/graph``
+           UI uses (``project:foo`` splits on colon before intersection).
+        3. Optional semantic neighbors from a search over the body.
+
+        All four groups come back as id-indexed arrays with a minimal
+        ``name`` / ``description`` / ``score`` (when applicable) so the
+        caller can render without a follow-up ``memory_get``.
+        """
+        mem_id = args.get("id")
+        if not mem_id:
+            return {"ok": False, "error": "id is required", "code": "validation_failed"}
+        mem_id_str = str(mem_id)
+        min_shared = int(args.get("min_shared_tags", 2))
+        k = int(args.get("k", 5))
+        include_semantic = bool(args.get("include_semantic", True))
+
+        target = await self._to_thread(self.storage.get, mem_id_str)
+        if target is None:
+            return {
+                "ok": False,
+                "error": f"Memory not found: {mem_id}",
+                "code": "not_found",
+            }
+
+        # Grab the full corpus once — cheap for the size the vault usually is,
+        # and we need it for co-tag computation anyway.
+        corpus = await self._to_thread(
+            self.storage.list, type=None, tags=None, user_id=None, limit=10**9
+        )
+        by_id = {m.id: m for m in corpus}
+
+        def _mini(m_id: str) -> dict[str, Any]:
+            m = by_id.get(m_id)
+            if m is None:
+                return {"id": m_id, "name": None, "description": None}
+            return {"id": m_id, "name": m.name, "description": m.description}
+
+        related_out = [_mini(i) for i in (target.related or []) if i != mem_id_str]
+        contradicts_out = [_mini(i) for i in (target.contradicts or []) if i != mem_id_str]
+
+        # Co-tag neighbors — mirror the logic in ui.graph_data.
+        def _normalize(t: str) -> str:
+            return t.split(":", 1)[-1].lower()
+
+        target_tags = {_normalize(t) for t in (target.tags or []) if t}
+        cotag_out: list[dict[str, Any]] = []
+        if target_tags:
+            for m in corpus:
+                if m.id == mem_id_str:
+                    continue
+                their_tags = {_normalize(t) for t in (m.tags or []) if t}
+                shared = target_tags & their_tags
+                if len(shared) >= min_shared:
+                    cotag_out.append(
+                        {
+                            "id": m.id,
+                            "name": m.name,
+                            "description": m.description,
+                            "shared_tags": sorted(shared),
+                            "shared_count": len(shared),
+                        }
+                    )
+            # Sort by overlap desc, then by recency (mtime approximated via updated string).
+            cotag_out.sort(
+                key=lambda d: (-d["shared_count"], -(ord(d["name"][0]) if d["name"] else 0))
+            )
+            cotag_out = cotag_out[: max(k * 2, 10)]
+
+        semantic_out: list[dict[str, Any]] = []
+        if include_semantic and target.body:
+            search_payload = await self.search(
+                {
+                    "query": target.body,
+                    "k": k + 1,  # +1 because self is likely to appear
+                    "threshold": 0.2,
+                }
+            )
+            if search_payload.get("ok"):
+                for hit in search_payload.get("results", []):
+                    h_id = hit.get("id")
+                    if not h_id or h_id == mem_id_str:
+                        continue
+                    memo = hit.get("memory") or {}
+                    semantic_out.append(
+                        {
+                            "id": h_id,
+                            "name": memo.get("name"),
+                            "description": memo.get("description"),
+                            "score": hit.get("score"),
+                        }
+                    )
+                    if len(semantic_out) >= k:
+                        break
+
+        return {
+            "ok": True,
+            "id": mem_id_str,
+            "related": related_out,
+            "contradicts": contradicts_out,
+            "cotag_neighbors": cotag_out,
+            "semantic_neighbors": semantic_out,
+        }
+
+    async def history(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Return the edit history of one memory (newest-first).
+
+        Wraps ``VaultStorage.read_history``. Returns an empty list for
+        memorias that have never been updated — that's valid, not an
+        error. A missing ``.md`` (bad id) still returns ``ok: false``
+        so the caller can distinguish "no history yet" from "no memory".
+        """
+        mem_id = args.get("id")
+        if not mem_id:
+            return {"ok": False, "error": "id is required", "code": "validation_failed"}
+        limit = int(args.get("limit", 20))
+
+        exists = await self._to_thread(self.storage.exists, str(mem_id))
+        if not exists:
+            return {
+                "ok": False,
+                "error": f"Memory not found: {mem_id}",
+                "code": "not_found",
+            }
+        entries = await self._to_thread(self.storage.read_history, str(mem_id), limit=limit)
+        return {
+            "ok": True,
+            "id": mem_id,
+            "count": len(entries),
+            "entries": entries,
+        }
+
     async def feedback(self, args: dict[str, Any]) -> dict[str, Any]:
         """Record thumbs up/down (or plain usage) on a memory.
 
@@ -1642,6 +1870,8 @@ def _build_server(service: Any) -> Server:
         "memory_duplicates": service.duplicates,
         "memory_lint": service.lint,
         "memory_feedback": service.feedback,
+        "memory_history": service.history,
+        "memory_related": service.related,
     }
 
     # Metrics sink: disabled by default, opt-in via Config.metrics_enabled.
