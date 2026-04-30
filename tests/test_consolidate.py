@@ -202,9 +202,7 @@ class _CrashingIndex(FakeIndex):
         self._add_calls += 1
         if self._add_calls == 1:
             raise RuntimeError("ollama crashed mid-merge")
-        return super().add(
-            content, user_id=user_id, agent_id=agent_id, metadata=metadata
-        )
+        return super().add(content, user_id=user_id, agent_id=agent_id, metadata=metadata)
 
 
 def test_apply_merge_crash_rolls_back_older_and_keeps_newer(tmp_path):

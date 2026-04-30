@@ -97,9 +97,7 @@ def test_skill_template_contains_auto_capture_directive():
     # checks against either the canonical Spanish or the short noun form.
     assert any(s in lower for s in ("bug fix", "fix con root cause", "root cause"))
     assert any(s in lower for s in ("decisión de diseño", "decisión arquitectónica", "decision"))
-    assert any(
-        s in lower for s in ("convención", "convention", "descubrimiento del codebase")
-    )
+    assert any(s in lower for s in ("convención", "convention", "descubrimiento del codebase"))
     assert any(s in lower for s in ("gotcha", "foot-gun", "foot gun"))
     # Must have an opt-out clause — the user must be able to silence the
     # proactive saves on demand.

@@ -280,9 +280,7 @@ async def test_reindex_orphan_sweep_skipped_with_limit(monkeypatch, reindex_env)
     """
     service, stub, config = reindex_env
     await _seed(service, n=3)
-    stub.store["ghost_id"] = [
-        {"id": "phantom-1", "metadata": {"memory_id": "ghost_id"}}
-    ]
+    stub.store["ghost_id"] = [{"id": "phantom-1", "metadata": {"memory_id": "ghost_id"}}]
 
     monkeypatch.setattr("mem_vault.config.load_config", lambda *a, **kw: config)
     monkeypatch.setattr("mem_vault.server.MemVaultService", lambda cfg: service)
