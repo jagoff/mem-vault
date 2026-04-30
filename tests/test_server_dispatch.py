@@ -51,6 +51,9 @@ class _RecordingService:
     async def delete(self, args):
         return await self._dispatch("delete", args)
 
+    async def synthesize(self, args):
+        return await self._dispatch("synthesize", args)
+
 
 # ---------------------------------------------------------------------------
 # _build_server — list_tools and call_tool dispatch

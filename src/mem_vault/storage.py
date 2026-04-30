@@ -69,6 +69,7 @@ class Memory:
     user_id: str = "default"
     origin_session_id: str | None = None
     contradicts: list[str] = field(default_factory=list)
+    related: list[str] = field(default_factory=list)
     visible_to: list[str] = field(default_factory=lambda: [VISIBLE_TO_ALL])
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -102,6 +103,8 @@ class Memory:
             meta["origin_session_id"] = self.origin_session_id
         if self.contradicts:
             meta["contradicts"] = list(self.contradicts)
+        if self.related:
+            meta["related"] = list(self.related)
         # Only emit ``visible_to`` when it's non-default — files written by
         # other tools (engram, manual notes) should round-trip cleanly
         # without sprouting a noisy field they didn't ask for.
@@ -124,6 +127,7 @@ class Memory:
             "user_id": self.user_id,
             "origin_session_id": self.origin_session_id,
             "contradicts": self.contradicts,
+            "related": self.related,
             "visible_to": self.visible_to,
         }
 
@@ -284,6 +288,7 @@ class VaultStorage:
         description: str | None = None,
         tags: list[str] | None = None,
         visible_to: list[str] | None = None,
+        related: list[str] | None = None,
     ) -> Memory:
         mem = self.get(memory_id)
         if mem is None:
@@ -298,6 +303,8 @@ class VaultStorage:
             mem.tags = tags
         if visible_to is not None:
             mem.visible_to = list(visible_to)
+        if related is not None:
+            mem.related = list(related)
         mem.updated = _now_iso()
         self._write(mem)
         return mem
@@ -367,6 +374,7 @@ class VaultStorage:
             "origin_session_id",
             "originSessionId",
             "contradicts",
+            "related",
             "visible_to",
         }
         # accept legacy "originSessionId" camelCase from existing files
@@ -395,6 +403,7 @@ class VaultStorage:
             user_id=str(meta.get("user_id") or "default"),
             origin_session_id=origin,
             contradicts=list(meta.get("contradicts") or []),
+            related=[str(r) for r in (meta.get("related") or [])],
             visible_to=visible_to,
             extra=extra,
         )

@@ -152,6 +152,17 @@ class Config(BaseModel):
             "stay disk-quiet; enable via ``MEM_VAULT_METRICS=1`` or this field."
         ),
     )
+    auto_link_default: bool = Field(
+        default=True,
+        description=(
+            "When True (default), every successful ``memory_save`` runs a "
+            "second semantic search to find similar existing memorias and "
+            "stamps their IDs in the new memory's ``related`` frontmatter. "
+            "Builds an emergent knowledge graph at zero extra cost to the "
+            "user. Disable per-call with ``auto_link=false`` or globally "
+            "via this field / ``MEM_VAULT_AUTO_LINK=0``."
+        ),
+    )
 
     @field_validator("vault_path", "state_dir", mode="before")
     @classmethod
@@ -261,13 +272,14 @@ def load_config(config_path: Path | None = None) -> Config:
         "MEM_VAULT_MAX_CONTENT_SIZE": "max_content_size",
         "MEM_VAULT_HTTP_TOKEN": "http_token",
         "MEM_VAULT_METRICS": "metrics_enabled",
+        "MEM_VAULT_AUTO_LINK": "auto_link_default",
     }
     for env_var, field in env_map.items():
         if env_var in os.environ:
             value: str | int | bool | float = os.environ[env_var]
             if field in {"embedder_dims", "max_content_size"}:
                 value = int(value)
-            elif field in {"auto_extract_default", "metrics_enabled"}:
+            elif field in {"auto_extract_default", "metrics_enabled", "auto_link_default"}:
                 value = str(value).lower() in {"1", "true", "yes", "on"}
             elif field in {"decay_half_life_days", "llm_timeout_s"}:
                 value = float(value)

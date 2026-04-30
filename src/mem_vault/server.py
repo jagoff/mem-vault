@@ -96,6 +96,15 @@ _TOOLS: list[types.Tool] = [
                     "default": False,
                     "description": "If true, run the LLM extractor + dedup. If false, save literally.",
                 },
+                "auto_link": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, after a successful save, run a semantic search "
+                        "for similar memorias and stamp their IDs in this memory's "
+                        "``related`` frontmatter. Defaults to ``Config.auto_link_default`` "
+                        "(true unless globally disabled via MEM_VAULT_AUTO_LINK=0)."
+                    ),
+                },
                 "visible_to": {
                     "description": (
                         "Which agents can see this memory. Defaults to public. Pass "
@@ -204,6 +213,41 @@ _TOOLS: list[types.Tool] = [
             "required": ["id"],
         },
     ),
+    types.Tool(
+        name="memory_synthesize",
+        description=(
+            "Compose an LLM-written summary of what the system knows about "
+            "``query``. Internally runs a wide semantic search (default k=10) "
+            "and asks the local LLM (Ollama) to weave the matched memorias "
+            "into a coherent answer in español rioplatense, citing the source "
+            "IDs inline. Use this when the user asks an open-ended question "
+            "(\"resumime todo lo que sé sobre X\") — it's the difference "
+            "between dumping a list of bullets and getting an interlocutor "
+            "that actually responds."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Topic or question to synthesize an answer for.",
+                },
+                "k": {
+                    "type": "integer",
+                    "default": 10,
+                    "minimum": 1,
+                    "maximum": 30,
+                    "description": "How many memorias to feed into the LLM.",
+                },
+                "threshold": {
+                    "type": "number",
+                    "default": 0.1,
+                    "description": "Minimum similarity for a memory to be included.",
+                },
+            },
+            "required": ["query"],
+        },
+    ),
 ]
 
 
@@ -261,6 +305,48 @@ class MemVaultService:
                 f"content too large: {len(content)} chars exceeds limit of {limit}. "
                 "Raise MEM_VAULT_MAX_CONTENT_SIZE or split the memory."
             )
+
+    async def _auto_link(
+        self,
+        mem_id: str,
+        content: str,
+        user_id: str,
+        *,
+        threshold: float = 0.5,
+        k: int = 5,
+    ) -> list[str]:
+        """Find top-k similar memories and return their IDs (excluding self).
+
+        Used post-save to populate the ``related`` frontmatter field so the
+        vault organically grows a knowledge graph instead of staying as
+        archipelago of isolated notes. Failures are swallowed — auto-link is
+        best-effort, missing it doesn't fail the save.
+        """
+        if not content.strip():
+            return []
+        try:
+            hits = await self._index_call(
+                self.index.search,
+                content,
+                user_id=user_id,
+                top_k=k + 1,  # +1 because self might appear in the results
+                threshold=threshold,
+            )
+        except Exception as exc:
+            logger.debug("auto-link search failed for %s: %s", mem_id, exc)
+            return []
+
+        related_ids: list[str] = []
+        for hit in hits:
+            if not isinstance(hit, dict):
+                continue
+            meta = hit.get("metadata") or {}
+            h_id = meta.get("memory_id")
+            if h_id and h_id != mem_id and h_id not in related_ids:
+                related_ids.append(str(h_id))
+            if len(related_ids) >= k:
+                break
+        return related_ids
 
     async def save(self, args: dict[str, Any]) -> dict[str, Any]:
         content: str = args["content"]
@@ -341,6 +427,22 @@ class MemVaultService:
                 "path": str(self.storage.path_for(mem.id)),
             }
 
+        # Auto-linking: after a successful index, find similar memorias and
+        # stamp their IDs onto this memory's ``related`` frontmatter. Off by
+        # default for hooks calling save() at high volume; opt in per-call
+        # with ``auto_link=true`` or globally via ``Config.auto_link_default``.
+        related_ids: list[str] = []
+        auto_link = bool(args.get("auto_link", self.config.auto_link_default))
+        if auto_link:
+            related_ids = await self._auto_link(mem.id, content, user_id)
+            if related_ids:
+                try:
+                    mem = await self._to_thread(
+                        self.storage.update, mem.id, related=related_ids
+                    )
+                except Exception as exc:
+                    logger.warning("auto-link write failed for %s: %s", mem.id, exc)
+
         return {
             "ok": True,
             "indexed": True,
@@ -348,7 +450,133 @@ class MemVaultService:
             "path": str(self.storage.path_for(mem.id)),
             "index_entries": len(index_results),
             "auto_extract": auto_extract,
+            "related": related_ids,
         }
+
+    async def synthesize(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Search the vault for ``query`` and ask the LLM to compose a summary.
+
+        Two-step: (1) wide semantic search (default ``k=10``, threshold 0.1)
+        to gather relevant memories, (2) a single Ollama call where the LLM
+        synthesizes a coherent answer using only those memories as source
+        material. Returns the synthesis plus the IDs the LLM was given so
+        the caller can verify provenance.
+
+        Failures are surfaced as ``ok: false`` with a code; the caller can
+        fall back to plain ``memory_search`` if synthesis isn't available.
+        """
+        query: str = args.get("query", "").strip()
+        if not query:
+            return {"ok": False, "error": "query is required", "code": "validation_failed"}
+        k = int(args.get("k", 10))
+        threshold = float(args.get("threshold", 0.1))
+        viewer_agent_id = args.get("viewer_agent_id") or self.config.agent_id
+
+        # Reuse search() so visibility filtering and the over-fetch behavior
+        # stay consistent with the regular memory_search tool.
+        search_payload = await self.search(
+            {
+                "query": query,
+                "k": k,
+                "threshold": threshold,
+                "viewer_agent_id": viewer_agent_id,
+            }
+        )
+        results = search_payload.get("results", []) if search_payload.get("ok") else []
+        if not results:
+            return {
+                "ok": True,
+                "query": query,
+                "synthesis": (
+                    f"No tengo memorias suficientes sobre «{query}». "
+                    "Tal vez no haya guardado nada sobre este tema todavía."
+                ),
+                "source_ids": [],
+                "count": 0,
+            }
+
+        # Build the LLM prompt. We hand it the bodies inline so it can cite
+        # exact phrasing; we also include the ID alongside each so the LLM
+        # can reference them in the synthesis.
+        bodies = []
+        source_ids: list[str] = []
+        for r in results:
+            mem = r.get("memory") or {}
+            mid = mem.get("id") or r.get("id")
+            body = mem.get("body") or r.get("snippet") or ""
+            if mid and body:
+                source_ids.append(str(mid))
+                bodies.append(f"### Memoria `{mid}`\n{body[:2000]}")
+
+        if not bodies:
+            return {
+                "ok": True,
+                "query": query,
+                "synthesis": "Las memorias relevantes no tenían cuerpo recuperable.",
+                "source_ids": [],
+                "count": 0,
+            }
+
+        prompt = (
+            f"Sintetizá un resumen claro y útil de lo que el sistema sabe sobre:\n\n"
+            f"  «{query}»\n\n"
+            "Basate **solo** en las siguientes memorias. Si se contradicen entre sí, "
+            "marcalo. Si la info es insuficiente para responder, decilo "
+            "explícitamente. Citá los IDs entre paréntesis cuando uses datos de una "
+            "memoria específica (ej. `(memoria-1)`).\n\n"
+            "---\n\n" + "\n\n---\n\n".join(bodies) + "\n\n---\n\n"
+            "Devolvé el resumen en español rioplatense, máximo 6 párrafos."
+        )
+
+        try:
+            synthesis = await self._call_llm_for_synthesis(prompt)
+        except _LLMTimeoutError as exc:
+            return {
+                "ok": False,
+                "error": str(exc),
+                "code": "llm_timeout",
+                "source_ids": source_ids,
+            }
+        except Exception as exc:
+            logger.exception("synthesize LLM call failed")
+            return {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "code": "llm_failed",
+                "source_ids": source_ids,
+            }
+
+        return {
+            "ok": True,
+            "query": query,
+            "synthesis": synthesis,
+            "source_ids": source_ids,
+            "count": len(source_ids),
+        }
+
+    async def _call_llm_for_synthesis(self, prompt: str) -> str:
+        """Send a synthesis prompt to Ollama, return the rendered answer.
+
+        We re-use the same Ollama host that the embedder/extractor uses
+        (no new config), and route the call through ``_index_call`` so the
+        LLM timeout + circuit breaker apply uniformly.
+        """
+        import ollama
+
+        client = ollama.Client(host=self.config.ollama_host)
+
+        def _sync_call() -> str:
+            res = client.chat(
+                model=self.config.llm_model,
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": 0.2},
+            )
+            # Ollama's `chat` returns a dict-like with `message.content`.
+            msg = res.get("message") or {}
+            content = msg.get("content") or ""
+            return str(content).strip()
+
+        return await self._index_call(_sync_call)
 
     async def search(self, args: dict[str, Any]) -> dict[str, Any]:
         query: str = args["query"]
@@ -519,6 +747,7 @@ def _build_server(service: Any) -> Server:
         "memory_get": service.get,
         "memory_update": service.update,
         "memory_delete": service.delete,
+        "memory_synthesize": service.synthesize,
     }
 
     # Metrics sink: disabled by default, opt-in via Config.metrics_enabled.
