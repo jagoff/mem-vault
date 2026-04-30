@@ -189,17 +189,29 @@ class VectorIndex:
 
     def _build_mem0_config(self) -> dict[str, Any]:
         cfg = self.config
-        # Qdrant embedded mode: passing `path` makes qdrant-client use a local
-        # file-backed collection — no Docker, no daemon. Each Config instance
-        # writes to its own state_dir/qdrant directory.
+        # Qdrant connection — server mode (url) takes precedence over
+        # embedded mode (path). Server mode is required when multiple
+        # agents / sessions / tools share the same vault: the embedded
+        # qdrant-client takes an exclusive file lock and silently fails
+        # the second concurrent caller, which surfaces as `memory_search`
+        # returning empty lists with no visible error to the agent.
+        # See `mem-vault Qdrant cleanup` memory (2026-04-30) for the
+        # full diagnosis.
+        vector_store_config: dict[str, Any] = {
+            "collection_name": cfg.qdrant_collection,
+            "embedding_model_dims": cfg.embedder_dims,
+        }
+        if cfg.qdrant_url:
+            vector_store_config["url"] = cfg.qdrant_url
+        else:
+            # Embedded mode: passing `path` makes qdrant-client use a
+            # local file-backed collection — no daemon, single writer.
+            # Each Config instance writes to its own state_dir/qdrant.
+            vector_store_config["path"] = str(cfg.qdrant_path)
         return {
             "vector_store": {
                 "provider": "qdrant",
-                "config": {
-                    "collection_name": cfg.qdrant_collection,
-                    "path": str(cfg.qdrant_path),
-                    "embedding_model_dims": cfg.embedder_dims,
-                },
+                "config": vector_store_config,
             },
             "llm": {
                 "provider": "ollama",

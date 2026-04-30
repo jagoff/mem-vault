@@ -52,6 +52,7 @@ ENV_TO_CONFIG_FIELD: dict[str, str] = {
     "MEM_VAULT_EMBEDDER_MODEL": "embedder_model",
     "MEM_VAULT_EMBEDDER_DIMS": "embedder_dims",
     "MEM_VAULT_COLLECTION": "qdrant_collection",
+    "MEM_VAULT_QDRANT_URL": "qdrant_url",
     "MEM_VAULT_USER_ID": "user_id",
     "MEM_VAULT_AGENT_ID": "agent_id",
     "MEM_VAULT_AUTO_EXTRACT": "auto_extract_default",
@@ -143,6 +144,19 @@ class Config(BaseModel):
             "Qdrant collection name. If left null and ``agent_id`` is set, "
             "defaults to ``mem_vault_<agent_id>`` for natural per-agent isolation. "
             "Otherwise falls back to ``mem_vault``."
+        ),
+    )
+    qdrant_url: str | None = Field(
+        default=None,
+        description=(
+            "URL of a remote Qdrant server (e.g. ``http://localhost:6333``). "
+            "When set, mem-vault talks to that server instead of running "
+            "Qdrant in embedded mode against ``qdrant_path``. The server "
+            "mode supports many concurrent clients (the embedded mode "
+            "allows only one), which is required when you have multiple "
+            "agent sessions / tools / workers reading and writing the same "
+            "vault at the same time. Override via ``MEM_VAULT_QDRANT_URL``. "
+            "Leave null (default) to keep the simple embedded mode."
         ),
     )
     user_id: str = Field(
