@@ -26,8 +26,9 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
-      - name: Sync dependencies (with dev extras)
-        run: uv sync --extra dev
+      - name: Sync dependencies (with dev + ui extras)
+        # ``[ui]`` is needed for ``test_ui_auth.py`` (fastapi.testclient).
+        run: uv sync --extra dev --extra ui
 
       - name: Run unit tests
         run: uv run pytest tests/ -v --tb=short
@@ -43,8 +44,10 @@ jobs:
         with:
           enable-cache: true
       - run: uv python install 3.12
-      - run: uv sync --extra dev
+      - run: uv sync --extra dev --extra ui
       - name: Ruff format check
         run: uv run ruff format --check src tests
       - name: Ruff lint
         run: uv run ruff check src tests
+      - name: Mypy (balanced profile, src only)
+        run: uv run mypy

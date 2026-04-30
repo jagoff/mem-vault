@@ -33,7 +33,7 @@ import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 logger = logging.getLogger(__name__)
 
@@ -48,9 +48,9 @@ class MetricsSink:
     """
 
     def __init__(self, path: Path, *, enabled: bool = True) -> None:
-        self.path = Path(path)
+        self.path: Path = Path(path)
         self.enabled = enabled
-        self._fh = None
+        self._fh: IO[str] | None = None
         self._lock = threading.Lock()
 
     def close(self) -> None:

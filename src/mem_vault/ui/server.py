@@ -231,7 +231,9 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
         tags: str = Form(""),
         content: str = Form(""),
     ):
-        kwargs = {"id": mem_id}
+        # Heterogeneous: ``tags`` is a list, the rest are strings — annotate
+        # explicitly so mypy doesn't infer ``dict[str, str]`` from the seed.
+        kwargs: dict[str, Any] = {"id": mem_id}
         if title.strip():
             kwargs["title"] = title.strip()
         if description.strip():

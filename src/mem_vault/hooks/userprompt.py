@@ -91,7 +91,11 @@ def detect_script(text: str) -> str:
                 break
     if total_letters < 3:
         return "unknown"
-    return max(counts, key=counts.get) if counts else "unknown"
+    if not counts:
+        return "unknown"
+    # Wrap ``counts.get`` so mypy sees a non-Optional return — ``dict.get``
+    # alone is typed as returning ``int | None`` and confuses ``max(key=...)``.
+    return max(counts, key=lambda k: counts[k])
 
 
 def _allowed_scripts() -> set[str]:

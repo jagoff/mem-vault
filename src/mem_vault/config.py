@@ -155,7 +155,10 @@ class Config(BaseModel):
 
     @field_validator("vault_path", "state_dir", mode="before")
     @classmethod
-    def _expand(cls, v: str | Path) -> Path:
+    def _expand(cls, v: str | Path | None) -> str | Path | None:
+        # Pydantic ``mode="before"`` accepts whatever the caller passed, so the
+        # signature stays loose. We only normalize truthy values; ``None`` /
+        # empty string passes through and Pydantic's own validator handles it.
         return Path(v).expanduser().resolve() if v else v
 
     @property
