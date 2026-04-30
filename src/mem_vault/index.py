@@ -72,11 +72,25 @@ class _CircuitBreaker:
     calls slipping through right at the edge — harmless. We don't lock.
     """
 
-    def __init__(self, *, threshold: int = 3, cooldown_s: float = 30.0):
+    def __init__(
+        self,
+        *,
+        threshold: int = 3,
+        cooldown_s: float = 30.0,
+        failure_decay_s: float = 300.0,
+    ):
         self.threshold = max(1, threshold)
         self.cooldown_s = max(0.0, cooldown_s)
+        # If no new failure happens within ``failure_decay_s`` of the last
+        # one, treat the breaker as healed: reset the counter on the next
+        # ``record_failure`` call. Without this, three transient failures
+        # spread across hours would still pile up and trip the breaker on
+        # an otherwise-healthy Ollama. 5 minutes default is long enough to
+        # group genuine flakiness and short enough to forget noise.
+        self.failure_decay_s = max(0.0, failure_decay_s)
         self._consecutive_failures = 0
         self._open_until = 0.0
+        self._last_failure_ts = 0.0
 
     def is_open(self) -> bool:
         return self._open_until > time.monotonic()
@@ -98,11 +112,21 @@ class _CircuitBreaker:
             logger.info("LLM circuit breaker: closed (success after failures)")
         self._consecutive_failures = 0
         self._open_until = 0.0
+        self._last_failure_ts = 0.0
 
     def record_failure(self) -> None:
+        now = time.monotonic()
+        # Time-decay reset: stale failures don't compound into a trip.
+        if (
+            self.failure_decay_s > 0
+            and self._last_failure_ts > 0
+            and (now - self._last_failure_ts) > self.failure_decay_s
+        ):
+            self._consecutive_failures = 0
+        self._last_failure_ts = now
         self._consecutive_failures += 1
         if self._consecutive_failures >= self.threshold:
-            self._open_until = time.monotonic() + self.cooldown_s
+            self._open_until = now + self.cooldown_s
             logger.warning(
                 "LLM circuit breaker: OPEN — %d consecutive failures, cooling down %.0fs",
                 self._consecutive_failures,

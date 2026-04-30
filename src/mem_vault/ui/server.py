@@ -26,15 +26,17 @@ import asyncio
 import ipaddress
 import logging
 import secrets
+import time
 from collections import Counter
 from datetime import UTC
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, ConfigDict, Field
 
 from mem_vault import __version__
 from mem_vault.config import load_config
@@ -95,6 +97,72 @@ def _format_relative(iso_str: str) -> str:
     return iso_str[:10]
 
 
+# ---------------------------------------------------------------------------
+# Pydantic v2 schemas for /api/v1 JSON endpoints
+# ---------------------------------------------------------------------------
+#
+# Why these exist: ``api_v1_save`` and ``api_v1_update`` used to take a raw
+# ``dict[str, Any]`` and pass it straight to the service. A buggy/malicious
+# caller sending ``{"content": null, "tags": "not a list"}`` would crash with
+# a 500 instead of a clean 422. These models give us:
+#   * input validation at the FastAPI boundary (typed bodies → 422 with the
+#     Pydantic error envelope on bad shapes),
+#   * an OpenAPI doc that reflects the actual contract,
+#   * dict-passthrough into the service via ``model_dump(exclude_none=True)``
+#     so the existing ``args.get(...)`` lookups inside ``MemVaultService``
+#     keep working without any change to the service layer.
+#
+# The set of literal types mirrors ``mem_vault.storage._VALID_TYPES``. Keep
+# them in sync — if ``storage.py`` ever grows a new type, add it here too or
+# the API will reject the payload before the storage layer can validate.
+
+_MemoryType = Literal["feedback", "preference", "decision", "fact", "note", "bug", "todo"]
+
+
+class MemoryCreate(BaseModel):
+    """Request body for ``POST /api/v1/memories``.
+
+    Mirrors the kwargs accepted by ``MemVaultService.save``. Only ``content``
+    is required; everything else has sane server-side defaults. ``visible_to``
+    accepts either a list of agent IDs or one of the shorthands ``"public"`` /
+    ``"private"`` (handled inside the service).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = Field(..., min_length=1)
+    title: str | None = None
+    description: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    type: _MemoryType | None = None
+    agent_id: str | None = None
+    user_id: str | None = None
+    visible_to: list[str] | str | None = None
+    auto_extract: bool | None = None
+    auto_link: bool | None = None
+    project: str | None = None
+    auto_contradict: bool | None = None
+
+
+class MemoryUpdate(BaseModel):
+    """Request body for ``PATCH /api/v1/memories/{mem_id}``.
+
+    All fields optional — the URL param carries the id. Only fields the caller
+    actually wants to mutate should be present; ``model_dump(exclude_none=True)``
+    in the route handler ensures we never send a spurious ``None`` to the
+    service that would be misread as "clear this field".
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    content: str | None = None
+    title: str | None = None
+    description: str | None = None
+    tags: list[str] | None = None
+    visible_to: list[str] | str | None = None
+    project: str | None = None
+
+
 def create_app(service: MemVaultService | None = None) -> FastAPI:
     """Build the FastAPI application. Accepts an optional pre-built service for tests."""
     if service is None:
@@ -142,6 +210,23 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
     templates.env.filters["relative_time"] = _format_relative
 
     app.state.service = service
+
+    # In-process TTL cache for the stats / types endpoints. Without this,
+    # every dashboard refresh walks the entire vault (parses N markdown
+    # files, hits stat() for each one). On iCloud-mounted Obsidian vaults
+    # with thousands of memorias that's 3-5 s per request — turns the UI
+    # into a slideshow. The cache is invalidated automatically when the TTL
+    # lapses; UI refreshes inherit the lag at most once per ``_STATS_TTL_S``.
+    _STATS_TTL_S = 30.0
+    _stats_cache: dict[str, Any] = {"ts": 0.0, "by_type": None, "by_agent": None, "total": 0}
+    _types_cache: dict[str, Any] = {"ts": 0.0, "types": None, "tags": None}
+    _cache_lock = asyncio.Lock()
+
+    def _stats_fresh() -> bool:
+        return (time.monotonic() - _stats_cache["ts"]) < _STATS_TTL_S
+
+    def _types_fresh() -> bool:
+        return (time.monotonic() - _types_cache["ts"]) < _STATS_TTL_S
 
     # ----- Pages ------------------------------------------------------------
 
@@ -299,30 +384,79 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
 
     # ----- API: stats -------------------------------------------------------
 
+    def _compute_stats() -> dict[str, Any]:
+        """Single-pass walk over the vault to populate both caches.
+
+        Iterates with ``iter_memories`` so we never hold the full corpus
+        in RAM — important for vaults with 10k+ memorias on iCloud.
+        """
+        total = 0
+        by_type: Counter = Counter()
+        by_agent: Counter = Counter()
+        types: set[str] = set()
+        tags: set[str] = set()
+        for m in service.storage.iter_memories():
+            total += 1
+            by_type[m.type] += 1
+            by_agent[m.agent_id or "—"] += 1
+            types.add(m.type)
+            tags.update(m.tags)
+        return {
+            "total": total,
+            "by_type": dict(by_type),
+            "by_agent": dict(by_agent),
+            "types": sorted(types),
+            "tags": sorted(tags),
+        }
+
+    async def _refresh_stats_cache() -> dict[str, Any]:
+        async with _cache_lock:
+            if _stats_fresh() and _types_fresh():
+                # Another request beat us into the lock — reuse its data.
+                return {
+                    "total": _stats_cache["total"],
+                    "by_type": _stats_cache["by_type"] or {},
+                    "by_agent": _stats_cache["by_agent"] or {},
+                    "types": _types_cache["types"] or [],
+                    "tags": _types_cache["tags"] or [],
+                }
+            data = await asyncio.to_thread(_compute_stats)
+            now = time.monotonic()
+            _stats_cache.update(
+                {
+                    "ts": now,
+                    "total": data["total"],
+                    "by_type": data["by_type"],
+                    "by_agent": data["by_agent"],
+                }
+            )
+            _types_cache.update({"ts": now, "types": data["types"], "tags": data["tags"]})
+            return data
+
     @app.get("/api/stats", response_class=HTMLResponse)
     async def stats(request: Request):
-        memories = await asyncio.to_thread(
-            service.storage.list, type=None, tags=None, user_id=None, limit=10**9
-        )
-        total = len(memories)
-        by_type = Counter(m.type for m in memories)
-        by_agent = Counter((m.agent_id or "—") for m in memories)
+        if _stats_fresh():
+            data = {
+                "total": _stats_cache["total"],
+                "by_type": _stats_cache["by_type"] or {},
+                "by_agent": _stats_cache["by_agent"] or {},
+            }
+        else:
+            data = await _refresh_stats_cache()
         return templates.TemplateResponse(
             request,
             "_stats.html",
-            {"total": total, "by_type": dict(by_type), "by_agent": dict(by_agent)},
+            {"total": data["total"], "by_type": data["by_type"], "by_agent": data["by_agent"]},
         )
 
     @app.get("/api/types")
     async def types_endpoint():
-        memories = await asyncio.to_thread(
-            service.storage.list, type=None, tags=None, user_id=None, limit=10**9
-        )
-        types = sorted({m.type for m in memories})
-        tags: set[str] = set()
-        for m in memories:
-            tags.update(m.tags)
-        return JSONResponse({"types": types, "tags": sorted(tags)})
+        if _types_fresh():
+            return JSONResponse(
+                {"types": _types_cache["types"] or [], "tags": _types_cache["tags"] or []}
+            )
+        data = await _refresh_stats_cache()
+        return JSONResponse({"types": data["types"], "tags": data["tags"]})
 
     # ----- API v1: JSON endpoints for the MCP / CLI remote client ----------
     # These exist alongside the HTMX endpoints above. They expose the exact
@@ -378,14 +512,18 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
         return JSONResponse(await service.get({"id": mem_id}))
 
     @app.post("/api/v1/memories")
-    async def api_v1_save(payload: dict[str, Any]):
-        return JSONResponse(await service.save(payload))
+    async def api_v1_save(payload: MemoryCreate):
+        # ``exclude_none=True`` keeps optional-but-unset fields out of the dict
+        # so the service falls back to its own defaults (``config.user_id``,
+        # ``auto_extract_default``, etc) instead of seeing an explicit ``None``
+        # and treating it as "the caller really wants null here".
+        return JSONResponse(await service.save(payload.model_dump(exclude_none=True)))
 
     @app.patch("/api/v1/memories/{mem_id}")
-    async def api_v1_update(mem_id: str, payload: dict[str, Any]):
-        payload = dict(payload)
-        payload["id"] = mem_id
-        return JSONResponse(await service.update(payload))
+    async def api_v1_update(mem_id: str, payload: MemoryUpdate):
+        args = payload.model_dump(exclude_none=True)
+        args["id"] = mem_id
+        return JSONResponse(await service.update(args))
 
     @app.delete("/api/v1/memories/{mem_id}")
     async def api_v1_delete(mem_id: str):

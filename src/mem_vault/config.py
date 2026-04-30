@@ -12,6 +12,7 @@ Ollama runs on localhost. No API keys are required or read.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import tomllib
 from pathlib import Path
@@ -448,7 +449,16 @@ def load_config(config_path: Path | None = None) -> Config:
 
     cfg = Config(**merged)
     if cfg.qdrant_collection is None:
-        cfg.qdrant_collection = f"mem_vault_{cfg.agent_id}" if cfg.agent_id else "mem_vault"
+        if cfg.agent_id:
+            # Sanitize the agent_id before composing the collection name —
+            # Qdrant rejects names with spaces / colons / other punctuation
+            # (collection names must match ``^[a-zA-Z0-9_-]+$``). Without
+            # this, ``MEM_VAULT_AGENT_ID="claude code"`` would crash on the
+            # first save with an opaque qdrant-client error.
+            safe = re.sub(r"[^A-Za-z0-9_-]+", "_", cfg.agent_id).strip("_")
+            cfg.qdrant_collection = f"mem_vault_{safe}" if safe else "mem_vault"
+        else:
+            cfg.qdrant_collection = "mem_vault"
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.qdrant_path.mkdir(parents=True, exist_ok=True)
     cfg.memory_dir.mkdir(parents=True, exist_ok=True)

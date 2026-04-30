@@ -178,6 +178,16 @@ async def run(cmd: str, args: argparse.Namespace) -> int:
 
     if cmd == "delete":
         if not args.yes:
+            # Reject non-TTY without --yes outright. Otherwise ``input()``
+            # either hangs forever (no EOF on the pipe) or returns immediately
+            # with EOF and silently aborts — both confusing for CI / piped
+            # invocations where the user can't actually type a response.
+            if not sys.stdin.isatty():
+                print(
+                    "error: delete requires --yes when stdin is not a TTY (CI / piped input).",
+                    file=sys.stderr,
+                )
+                return 2
             print(f"about to delete memory {args.id!r} (file + index entry).")
             ans = input("type 'yes' to confirm: ").strip().lower()
             if ans != "yes":

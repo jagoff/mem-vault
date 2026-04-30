@@ -71,3 +71,73 @@ def test_breaker_cooldown_remaining_decreases() -> None:
     second = breaker.cooldown_remaining()
     assert first > 0
     assert second < first
+
+
+# ---------------------------------------------------------------------------
+# Failure-decay reset added in the audit pass
+# ---------------------------------------------------------------------------
+
+
+def test_failure_counter_decays_after_silence(monkeypatch):
+    """Stale failures don't compound — counter resets after ``failure_decay_s``."""
+    from mem_vault.index import _CircuitBreaker
+
+    fake_now = [1000.0]
+
+    def fake_monotonic():
+        return fake_now[0]
+
+    import mem_vault.index as idx_mod
+
+    monkeypatch.setattr(idx_mod.time, "monotonic", fake_monotonic)
+    breaker = _CircuitBreaker(threshold=3, cooldown_s=30.0, failure_decay_s=300.0)
+
+    # Two failures, close together — both count.
+    breaker.record_failure()
+    fake_now[0] += 5
+    breaker.record_failure()
+    assert breaker._consecutive_failures == 2
+    assert not breaker.is_open()
+
+    # 10 minutes of silence — the next failure should NOT add to the prior count.
+    fake_now[0] += 600
+    breaker.record_failure()
+    assert breaker._consecutive_failures == 1, (
+        "stale failures should have decayed before the new one was recorded"
+    )
+    assert not breaker.is_open()
+
+
+def test_failure_counter_does_not_decay_when_disabled(monkeypatch):
+    """``failure_decay_s=0`` keeps the legacy behavior (no decay)."""
+    from mem_vault.index import _CircuitBreaker
+
+    fake_now = [1000.0]
+    import mem_vault.index as idx_mod
+
+    monkeypatch.setattr(idx_mod.time, "monotonic", lambda: fake_now[0])
+    breaker = _CircuitBreaker(threshold=3, cooldown_s=30.0, failure_decay_s=0.0)
+
+    breaker.record_failure()
+    fake_now[0] += 99999  # arbitrarily long gap
+    breaker.record_failure()
+    assert breaker._consecutive_failures == 2  # no decay
+
+
+def test_failure_decay_does_not_close_open_breaker(monkeypatch):
+    """If the breaker tripped already, decay applies only on the NEXT failure."""
+    from mem_vault.index import _CircuitBreaker
+
+    fake_now = [1000.0]
+    import mem_vault.index as idx_mod
+
+    monkeypatch.setattr(idx_mod.time, "monotonic", lambda: fake_now[0])
+    breaker = _CircuitBreaker(threshold=2, cooldown_s=30.0, failure_decay_s=60.0)
+
+    breaker.record_failure()
+    breaker.record_failure()
+    assert breaker.is_open()
+    # Cooldown lapses (2 min), but the breaker reads the timestamp on
+    # is_open() — that path is unchanged by the decay logic.
+    fake_now[0] += 120
+    assert not breaker.is_open()

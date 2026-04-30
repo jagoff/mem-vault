@@ -151,9 +151,16 @@ async def _gather_context(prompt: str) -> str:
         return ""
 
     lines: list[str] = ["## Memorias relevantes al mensaje actual (mem-vault)\n"]
+    # Dedup by memory id — ``memory_search`` should already collapse duplicates
+    # via the hybrid+rerank path, but we belt-and-suspender it here so a buggy
+    # ranker can never inject the same memoria twice into the prompt.
+    seen: set[str] = set()
     for hit in result["results"]:
         mem = hit.get("memory") or {}
         mid = hit.get("id") or mem.get("id") or "?"
+        if mid != "?" and mid in seen:
+            continue
+        seen.add(mid)
         name = mem.get("name") or mid
         descr = (mem.get("description") or hit.get("snippet") or "").strip().replace("\n", " ")
         score = hit.get("score")

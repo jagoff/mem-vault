@@ -340,3 +340,42 @@ async def test_reindex_orphan_sweep_skipped_with_limit(monkeypatch, reindex_env)
     await reindex_mod.run(_make_args(limit=1))
     # Orphan must NOT have been removed because we couldn't walk every file
     assert "ghost_id" in stub.store
+
+
+async def test_reindex_reports_orphan_skip_on_limit(monkeypatch, reindex_env, capsys):
+    """``--limit`` skips the orphan sweep — the user must be told why,
+    otherwise the run looks like a clean reconcile when it isn't.
+    """
+    service, stub, config = reindex_env
+    await _seed(service, n=2)
+
+    monkeypatch.setattr("mem_vault.config.load_config", lambda *a, **kw: config)
+    monkeypatch.setattr("mem_vault.server.MemVaultService", lambda cfg: service)
+
+    rc = await reindex_mod.run(_make_args(limit=1))
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    # The skip reason must be visible on stdout, not just hidden in stderr.
+    assert "orphan sweep skipped" in out
+    assert "--limit set" in out
+    # And the final summary should not pretend a sweep ran.
+    assert "orphans_removed=" not in out
+
+
+async def test_reindex_reports_orphan_count_on_normal_run(monkeypatch, reindex_env, capsys):
+    """A normal run (no --limit, no --purge) reports ``orphans_removed=N``
+    in the final summary so the user can confirm the sweep happened.
+    """
+    service, stub, config = reindex_env
+    await _seed(service, n=2)
+
+    monkeypatch.setattr("mem_vault.config.load_config", lambda *a, **kw: config)
+    monkeypatch.setattr("mem_vault.server.MemVaultService", lambda cfg: service)
+
+    rc = await reindex_mod.run(_make_args())
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "orphans_removed=" in out
+    assert "orphan sweep skipped" not in out

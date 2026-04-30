@@ -485,3 +485,100 @@ async def test_update_missing_id_returns_not_found(service_factory):
     res = await service.update({"id": "ghost", "content": "anything"})
     assert res["ok"] is False
     assert "not found" in res["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Project metadata preservation across update — audit-pass fix
+# ---------------------------------------------------------------------------
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_update_preserves_project_metadata_via_default(monkeypatch, tmp_path):
+    """``memory_update`` re-indexes with the project tag derived from config."""
+    monkeypatch.setenv("MEM_VAULT_PATH", str(tmp_path))
+    monkeypatch.setenv("MEM_VAULT_STATE_DIR", str(tmp_path / "_state"))
+    monkeypatch.setenv("MEM_VAULT_PROJECT", "audit-test-project")
+
+    from mem_vault.config import load_config
+    from mem_vault.server import MemVaultService
+
+    cfg = load_config()
+    service = MemVaultService(cfg)
+
+    # Stub out the index with a fake that records the metadata it sees.
+    captured: list[dict] = []
+
+    class FakeIndex:
+        def __init__(self):
+            self.breaker = service.index._breaker
+
+        def add(self, content, *, user_id, agent_id=None, metadata=None, auto_extract=False):
+            captured.append(dict(metadata or {}))
+            return [{"id": "x"}]
+
+        def delete_by_metadata(self, key, value, user_id):
+            return 0
+
+        def search(self, *a, **kw):
+            return []
+
+    service.index = FakeIndex()  # type: ignore[assignment]
+
+    # Save a memory; project must be stamped.
+    save_resp = await service.save({"content": "alpha", "title": "alpha"})
+    assert save_resp["ok"]
+    assert captured[-1].get("project") == "audit-test-project"
+
+    # Update the body (forces re-index). The project field MUST survive.
+    captured.clear()
+    upd_resp = await service.update({"id": save_resp["memory"]["id"], "content": "alpha v2"})
+    assert upd_resp.get("ok")
+    assert captured, "update should have re-indexed"
+    assert captured[-1].get("project") == "audit-test-project", (
+        f"update dropped project metadata: {captured[-1]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_preserves_project_metadata_via_tag(monkeypatch, tmp_path):
+    """A ``project:foo`` tag should propagate through update without explicit arg."""
+    monkeypatch.setenv("MEM_VAULT_PATH", str(tmp_path))
+    monkeypatch.setenv("MEM_VAULT_STATE_DIR", str(tmp_path / "_state"))
+    monkeypatch.delenv("MEM_VAULT_PROJECT", raising=False)
+
+    from mem_vault.config import load_config
+    from mem_vault.server import MemVaultService
+
+    cfg = load_config()
+    service = MemVaultService(cfg)
+
+    captured: list[dict] = []
+
+    class FakeIndex:
+        def __init__(self):
+            self.breaker = service.index._breaker
+
+        def add(self, content, *, user_id, agent_id=None, metadata=None, auto_extract=False):
+            captured.append(dict(metadata or {}))
+            return [{"id": "x"}]
+
+        def delete_by_metadata(self, key, value, user_id):
+            return 0
+
+        def search(self, *a, **kw):
+            return []
+
+    service.index = FakeIndex()  # type: ignore[assignment]
+
+    save_resp = await service.save(
+        {"content": "beta", "title": "beta", "tags": ["project:tagged-proj", "x"]}
+    )
+    assert captured[-1].get("project") == "tagged-proj"
+
+    captured.clear()
+    upd_resp = await service.update({"id": save_resp["memory"]["id"], "content": "beta v2"})
+    assert upd_resp.get("ok")
+    assert captured[-1].get("project") == "tagged-proj"

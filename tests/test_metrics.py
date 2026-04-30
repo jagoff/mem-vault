@@ -98,11 +98,60 @@ def test_sink_creates_parent_directory(tmp_path):
     assert path.exists()
 
 
-def test_sink_disables_itself_on_persistent_io_error(tmp_path, monkeypatch, caplog):
-    """If the file can't be opened, the sink logs once and disables itself."""
+def test_sink_enters_cooldown_on_io_error_then_drops_writes(tmp_path):
+    """A failed write trips the cooldown; subsequent writes drop silently."""
 
-    sink = MetricsSink(tmp_path / "metrics.jsonl", enabled=True)
+    sink = MetricsSink(tmp_path / "metrics.jsonl", enabled=True, recovery_window_s=300.0)
 
+    # Drive the sink's internal clock manually so we don't sleep in tests.
+    fake_now = [1000.0]
+    sink._now = lambda: fake_now[0]
+
+    open_calls = {"n": 0}
+
+    class _Exploder:
+        def open(self, *args, **kwargs):
+            open_calls["n"] += 1
+            raise OSError("disk full")
+
+        @property
+        def parent(self):
+            class _NoOp:
+                def mkdir(self, **kwargs):
+                    pass
+
+            return _NoOp()
+
+    sink.path = _Exploder()  # type: ignore[assignment]
+
+    # First write fails → counter ticks, cooldown opens.
+    sink.record(tool="x", duration_ms=1.0, ok=True)
+    assert sink.enabled is True  # NOT permanently disabled anymore
+    assert sink.failure_count == 1
+    assert sink.last_failure_ts == fake_now[0]
+    assert open_calls["n"] == 1
+
+    # The next 5 writes inside the cooldown window must be dropped
+    # silently — no FS attempt, no extra failure ticks, no log spam.
+    for _ in range(5):
+        sink.record(tool="x", duration_ms=1.0, ok=True)
+    assert sink.failure_count == 1, "cooldown drops shouldn't increment failure_count"
+    assert open_calls["n"] == 1, "no further open() attempts during cooldown"
+
+
+def test_sink_retries_after_recovery_window_and_resets_on_success(tmp_path):
+    """Once the cooldown window passes, the sink retries the write.
+
+    On a successful retry the failure counter resets to 0 and the sink
+    keeps writing as if the transient blip never happened.
+    """
+    real_path = tmp_path / "metrics.jsonl"
+    sink = MetricsSink(real_path, enabled=True, recovery_window_s=300.0)
+
+    fake_now = [1000.0]
+    sink._now = lambda: fake_now[0]
+
+    # Stage 1: first write fails (FS is "broken").
     class _Exploder:
         def open(self, *args, **kwargs):
             raise OSError("disk full")
@@ -117,7 +166,63 @@ def test_sink_disables_itself_on_persistent_io_error(tmp_path, monkeypatch, capl
 
     sink.path = _Exploder()  # type: ignore[assignment]
     sink.record(tool="x", duration_ms=1.0, ok=True)
-    assert sink.enabled is False  # turned itself off
+    assert sink.failure_count == 1
+    assert sink.last_failure_ts == 1000.0
+
+    # Stage 2: still inside the cooldown — even though we "fix" the FS,
+    # we don't try yet (cheap drop).
+    sink.path = real_path  # FS recovered
+    fake_now[0] = 1000.0 + 100.0  # only 100 s passed, < 300 s window
+    sink.record(tool="x", duration_ms=1.0, ok=True)
+    assert not real_path.exists(), "must not write while still in cooldown"
+    assert sink.failure_count == 1
+
+    # Stage 3: window elapsed → retry. This one succeeds → counter
+    # resets to 0, last_failure_ts cleared, file gets the line.
+    fake_now[0] = 1000.0 + 301.0
+    sink.record(tool="x", duration_ms=2.5, ok=True)
+    sink.close()
+
+    assert real_path.exists()
+    lines = _read_lines(real_path)
+    assert len(lines) == 1
+    assert lines[0]["tool"] == "x"
+    assert sink.failure_count == 0
+    assert sink.last_failure_ts is None
+
+
+def test_sink_repeated_failures_extend_cooldown(tmp_path):
+    """If retry also fails, ``failure_count`` keeps climbing and the
+    cooldown timer restarts from the latest failure."""
+
+    sink = MetricsSink(tmp_path / "metrics.jsonl", enabled=True, recovery_window_s=300.0)
+    fake_now = [1000.0]
+    sink._now = lambda: fake_now[0]
+
+    class _Exploder:
+        def open(self, *args, **kwargs):
+            raise OSError("disk still full")
+
+        @property
+        def parent(self):
+            class _NoOp:
+                def mkdir(self, **kwargs):
+                    pass
+
+            return _NoOp()
+
+    sink.path = _Exploder()  # type: ignore[assignment]
+
+    sink.record(tool="x", duration_ms=1.0, ok=True)
+    assert sink.failure_count == 1
+    first_ts = sink.last_failure_ts
+
+    # Window elapsed — sink retries, retry also fails.
+    fake_now[0] = 1000.0 + 400.0
+    sink.record(tool="x", duration_ms=1.0, ok=True)
+    assert sink.failure_count == 2
+    assert sink.last_failure_ts == 1400.0
+    assert sink.last_failure_ts != first_ts
 
 
 # ---------------------------------------------------------------------------

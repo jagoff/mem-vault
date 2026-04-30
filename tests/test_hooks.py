@@ -663,3 +663,138 @@ def test_stop_vault_memory_count_returns_minus_one_when_config_fails(monkeypatch
     from mem_vault.hooks.stop import _vault_memory_count
 
     assert _vault_memory_count() == -1
+
+
+# ---------------------------------------------------------------------------
+# UserPromptSubmit hook — dedup of repeated memory ids
+# ---------------------------------------------------------------------------
+
+
+def test_userprompt_dedupes_repeated_memory_ids(monkeypatch, capsys):
+    """If memory_search returns the same id twice (rare hybrid+rerank edge
+    case), the injected context must list it only once."""
+    service = AsyncMock()
+    service.search = AsyncMock(
+        return_value={
+            "ok": True,
+            "results": [
+                {
+                    "id": "dup-mem",
+                    "score": 0.91,
+                    "memory": {
+                        "id": "dup-mem",
+                        "name": "Memoria duplicada",
+                        "description": "Primer hit",
+                    },
+                },
+                {
+                    "id": "dup-mem",
+                    "score": 0.88,
+                    "memory": {
+                        "id": "dup-mem",
+                        "name": "Memoria duplicada",
+                        "description": "Segundo hit (mismo id)",
+                    },
+                },
+                {
+                    "id": "other",
+                    "score": 0.71,
+                    "memory": {
+                        "id": "other",
+                        "name": "Otra memoria",
+                        "description": "Distinta",
+                    },
+                },
+            ],
+        }
+    )
+
+    _patch_stdin(monkeypatch, {"prompt": "Una pregunta lo bastante larga para no ser skip"})
+    _patch_build_service(monkeypatch, "userprompt", service)
+
+    from mem_vault.hooks import userprompt
+
+    importlib.reload(userprompt)
+    userprompt.run()
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    additional = payload["hookSpecificOutput"]["additionalContext"]
+    # The duplicated memoria should appear exactly once — first occurrence wins.
+    assert additional.count("Memoria duplicada") == 1
+    assert "Primer hit" in additional
+    assert "Segundo hit" not in additional
+    # The non-duplicate memoria still shows up.
+    assert "Otra memoria" in additional
+
+
+# ---------------------------------------------------------------------------
+# Stop hook — sessions.log rotation + survives rotation failure
+# ---------------------------------------------------------------------------
+
+
+def test_stop_hook_rotates_oversized_log(monkeypatch, tmp_path):
+    """When sessions.log exceeds the cap, rotate to sessions.log.1 before append."""
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setattr("mem_vault.hooks.stop._vault_memory_count", lambda: 7)
+    # Tiny cap so the test stays fast — 1 KiB.
+    monkeypatch.setenv("MEM_VAULT_SESSIONS_LOG_MAX_BYTES", "1024")
+    monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
+
+    log_dir = tmp_path / ".local" / "share" / "mem-vault"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "sessions.log"
+    # Pre-fill above the 1 KiB cap.
+    log_file.write_text("x" * 4096, encoding="utf-8")
+    assert log_file.stat().st_size > 1024
+
+    from mem_vault.hooks import stop
+
+    importlib.reload(stop)
+    monkeypatch.setattr("mem_vault.hooks.stop._vault_memory_count", lambda: 7)
+    stop.run()
+
+    rotated = log_dir / "sessions.log.1"
+    assert rotated.exists(), "rotation target should exist after the hook ran"
+    # Rotated copy keeps the old content (≥4096 bytes of ``x``).
+    assert rotated.stat().st_size >= 4096
+    # New live log only has the freshly appended audit line — way under 1 KiB.
+    assert log_file.exists()
+    new_content = log_file.read_text(encoding="utf-8")
+    assert "auto_feedback=" in new_content
+    assert len(new_content) < 1024
+
+
+def test_stop_hook_survives_rotation_failure(monkeypatch, tmp_path, capsys):
+    """If rotation raises, the hook still exits cleanly and writes nothing weird."""
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setattr("mem_vault.hooks.stop._vault_memory_count", lambda: 3)
+    monkeypatch.setenv("MEM_VAULT_SESSIONS_LOG_MAX_BYTES", "1024")
+    monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
+
+    log_dir = tmp_path / ".local" / "share" / "mem-vault"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "sessions.log"
+    log_file.write_text("x" * 4096, encoding="utf-8")
+
+    # Force the rotation step to blow up — simulates an unwritable target.
+    def _boom(_log_file):
+        raise PermissionError("rotation target unwritable")
+
+    monkeypatch.setattr("mem_vault.hooks.stop._maybe_rotate_sessions_log", _boom)
+
+    from mem_vault.hooks import stop
+
+    importlib.reload(stop)
+    monkeypatch.setattr("mem_vault.hooks.stop._vault_memory_count", lambda: 3)
+    monkeypatch.setattr("mem_vault.hooks.stop._maybe_rotate_sessions_log", _boom)
+
+    # Must NOT raise — hook contract requires exit 0 on any failure path.
+    stop.run()
+
+    err = capsys.readouterr().err
+    assert "rotate failed" in err
+    # The hook still appended the audit line to the existing (oversized) file.
+    assert log_file.exists()
+    content = log_file.read_text(encoding="utf-8")
+    assert "auto_feedback=" in content

@@ -356,3 +356,160 @@ async def test_hybrid_invalidate_is_called_on_delete(hybrid_service, monkeypatch
     monkeypatch.setattr(service._hybrid, "invalidate", lambda: calls.append(1))
     await service.delete({"id": seed["memory"]["id"]})
     assert calls, "delete should invalidate the BM25 cache"
+
+
+# ---------------------------------------------------------------------------
+# Determinism guards — reciprocal_rank_fusion + fuse_dense_and_bm25
+# ---------------------------------------------------------------------------
+
+
+def test_rrf_rejects_negative_k():
+    """Negative ``k`` values would make the RRF contribution
+    ``1/(k + position + 1)`` go negative or blow up near zero. The
+    function must fail loudly instead of silently producing nonsense
+    scores. Common cause: a typo in config (``rrf_k=-1``) or a bad
+    caller passing through user input unchecked.
+    """
+    with pytest.raises(ValueError, match="non-negative"):
+        reciprocal_rank_fusion([["a", "b"]], k=-1)
+    with pytest.raises(ValueError, match="non-negative"):
+        reciprocal_rank_fusion([["a", "b"]], k=-60)
+
+
+def test_rrf_accepts_k_zero():
+    """``k=0`` is a degenerate-but-valid case: contribution becomes
+    ``1/(position+1)``. The validator must allow it (only negative is
+    nonsense)."""
+    out = reciprocal_rank_fusion([["a", "b"]], k=0)
+    # First doc: 1/1 = 1.0; second doc: 1/2 = 0.5.
+    scores = dict(out)
+    assert scores["a"] == pytest.approx(1.0)
+    assert scores["b"] == pytest.approx(0.5)
+
+
+def test_fuse_dense_and_bm25_known_good_ordering():
+    """Regression guard for the implicit-ascending sort in
+    ``fuse_dense_and_bm25``.
+
+    Inputs:
+    - dense_hits ordered by mem0 score desc → ``[a, b, c]`` (a is best).
+    - bm25_hits  ordered by BM25 score desc → ``[c, b, a]`` (c is best).
+
+    Expected RRF scores with k=60:
+    - a: 1/(60+1) [dense rank 0] + 1/(60+3) [bm25 rank 2] = 1/61 + 1/63
+    - b: 1/(60+2) [dense rank 1] + 1/(60+2) [bm25 rank 1] = 2/62
+    - c: 1/(60+3) [dense rank 2] + 1/(60+1) [bm25 rank 0] = 1/63 + 1/61
+
+    Numerically a == c by construction (same pair of denominators, just
+    swapped) and they're slightly above b (the convexity of ``1/x``
+    means the asymmetric pair ``(1/61 + 1/63)`` beats the symmetric
+    ``(1/62 + 1/62)`` — Jensen's inequality, in tiny). So the
+    deterministic order is ``[a, c, b]``: ``a`` and ``c`` tied at the
+    top with lexicographic tiebreak, ``b`` last.
+
+    If anyone refactors and accidentally flips one of the sorts to
+    ``reverse=True``, the dense list would be re-read as ``[c, b, a]``
+    → ``c``'s score becomes ``2 * 1/61`` (best in both) and ``a``'s
+    becomes ``2 * 1/63`` (worst in both). Order would flip to
+    ``[c, b, a]``. This test catches that drift.
+    """
+    dense_hits = [
+        {"metadata": {"memory_id": "a"}, "score": 0.9},
+        {"metadata": {"memory_id": "b"}, "score": 0.7},
+        {"metadata": {"memory_id": "c"}, "score": 0.5},
+    ]
+    bm25_hits = [("c", 9.0), ("b", 5.0), ("a", 1.0)]
+    out = fuse_dense_and_bm25(dense_hits, bm25_hits, rrf_k=60)
+    ids = [(h.get("metadata") or {}).get("memory_id") or h.get("id") for h in out]
+    # a and c tied at top (lex tiebreak puts a first), b last.
+    assert ids == ["a", "c", "b"]
+    by_id = {(h.get("metadata") or {}).get("memory_id") or h.get("id"): h for h in out}
+    expected_outer = 1.0 / 61 + 1.0 / 63
+    expected_middle = 2.0 / 62
+    assert by_id["a"]["rrf_score"] == pytest.approx(expected_outer)
+    assert by_id["c"]["rrf_score"] == pytest.approx(expected_outer)
+    assert by_id["b"]["rrf_score"] == pytest.approx(expected_middle)
+    # The whole point of the regression guard: outer > middle (Jensen).
+    assert by_id["a"]["rrf_score"] > by_id["b"]["rrf_score"]
+
+
+def test_fuse_dense_and_bm25_asymmetric_known_good():
+    """A second known-good check with asymmetric inputs to catch any
+    sort regression that happens to preserve symmetric ties."""
+    # 'a' is BEST in dense (rank 0) and ABSENT in BM25.
+    # 'b' is ABSENT in dense and BEST in BM25 (rank 0).
+    # 'c' is in both but at rank 1 in each.
+    dense_hits = [
+        {"metadata": {"memory_id": "a"}, "score": 0.9},
+        {"metadata": {"memory_id": "c"}, "score": 0.7},
+    ]
+    bm25_hits = [("b", 9.0), ("c", 5.0)]
+    out = fuse_dense_and_bm25(dense_hits, bm25_hits, rrf_k=60)
+    scores = {
+        (h.get("metadata") or {}).get("memory_id") or h.get("id"): h["rrf_score"] for h in out
+    }
+    # 'c' appears in BOTH at rank 1 → contribution 2/62 ≈ 0.03226
+    # 'a' and 'b' each appear once at rank 0 → contribution 1/61 ≈ 0.01639
+    assert scores["c"] == pytest.approx(2.0 / 62)
+    assert scores["a"] == pytest.approx(1.0 / 61)
+    assert scores["b"] == pytest.approx(1.0 / 61)
+    # 'c' must outrank both 'a' and 'b' (it's in both lists at the same
+    # near-top rank). If a sort flipped, 'c' would drop to last position.
+    ids = [(h.get("metadata") or {}).get("memory_id") or h.get("id") for h in out]
+    assert ids[0] == "c"
+
+
+# ---------------------------------------------------------------------------
+# HybridRetriever — invalidate cycle stress (regression for iter_memories)
+# ---------------------------------------------------------------------------
+
+
+def test_hybrid_retriever_multiple_invalidate_search_cycles(tmp_path):
+    """Regression: ensure ``_rebuild`` reads the full corpus through
+    ``iter_memories()`` correctly across multiple invalidate→search
+    cycles. A previous audit pass swapped ``storage.list(limit=10**9)``
+    for ``storage.iter_memories()`` — this test exercises the new
+    streaming path under repeated saves to make sure the BM25 corpus
+    stays in sync after every invalidation.
+
+    The historic foot-gun: a generator-based source that gets exhausted
+    on the first read and yields nothing on the second. Our
+    ``iter_memories`` re-walks the directory each call, so this passes —
+    the test is the canary that locks that contract.
+    """
+    storage = VaultStorage(tmp_path)
+    retriever = HybridRetriever(storage)
+
+    # Cycle 1: empty corpus → nothing matches.
+    assert retriever.search("alpha_term") == []
+
+    # Cycle 2: save one + invalidate → it shows up.
+    storage.save(content="body with alpha_term included", title="alpha")
+    retriever.invalidate()
+    res = retriever.search("alpha_term")
+    assert [i for i, _ in res] == ["alpha"]
+
+    # Cycle 3: save a second + invalidate → both queryable, BM25 corpus
+    # contains both docs (proves _rebuild didn't only see the new one
+    # or only the old one).
+    storage.save(content="body with beta_term and alpha_term", title="beta")
+    retriever.invalidate()
+    res_alpha = retriever.search("alpha_term")
+    res_beta = retriever.search("beta_term")
+    assert {i for i, _ in res_alpha} == {"alpha", "beta"}
+    assert [i for i, _ in res_beta] == ["beta"]
+
+    # Cycle 4: a third invalidate without any change must yield the
+    # same corpus (idempotent rebuild).
+    retriever.invalidate()
+    res_alpha_again = retriever.search("alpha_term")
+    assert {i for i, _ in res_alpha_again} == {"alpha", "beta"}
+
+    # Cycle 5: save a third + invalidate → confirms the streaming path
+    # still works after multiple back-to-back rebuilds.
+    storage.save(content="gamma_term only here", title="gamma")
+    retriever.invalidate()
+    res_gamma = retriever.search("gamma_term")
+    assert [i for i, _ in res_gamma] == ["gamma"]
+    res_alpha_final = retriever.search("alpha_term")
+    assert {i for i, _ in res_alpha_final} == {"alpha", "beta"}

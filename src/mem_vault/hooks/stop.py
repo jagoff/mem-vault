@@ -35,6 +35,46 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# Default soft cap for sessions.log: 50 MiB. Configurable via env so tests can
+# use a tiny cap. We rotate to ``sessions.log.1`` (single rotation, no compression)
+# when the live file exceeds the cap. Best-effort — failure to rotate must NOT
+# break the hook (contract: hooks always exit 0).
+_DEFAULT_SESSIONS_LOG_MAX_BYTES = 52_428_800  # 50 MiB
+
+
+def _sessions_log_max_bytes() -> int:
+    raw = os.environ.get("MEM_VAULT_SESSIONS_LOG_MAX_BYTES", "").strip()
+    if not raw:
+        return _DEFAULT_SESSIONS_LOG_MAX_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        return _DEFAULT_SESSIONS_LOG_MAX_BYTES
+    # Negative or zero disables the cap (no rotation).
+    return value if value > 0 else 0
+
+
+def _maybe_rotate_sessions_log(log_file: Path) -> None:
+    """Rotate ``log_file`` to ``log_file.1`` once it exceeds the soft cap.
+
+    Single rotation, no compression. Wrapped fully in try/except by the caller
+    so a rotation failure (permissions, FS full, etc.) is a no-op rather than
+    a crash — the contract for the Stop hook is "always exit 0".
+    """
+    cap = _sessions_log_max_bytes()
+    if cap <= 0:
+        return
+    try:
+        size = log_file.stat().st_size
+    except FileNotFoundError:
+        return
+    if size <= cap:
+        return
+    rotated = log_file.with_suffix(log_file.suffix + ".1")
+    # ``Path.replace`` is atomic on POSIX (rename(2)). Overwrites an existing
+    # ``.1`` if present — we keep only one historical file by design.
+    log_file.replace(rotated)
+
 
 def _vault_memory_count() -> int:
     try:
@@ -233,6 +273,22 @@ def run() -> None:
         f"{now}\tstop\tcwd={cwd}\tmemories={count}"
         f"\tstop_hook_active={stop_active}\tauto_feedback={bumped}\n"
     )
+
+    # Best-effort rotation BEFORE the write so the new line lands in the fresh
+    # file. Wrapped in its own try/except — if rotation fails (e.g. the target
+    # is unwritable) we still try to append to the existing file. Hook contract
+    # forbids any non-zero exit here.
+    try:
+        _maybe_rotate_sessions_log(log_file)
+    except Exception as exc:
+        print(f"mem-vault: stop_log rotate failed: {exc}", file=sys.stderr)
+
+    # POSIX-atomic append: ``open(path, "a")`` opens with ``O_APPEND``, which
+    # the kernel guarantees atomic for a single ``write(2)`` call up to
+    # ``PIPE_BUF`` bytes (≥512 by POSIX, 4096 on Linux/macOS). Our line is
+    # well under that ceiling, so concurrent Claude Code + Devin sessions
+    # cannot interleave bytes within a single line. We deliberately do ONE
+    # ``f.write(line)`` with a complete, newline-terminated string.
     try:
         with log_file.open("a", encoding="utf-8") as f:
             f.write(line)

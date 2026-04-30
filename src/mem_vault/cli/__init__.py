@@ -95,8 +95,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
-    argv = sys.argv[1:]
+def _dispatch(argv: list[str]) -> None:
     if not argv:
         # Backwards-compat: bare `mem-vault` boots the MCP server, like
         # `mem-vault-mcp` does. This keeps the existing Devin / Claude Code
@@ -152,6 +151,35 @@ def main() -> None:
 
     print(f"error: unknown subcommand: {cmd}", file=sys.stderr)
     sys.exit(2)
+
+
+def main() -> None:
+    """CLI entrypoint with a top-level error guard.
+
+    Any exception bubbling out of a subcommand is rendered as a one-line
+    error to stderr and the process exits with code 1. Without this, a
+    misconfigured ``MEM_VAULT_PATH`` (or any other unexpected condition)
+    prints a full traceback that leaks config paths, the Ollama host, and
+    other internals to whoever is reading stdout — bad surprise in CI or
+    a shared shell. ``--debug`` opts back into the raw traceback for
+    development.
+    """
+    argv = sys.argv[1:]
+    debug = "--debug" in argv
+    if debug:
+        argv = [a for a in argv if a != "--debug"]
+    try:
+        _dispatch(argv)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        if debug:
+            raise
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print("(re-run with --debug for the full traceback)", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

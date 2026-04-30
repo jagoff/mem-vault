@@ -344,3 +344,194 @@ def test_atomic_write_used_by_storage(tmp_path, monkeypatch):
     storage.save(content="x", title="t")
     assert calls, "VaultStorage._write did not use atomic_write_bytes"
     assert calls[0][0] == storage.path_for("t")
+
+
+# ---------------------------------------------------------------------------
+# iter_memories + count — streaming corpus walk
+# ---------------------------------------------------------------------------
+
+
+def test_iter_memories_yields_in_mtime_desc_order(tmp_path):
+    """``iter_memories`` matches ``list()`` order: newest mtime first."""
+    storage = VaultStorage(tmp_path)
+    storage.save(content="first body", title="first")
+    storage.save(content="second body", title="second")
+    storage.save(content="third body", title="third")
+    yielded = [m.id for m in storage.iter_memories()]
+    listed = [m.id for m in storage.list(limit=10)]
+    assert yielded == listed
+    assert yielded[0] == "third"  # most recent first
+
+
+def test_iter_memories_applies_filters(tmp_path):
+    storage = VaultStorage(tmp_path)
+    storage.save(content="a", title="a", type="bug", tags=["x"])
+    storage.save(content="b", title="b", type="note", tags=["x", "y"])
+    storage.save(content="c", title="c", type="note", tags=["y"])
+    bugs = list(storage.iter_memories(type="bug"))
+    assert {m.id for m in bugs} == {"a"}
+    tagged_x = list(storage.iter_memories(tags=["x"]))
+    assert {m.id for m in tagged_x} == {"a", "b"}
+
+
+def test_count_is_O_glob(tmp_path):
+    """``count`` returns the number of .md files without parsing frontmatter."""
+    storage = VaultStorage(tmp_path)
+    assert storage.count() == 0
+    storage.save(content="one", title="one")
+    storage.save(content="two", title="two")
+    assert storage.count() == 2
+    # A malformed .md should still be counted (count() doesn't parse).
+    (tmp_path / "broken.md").write_text("not yaml at all", encoding="utf-8")
+    assert storage.count() == 3
+
+
+def test_iter_memories_skips_unparseable(tmp_path):
+    """A broken .md is silently skipped by iter_memories (mirrors list())."""
+    storage = VaultStorage(tmp_path)
+    storage.save(content="ok", title="ok")
+    # Frontmatter starts but never closes → parse fails on some inputs.
+    (tmp_path / "broken.md").write_text(
+        "---\nname: broken\nthis: is: not: valid:\n: yaml :\n---\n", encoding="utf-8"
+    )
+    yielded = list(storage.iter_memories())
+    assert any(m.id == "ok" for m in yielded)
+
+
+# ---------------------------------------------------------------------------
+# _reserve_unique_id max_attempts guard
+# ---------------------------------------------------------------------------
+
+
+def test_reserve_unique_id_caps_linear_probe(tmp_path, monkeypatch):
+    """Pathological collision chains fall back to a random suffix."""
+    storage = VaultStorage(tmp_path)
+    # Pre-create the linear chain so the next reserve must use the fallback.
+    base = "memory"
+    (tmp_path / f"{base}.md").write_text("", encoding="utf-8")
+    for i in range(2, 12):
+        (tmp_path / f"{base}_{i}.md").write_text("", encoding="utf-8")
+    # max_attempts=10 → after 10 collisions falls back to ``<base>_<hex>``.
+    new_id = storage._reserve_unique_id(base, max_attempts=10)
+    assert new_id.startswith(f"{base}_")
+    # The fallback hex suffix is 8 chars — never collides with the linear
+    # ``_2``..``_11`` shapes the precreation produced.
+    suffix = new_id.removeprefix(f"{base}_")
+    assert len(suffix) == 8
+
+
+# ---------------------------------------------------------------------------
+# record_usage / record_feedback concurrency — per-file flock fix
+# ---------------------------------------------------------------------------
+
+
+def test_record_usage_concurrent_increments_preserved(tmp_path):
+    """N threads bumping the same memoria must preserve all N increments.
+
+    Pre-fix: each thread did ``read → modify → write`` without any lock,
+    so two threads reading ``usage_count = K`` simultaneously both wrote
+    back ``K + 1`` and one increment was silently lost. Net counter ended
+    up well below the number of calls.
+
+    Post-fix: a per-file ``fcntl.flock(LOCK_EX)`` on a sibling
+    ``<id>.md.lock`` serializes the read-modify-write window, so every
+    increment lands on disk.
+
+    We use a ``threading.Barrier`` so all threads contend on the lock at
+    the exact same moment — maximizes the chance of catching a regression
+    if the lock is removed.
+    """
+    storage = VaultStorage(tmp_path)
+    mem = storage.save(content="x", title="hot memoria")
+    n_threads = 16
+    barrier = threading.Barrier(n_threads)
+
+    def bump():
+        barrier.wait()
+        storage.record_usage(mem.id)
+
+    threads = [threading.Thread(target=bump) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    final = storage.get(mem.id)
+    assert final is not None
+    # Hard invariant: no increment can be lost. Every bump must persist.
+    assert final.usage_count == n_threads, (
+        f"expected {n_threads} increments, got {final.usage_count} — "
+        "one or more record_usage calls lost their bump (lock missing/broken?)"
+    )
+
+
+def test_record_feedback_concurrent_with_record_usage(tmp_path):
+    """``record_feedback`` shares the lock with ``record_usage``.
+
+    A thumbs-up landing at the same instant as a search-driven usage
+    bump must not lose either count: helpful_count and usage_count are
+    both touched, and both writes go through ``_write`` (full file
+    rewrite). The shared per-file flock guarantees they serialize.
+    """
+    storage = VaultStorage(tmp_path)
+    mem = storage.save(content="x", title="hot memoria 2")
+    n_each = 10
+    barrier = threading.Barrier(n_each * 2)
+
+    def thumbs():
+        barrier.wait()
+        storage.record_feedback(mem.id, helpful=True)
+
+    def usage():
+        barrier.wait()
+        storage.record_usage(mem.id)
+
+    threads = [threading.Thread(target=thumbs) for _ in range(n_each)] + [
+        threading.Thread(target=usage) for _ in range(n_each)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    final = storage.get(mem.id)
+    assert final is not None
+    assert final.helpful_count == n_each, f"expected {n_each} helpful, got {final.helpful_count}"
+    assert final.usage_count == n_each, f"expected {n_each} usages, got {final.usage_count}"
+
+
+def test_record_usage_lock_sidecar_lifecycle(tmp_path):
+    """The ``<id>.md.lock`` sibling exists post-bump and is removed on delete.
+
+    Implementation choice: we keep the lock file on disk between calls
+    (avoids a TOCTOU between unlink + reopen for the next caller). On
+    ``delete``, the lock sidecar is cleaned up alongside the ``.md`` so
+    a deleted memoria leaves no orphan lock file behind.
+
+    We also assert the lock file does NOT show up in ``list()`` /
+    ``count()`` — those globs match ``*.md``, but ``foo.md.lock`` ends
+    in ``.lock`` and must be invisible to the corpus walkers.
+    """
+    storage = VaultStorage(tmp_path)
+    mem = storage.save(content="x", title="lock lifecycle")
+    storage.record_usage(mem.id)
+
+    md_path = storage.path_for(mem.id)
+    lock_path = md_path.with_name(f"{md_path.name}.lock")
+
+    # On POSIX the lock file should exist; on Windows it doesn't (no-op
+    # path). Don't fail the suite on Windows — just check the corpus
+    # invariant (which holds either way).
+    import sys
+
+    if sys.platform != "win32":
+        assert lock_path.exists(), "expected lock sidecar to persist between calls"
+
+    # Crucially, the corpus walkers don't see the lock file as a memoria.
+    assert storage.count() == 1, "lock sidecar must not be counted as a memoria"
+    assert {m.id for m in storage.list()} == {mem.id}
+
+    # Delete cleans up the lock sidecar.
+    assert storage.delete(mem.id) is True
+    assert not md_path.exists()
+    assert not lock_path.exists(), "delete() should clean up the lock sidecar"

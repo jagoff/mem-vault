@@ -41,7 +41,7 @@ from mem_vault.discovery import (
     lint_memory,
 )
 from mem_vault.index import CircuitBreakerOpenError, VectorIndex, compute_content_hash
-from mem_vault.storage import VaultStorage, slugify
+from mem_vault.storage import VaultStorage
 
 logger = logging.getLogger("mem_vault.server")
 
@@ -700,6 +700,28 @@ class MemVaultService:
     async def _to_thread(self, fn, *args, **kwargs):
         return await asyncio.to_thread(fn, *args, **kwargs)
 
+    def _resolve_project_scope(
+        self,
+        explicit: Any,
+        tags: list[str] | None,
+    ) -> str | None:
+        """Resolve the project tag stamped into the Qdrant payload.
+
+        Precedence: explicit caller arg → first ``project:X`` tag →
+        ``config.project_default``. Returns ``None`` when none of the
+        three resolves to a non-empty string. Shared by ``save`` and
+        ``update`` so an update never silently drops the project that
+        was set at save time.
+        """
+        if isinstance(explicit, str) and explicit.strip():
+            return explicit.strip()
+        for t in tags or []:
+            if isinstance(t, str) and t.startswith("project:"):
+                cand = t.split(":", 1)[1].strip()
+                if cand:
+                    return cand
+        return self.config.project_default or None
+
     async def _index_call(self, fn, *args, **kwargs):
         """Run an Ollama-backed index call with the configured wall-clock timeout.
 
@@ -983,17 +1005,7 @@ class MemVaultService:
         # Qdrant metadata so ``memory_search`` can filter on it without
         # scanning tag lists (Qdrant payload index is faster than the
         # array-contains filter we'd use for tags).
-        explicit_project = args.get("project")
-        project_scope: str | None = None
-        if isinstance(explicit_project, str) and explicit_project.strip():
-            project_scope = explicit_project.strip()
-        else:
-            for t in tags:
-                if isinstance(t, str) and t.startswith("project:"):
-                    project_scope = t.split(":", 1)[1].strip() or None
-                    break
-            if project_scope is None:
-                project_scope = self.config.project_default
+        project_scope = self._resolve_project_scope(args.get("project"), tags)
 
         index_results: list[dict[str, Any]] = []
         index_metadata: dict[str, Any] = {
@@ -1310,7 +1322,9 @@ class MemVaultService:
         if self.config.reranker_enabled:
             raw_k = max(k * 5, 30)
         else:
-            raw_k = max(k, k * 3, 20)
+            # ``max(k, k*3, 20)`` collapses to ``max(k*3, 20)`` for k >= 0
+            # (which the input schema guarantees: minimum=1).
+            raw_k = max(k * 3, 20)
 
         try:
             hits = await self._index_call(
@@ -1363,10 +1377,11 @@ class MemVaultService:
         for hit in hits:
             md = (hit.get("metadata") or {}) if isinstance(hit, dict) else {}
             mem_id = md.get("memory_id")
-            if not mem_id:
-                # Fall back: derive from content slug (best-effort)
-                txt = hit.get("memory") or hit.get("text") or ""
-                mem_id = slugify(txt[:80]) if txt else None
+            # Hits without a ``memory_id`` are orphan index entries — skip
+            # them rather than guessing via ``slugify(text)``. The mem ``is
+            # None`` branch below already handles backing-file orphans, so a
+            # second guess on top of an already-broken metadata payload only
+            # adds risk (e.g. surfacing the wrong file by slug collision).
             if not mem_id or mem_id in seen_ids:
                 continue
             seen_ids.add(mem_id)
@@ -1493,6 +1508,19 @@ class MemVaultService:
         indexing_error_code: str | None = None
         if needs_reindex:
             user_id = self.config.user_id
+            # Preserve the project scope across re-index. Without this, an
+            # update that didn't pass ``project`` would silently strip the
+            # field from Qdrant — searches filtered by project would stop
+            # finding the memory until the next ``mem-vault reindex``.
+            project_scope = self._resolve_project_scope(args.get("project"), mem.tags)
+            metadata: dict[str, Any] = {
+                "memory_id": mem.id,
+                "type": mem.type,
+                "tags": mem.tags,
+                "content_hash": compute_content_hash(mem.body),
+            }
+            if project_scope:
+                metadata["project"] = project_scope
             try:
                 await self._to_thread(self.index.delete_by_metadata, "memory_id", mem.id, user_id)
                 await self._index_call(
@@ -1500,12 +1528,7 @@ class MemVaultService:
                     mem.body,
                     user_id=user_id,
                     agent_id=self.config.agent_id,
-                    metadata={
-                        "memory_id": mem.id,
-                        "type": mem.type,
-                        "tags": mem.tags,
-                        "content_hash": compute_content_hash(mem.body),
-                    },
+                    metadata=metadata,
                     auto_extract=False,
                 )
             except _LLMTimeoutError as exc:
@@ -1902,26 +1925,48 @@ class MemVaultService:
 # ---------------------------------------------------------------------------
 
 
+#: Tools whose service-method name diverges from the mechanical
+#: ``memory_X -> service.X`` mapping (``list`` is a built-in, hence the
+#: trailing underscore on the service side).
+_HANDLER_OVERRIDES: dict[str, str] = {
+    "memory_list": "list_",
+}
+
+
+def _build_handlers(service: Any) -> dict[str, Any]:
+    """Derive the tool-name → service-method dict from ``_TOOLS``.
+
+    Every entry in ``_TOOLS`` MUST have a callable on ``service``. Mechanical
+    tool names (``memory_save`` → ``service.save``) are resolved by stripping
+    the ``memory_`` prefix; irregular cases are routed through
+    ``_HANDLER_OVERRIDES``. Any miss raises ``AttributeError`` at build time
+    so the symmetry between schema and dispatch is enforced before the
+    server ever accepts a request.
+    """
+    handlers: dict[str, Any] = {}
+    for tool in _TOOLS:
+        attr = _HANDLER_OVERRIDES.get(tool.name)
+        if attr is None:
+            if not tool.name.startswith("memory_"):
+                raise AttributeError(
+                    f"Tool name {tool.name!r} doesn't start with 'memory_' and "
+                    f"has no entry in _HANDLER_OVERRIDES."
+                )
+            attr = tool.name[len("memory_") :]
+        handler = getattr(service, attr, None)
+        if handler is None:
+            raise AttributeError(
+                f"Service {type(service).__name__} is missing handler "
+                f"{attr!r} for tool {tool.name!r}."
+            )
+        handlers[tool.name] = handler
+    return handlers
+
+
 def _build_server(service: Any) -> Server:
     server: Server = Server(SERVER_NAME, version=SERVER_VERSION)
 
-    handlers = {
-        "memory_save": service.save,
-        "memory_search": service.search,
-        "memory_list": service.list_,
-        "memory_get": service.get,
-        "memory_update": service.update,
-        "memory_delete": service.delete,
-        "memory_synthesize": service.synthesize,
-        "memory_briefing": service.briefing,
-        "memory_derive_metadata": service.derive_metadata,
-        "memory_stats": service.stats,
-        "memory_duplicates": service.duplicates,
-        "memory_lint": service.lint,
-        "memory_feedback": service.feedback,
-        "memory_history": service.history,
-        "memory_related": service.related,
-    }
+    handlers = _build_handlers(service)
 
     # Metrics sink: disabled by default, opt-in via Config.metrics_enabled.
     # We attach it unconditionally so the call_tool wrapper has one less

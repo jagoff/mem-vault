@@ -152,10 +152,174 @@ async def test_remote_delete(remote):
 
 async def test_remote_unreachable_returns_friendly_error():
     """When the server is offline we should NOT raise — return ok:false with a hint."""
-    svc = RemoteMemVaultService("http://127.0.0.1:1", timeout=0.1)  # port that's not listening
+    # max_retries=0 para que el test no demore por el backoff (0.5+1.0=1.5s)
+    # de la nueva lógica de retry. Lo que verificamos acá es el mensaje, no
+    # los retries (eso lo cubren los tests de abajo con MockTransport).
+    svc = RemoteMemVaultService("http://127.0.0.1:1", timeout=0.1, max_retries=0)
     try:
         res = await svc.search({"query": "anything"})
         assert res["ok"] is False
         assert "unreachable" in res["error"].lower() or "connect" in res["error"].lower()
+    finally:
+        await svc.close()
+
+
+# ---------------------------------------------------------------------------
+# Retry + HTTPS-warning tests (added together with the hardening of
+# `_request`). Strategy: drive the client through `httpx.MockTransport` so
+# we can inject 5xx / 4xx / network errors deterministically and assert the
+# call count + final result, without hitting any real server.
+# ---------------------------------------------------------------------------
+
+
+def _mk_remote_with_transport(
+    handler, *, max_retries: int = 2, timeout: float = 1.0
+) -> RemoteMemVaultService:
+    """Build a RemoteMemVaultService whose AsyncClient is backed by MockTransport.
+
+    Bypasses the constructor's httpx client by replacing `_client` after init.
+    Tests own closing the service.
+    """
+    svc = RemoteMemVaultService("http://test", max_retries=max_retries, timeout=timeout)
+    # Replace the client with one routed through the mock transport. We
+    # don't `await svc.close()` here — the original client wasn't used and
+    # leaving it un-closed in tests is harmless (it doesn't open sockets
+    # until first request). Closing it would require an event loop.
+    svc._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://test",
+        timeout=timeout,
+    )
+    return svc
+
+
+async def test_remote_retries_on_5xx():
+    """503 twice, then 200 — expect success with 3 total calls."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            return httpx.Response(503, text="upstream restarting")
+        return httpx.Response(200, json={"ok": True, "memory": {"id": "z"}, "indexed": True})
+
+    # Patch sleep so backoff doesn't actually delay the test (we only care
+    # that retries happened, not how long they slept).
+    import mem_vault.remote as remote_mod
+
+    orig_sleep = remote_mod.asyncio.sleep
+
+    async def _no_sleep(_s):
+        return None
+
+    remote_mod.asyncio.sleep = _no_sleep  # type: ignore[assignment]
+    try:
+        svc = _mk_remote_with_transport(handler, max_retries=2)
+        try:
+            res = await svc.save({"content": "hi"})
+            assert res["ok"] is True
+            assert res["memory"]["id"] == "z"
+            assert calls["n"] == 3, f"expected 3 attempts (1 + 2 retries), got {calls['n']}"
+        finally:
+            await svc.close()
+    finally:
+        remote_mod.asyncio.sleep = orig_sleep  # type: ignore[assignment]
+
+
+async def test_remote_does_not_retry_on_400():
+    """400 is the caller's fault — return immediately without retrying."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        # 400 con body JSON `{ok: false, ...}` — el cliente lo devuelve tal cual.
+        return httpx.Response(400, json={"ok": False, "error": "bad request"})
+
+    svc = _mk_remote_with_transport(handler, max_retries=5)
+    try:
+        res = await svc.save({"content": "hi"})
+        assert res["ok"] is False
+        assert calls["n"] == 1, f"expected 1 attempt (no retry on 4xx), got {calls['n']}"
+    finally:
+        await svc.close()
+
+
+async def test_remote_does_not_retry_on_401():
+    """401 means auth failure — never retry, return 'unauthorized' code."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(401, text="missing token")
+
+    svc = _mk_remote_with_transport(handler, max_retries=5)
+    try:
+        res = await svc.save({"content": "hi"})
+        assert res["ok"] is False
+        assert res.get("code") == "unauthorized"
+        assert calls["n"] == 1, f"expected 1 attempt (no retry on 401), got {calls['n']}"
+    finally:
+        await svc.close()
+
+
+async def test_remote_warns_on_http_with_token(caplog):
+    """http:// + token must emit a logger.warning about plaintext credentials."""
+    import logging as _logging
+
+    caplog.set_level(_logging.WARNING, logger="mem_vault.remote")
+    svc = RemoteMemVaultService("http://insecure.example.com", token="secret-abc")
+    try:
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == _logging.WARNING and "plaintext" in r.getMessage().lower()
+        ]
+        assert warnings, (
+            f"expected a plaintext warning, got: {[r.getMessage() for r in caplog.records]}"
+        )
+        # Defensa adicional: el token literal no debería aparecer en el mensaje
+        # (queremos avisar, no echar el secreto al log).
+        for w in warnings:
+            assert "secret-abc" not in w.getMessage()
+    finally:
+        await svc.close()
+
+
+async def test_remote_no_warning_on_https(caplog):
+    """https:// + token must NOT emit a plaintext warning."""
+    import logging as _logging
+
+    caplog.set_level(_logging.WARNING, logger="mem_vault.remote")
+    svc = RemoteMemVaultService("https://secure.example.com", token="secret-abc")
+    try:
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == _logging.WARNING and "plaintext" in r.getMessage().lower()
+        ]
+        assert not warnings, (
+            f"unexpected plaintext warning over https: {[r.getMessage() for r in warnings]}"
+        )
+    finally:
+        await svc.close()
+
+
+async def test_remote_no_warning_when_no_token(caplog, monkeypatch):
+    """http:// without any token (no arg, no config, no env) must NOT warn."""
+    import logging as _logging
+
+    # Aseguramos que no haya un token suelto en el env del test runner.
+    monkeypatch.delenv("MEM_VAULT_HTTP_TOKEN", raising=False)
+    caplog.set_level(_logging.WARNING, logger="mem_vault.remote")
+    svc = RemoteMemVaultService("http://insecure.example.com")
+    try:
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == _logging.WARNING and "plaintext" in r.getMessage().lower()
+        ]
+        assert not warnings, (
+            f"unexpected plaintext warning without a token: {[r.getMessage() for r in warnings]}"
+        )
     finally:
         await svc.close()

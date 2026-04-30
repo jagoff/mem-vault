@@ -62,14 +62,16 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
             r"([A-Za-z0-9/+=]{40})\b"
         ),
     ),
-    # GitHub personal access tokens (classic + fine-grained)
+    # GitHub personal access tokens (classic + fine-grained). Real tokens
+    # are 36-78 chars; the prior ``{36,255}`` upper bound was wide enough
+    # to flag long env-var-name pastes as secrets.
     (
         "github_token",
-        re.compile(r"\b(ghp_[A-Za-z0-9]{36,255})\b"),
+        re.compile(r"\b(ghp_[A-Za-z0-9]{36,80})\b"),
     ),
     (
         "github_token",
-        re.compile(r"\b(gh[ousr]_[A-Za-z0-9]{36,255})\b"),
+        re.compile(r"\b(gh[ousr]_[A-Za-z0-9]{36,80})\b"),
     ),
     # Anthropic keys — sk-ant-... (listed FIRST because its prefix is a
     # superset of OpenAI's ``sk-``; running them in reverse order would
@@ -92,6 +94,65 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "google_api_key",
         re.compile(r"\b(AIza[0-9A-Za-z\-_]{35})\b"),
+    ),
+    # Stripe keys (live + restricted). Test keys (``sk_test_``) are
+    # technically harmless but redacting them too avoids cargo-culted
+    # leaks of staging credentials.
+    (
+        "stripe_key",
+        re.compile(r"\b((?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{16,})\b"),
+    ),
+    # Twilio Account SID + Auth Token shape. Account SIDs are 32 hex
+    # chars prefixed by ``AC``; auth tokens are bare 32 hex.
+    (
+        "twilio_sid",
+        re.compile(r"\b(AC[a-f0-9]{32})\b"),
+    ),
+    # SendGrid API keys — ``SG.<22>.<43>``.
+    (
+        "sendgrid_key",
+        re.compile(r"\b(SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43})\b"),
+    ),
+    # Notion integration tokens — ``secret_<43 base62>``. Listed BEFORE
+    # ``credential_assignment`` so a bare ``secret_<...>`` paste gets the
+    # specific ``notion_token`` label; a ``secret = "..."`` shape (no
+    # underscore directly after the word) still falls through to the
+    # generic credential rule below.
+    (
+        "notion_token",
+        re.compile(r"\b(secret_[A-Za-z0-9]{43})\b"),
+    ),
+    # Linear API keys — ``lin_api_<40>`` (personal API keys).
+    (
+        "linear_key",
+        re.compile(r"\b(lin_api_[A-Za-z0-9]{40})\b"),
+    ),
+    # Linear OAuth keys — ``lin_oauth_<40>``.
+    (
+        "linear_key",
+        re.compile(r"\b(lin_oauth_[A-Za-z0-9]{40})\b"),
+    ),
+    # Slack incoming-webhook URLs — anyone with the URL can POST to the
+    # channel without auth, so the URL itself is a secret. Format:
+    # ``https://hooks.slack.com/services/T<8+>/B<8-11>/<24-32>``.
+    (
+        "slack_webhook_url",
+        re.compile(
+            r"(https://hooks\.slack\.com/services/T[A-Z0-9]{8,}/B[A-Z0-9]{8,11}/[A-Za-z0-9]{24,32})"
+        ),
+    ),
+    # GCP service-account private key embedded in JSON
+    # (``"private_key": "-----BEGIN ... -----END ..."``). Catch the
+    # whole shape so partial pastes from a service-account file are
+    # redacted too. Must come before the generic PEM rule so the kind
+    # label stays specific.
+    (
+        "gcp_service_account",
+        re.compile(
+            r'"private_key"\s*:\s*"(-----BEGIN [A-Z ]*PRIVATE KEY-----'
+            r'(?:\\n|\n|[^"])+?-----END [A-Z ]*PRIVATE KEY-----(?:\\n)?)"',
+            re.DOTALL,
+        ),
     ),
     # JWT (three base64url-safe segments separated by dots, each at least
     # ~20 chars). Matches are greedy to capture the whole token.

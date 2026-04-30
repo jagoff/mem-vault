@@ -271,3 +271,125 @@ def test_parser_registers_install_skill_subcommand():
     # text and look for our subcommand.
     help_text = parser.format_help()
     assert "install-skill" in help_text
+
+
+# ---------------------------------------------------------------------------
+# --alias validator — keep weird filenames out of the skills dir.
+# ---------------------------------------------------------------------------
+
+
+import pytest  # noqa: E402  — local import keeps the rest of the file lint-clean
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "mv",
+        "mem_vault",
+        "memory",
+        "MV",
+        "abc123",
+        "_underscore",
+        "A",
+        "a1_b2_c3",
+    ],
+)
+def test_alias_validator_accepts_identifier_like_values(value: str) -> None:
+    """The validator should be a no-op for plain identifier-style names."""
+    assert install_skill._alias_arg(value) == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "../etc/passwd",  # path traversal attempt
+        "with/slash",  # subdir
+        "with space",  # shell-meta
+        "with-dash",  # dash not allowed by the regex
+        "trailing.",  # dot
+        "leading.dot",  # dot in the middle
+        ".hidden",  # would create a dotfile dir
+        "weird;name",  # shell sep
+        "name|pipe",  # pipe
+        "$envlike",  # env-var-looking
+        "",  # empty string — fullmatch must reject
+        "a b",  # space inside
+        "naïve",  # non-ASCII outside [a-zA-Z0-9_]
+        "tab\there",  # whitespace
+    ],
+)
+def test_alias_validator_rejects_weird_inputs(value: str) -> None:
+    """The validator must raise ``ArgumentTypeError`` for anything weird.
+
+    These are the values that would otherwise reach the disk write or the
+    ``name:`` frontmatter substitution and produce surprising files.
+    """
+    with pytest.raises(argparse.ArgumentTypeError):
+        install_skill._alias_arg(value)
+
+
+def test_alias_flag_in_parser_passes_validation_for_valid_value() -> None:
+    """End-to-end: argparse should accept ``--alias goodname``."""
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd")
+    install_skill.add_subparser(sub)
+
+    args = parser.parse_args(["install-skill", "--alias", "extra_one"])
+    assert args.alias == ["extra_one"]
+
+
+def test_alias_flag_in_parser_rejects_slash(capsys) -> None:
+    """End-to-end: ``--alias '../foo'`` must trip argparse with exit 2.
+
+    ``argparse`` converts ``ArgumentTypeError`` raised inside ``type=`` into
+    a usage error → ``SystemExit(2)`` + the message on stderr.
+    """
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd")
+    install_skill.add_subparser(sub)
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["install-skill", "--alias", "../foo"])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "invalid alias" in err or "invalid _alias_arg" in err
+
+
+@pytest.mark.parametrize("bad", ["with space", "weird/sub", "a;b", "."])
+def test_alias_flag_in_parser_rejects_other_weird_values(bad: str) -> None:
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd")
+    install_skill.add_subparser(sub)
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["install-skill", "--alias", bad])
+    assert exc_info.value.code == 2
+
+
+def test_alias_flag_appends_extra_alias_during_install(tmp_path) -> None:
+    """``--alias custom`` adds a new directory on top of the defaults."""
+    args = _make_args(target=tmp_path)
+    # The parser would set ``alias`` to a list; mimic that here.
+    args.alias = ["custom"]
+    rc = install_skill.run(args)
+    assert rc == 0
+
+    # Defaults still installed.
+    for alias in ("mv", "mem_vault", "memory"):
+        assert (tmp_path / alias / "SKILL.md").exists()
+    # Plus the custom one.
+    custom_md = tmp_path / "custom" / "SKILL.md"
+    assert custom_md.exists()
+    head = custom_md.read_text(encoding="utf-8").splitlines()[1]
+    assert head == "name: custom"
+
+
+def test_alias_flag_dedupes_when_overlapping_default(tmp_path, capsys) -> None:
+    """Passing ``--alias mv`` must not duplicate the default ``mv`` install."""
+    args = _make_args(target=tmp_path)
+    args.alias = ["mv"]  # overlaps with the default
+    install_skill.run(args)
+
+    out = capsys.readouterr().out
+    # We still install three distinct skills (the defaults), nothing extra.
+    assert "3 skill(s) installed" in out

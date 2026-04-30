@@ -34,6 +34,7 @@ slug — they round-trip cleanly through the MCP tools and double as filenames.
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import logging
@@ -41,6 +42,7 @@ import os
 import re
 import tempfile
 import unicodedata
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -49,6 +51,74 @@ from typing import Any
 import frontmatter
 
 logger = logging.getLogger(__name__)
+
+
+# fcntl is POSIX-only — Windows lacks it. We import lazily so the module
+# still loads on Windows; ``_locked_for_update`` falls back to a no-op
+# there (with a debug log). The mem-vault use case targeting concurrent
+# agents is overwhelmingly POSIX (macOS dev, Linux servers); Windows
+# users running multiple agents against the same vault are rare, and a
+# missing lock there only loses an increment, never corrupts a file.
+try:
+    import fcntl as _fcntl
+
+    _HAS_FCNTL = True
+except ImportError:  # pragma: no cover - Windows path
+    _fcntl = None  # type: ignore[assignment]
+    _HAS_FCNTL = False
+
+
+@contextlib.contextmanager
+def _locked_for_update(target_md_path: Path) -> Iterator[None]:
+    """Acquire an exclusive POSIX advisory lock for a memory file.
+
+    Why a sibling ``.lock`` file instead of locking the ``.md`` directly:
+    ``atomic_write_bytes`` finalizes via ``os.replace`` of a fresh inode
+    over the target. If we held an ``flock`` on an fd opened against the
+    pre-replace inode, that fd would be pointing at an unlinked inode
+    after the replace, and any reader holding the lock would be guarding
+    a ghost. A sibling lock file stays put across replaces — readers
+    serialize on the same inode regardless of how many times the ``.md``
+    rotates.
+
+    The lock file lives in the same directory as the ``.md`` so it shares
+    filesystem semantics (``flock`` works on the open fd; same FS = same
+    locking domain). It's created lazily and is small (zero bytes).
+
+    On Windows (no ``fcntl``), this falls back to a no-op with a debug log.
+    Concurrent ``record_usage`` calls there race the same way the original
+    code did — documented limitation. Ship POSIX-first.
+
+    The yield is unconditional cleanup: ``flock`` is released by the OS
+    when the fd closes, but we explicitly ``LOCK_UN`` for clarity. We do
+    NOT delete the lock file — keeping it idle on disk is harmless (one
+    empty sibling per memory) and avoids a TOCTOU where another waiter
+    races to recreate it between unlink and reopen.
+    """
+    if not _HAS_FCNTL:
+        # Windows / unsupported POSIX subsystem. Caveman: no lock, fingers
+        # crossed. Same as pre-fix behavior on POSIX, so net zero regression.
+        logger.debug("fcntl not available; record_usage runs unlocked on this platform")
+        yield
+        return
+    lock_path = target_md_path.with_name(f"{target_md_path.name}.lock")
+    # Create the lock file if missing. ``open`` with ``"a+"`` is fine: it
+    # creates with mode 0o644, doesn't truncate, and gives us a writable fd.
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        _fcntl.flock(fd, _fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            try:
+                _fcntl.flock(fd, _fcntl.LOCK_UN)
+            except OSError:
+                # Releasing already-released lock is harmless; just log.
+                logger.debug("flock LOCK_UN raised on %s (benign)", lock_path)
+    finally:
+        os.close(fd)
+
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _VALID_TYPES = {"feedback", "preference", "decision", "fact", "note", "bug", "todo"}
@@ -371,7 +441,7 @@ class VaultStorage:
             entries = entries[:limit]
         return entries
 
-    def _reserve_unique_id(self, base_slug: str) -> str:
+    def _reserve_unique_id(self, base_slug: str, *, max_attempts: int = 1000) -> str:
         """Atomically claim an unused slug by creating an empty placeholder.
 
         Strategy: try ``open(O_CREAT|O_EXCL|O_WRONLY)`` on each candidate
@@ -385,11 +455,17 @@ class VaultStorage:
         a few microseconds later with ``atomic_write_bytes`` (which uses
         ``os.replace`` and so is itself atomic). A reader that opens the
         file in the gap sees an empty markdown file, never a partial one.
+
+        ``max_attempts`` bounds the linear probe so a pathological vault
+        with thousands of identically-slugged files (or an attacker-induced
+        slug collision via emoji-only titles that all normalize to
+        ``"memory"``) can't turn a single save into an unbounded stat()
+        loop. After exhausting the linear probe we fall back to an
+        entropy-suffix candidate so the save still succeeds.
         """
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         candidate = base_slug
-        i = 2
-        while True:
+        for i in range(2, max_attempts + 2):
             path = self.path_for(candidate)
             try:
                 fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
@@ -397,7 +473,14 @@ class VaultStorage:
                 return candidate
             except FileExistsError:
                 candidate = f"{base_slug}_{i}"
-                i += 1
+        # Fallback: random suffix breaks pathological collision chains.
+        import secrets
+
+        suffix = secrets.token_hex(4)
+        path = self.path_for(f"{base_slug}_{suffix}")
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        os.close(fd)
+        return f"{base_slug}_{suffix}"
 
     def save(
         self,
@@ -517,21 +600,28 @@ class VaultStorage:
         counter bumped. Returns the updated Memory, or ``None`` if the
         memory isn't on disk (orphan).
 
-        Failure is swallowed — a concurrent write race (two search
-        threads incrementing the same memory) is harmless if one of them
-        overwrites the other; we'd rather lose a count than crash the
-        search path.
+        Failure is swallowed — if the write itself dies (disk full, FS
+        gone), we'd rather lose a count than crash the search path.
+
+        Concurrency: the read-modify-write is serialized via a per-file
+        POSIX advisory lock (``<id>.md.lock`` sibling). Two simultaneous
+        ``memory_search`` calls hitting the same memoria used to race —
+        both read ``usage_count = N``, both wrote ``N+1``, one increment
+        was lost. The flock pins the read+modify+write window so all
+        increments survive. On Windows (no fcntl) the lock is a no-op,
+        documented limitation.
         """
-        mem = self.get(memory_id)
-        if mem is None:
-            return None
-        mem.usage_count = max(0, mem.usage_count + int(delta))
-        mem.last_used = _now_iso()
-        try:
-            self._write(mem)
-        except Exception:
-            return None
-        return mem
+        with _locked_for_update(self.path_for(memory_id)):
+            mem = self.get(memory_id)
+            if mem is None:
+                return None
+            mem.usage_count = max(0, mem.usage_count + int(delta))
+            mem.last_used = _now_iso()
+            try:
+                self._write(mem)
+            except Exception:
+                return None
+            return mem
 
     def record_feedback(
         self,
@@ -548,20 +638,26 @@ class VaultStorage:
         Also bumps ``last_used``. ``updated`` stays untouched so we don't
         retrigger re-embedding on a thumbs. Returns the updated Memory,
         or ``None`` if not on disk.
+
+        Concurrency: same per-file flock as ``record_usage`` — a thumbs
+        landing at the same instant as a search-driven usage bump must
+        not lose either count. Both paths share the same lock file so
+        they serialize against each other.
         """
-        mem = self.get(memory_id)
-        if mem is None:
-            return None
-        if helpful is True:
-            mem.helpful_count = max(0, mem.helpful_count + 1)
-        elif helpful is False:
-            mem.unhelpful_count = max(0, mem.unhelpful_count + 1)
-        mem.last_used = _now_iso()
-        try:
-            self._write(mem)
-        except Exception:
-            return None
-        return mem
+        with _locked_for_update(self.path_for(memory_id)):
+            mem = self.get(memory_id)
+            if mem is None:
+                return None
+            if helpful is True:
+                mem.helpful_count = max(0, mem.helpful_count + 1)
+            elif helpful is False:
+                mem.unhelpful_count = max(0, mem.unhelpful_count + 1)
+            mem.last_used = _now_iso()
+            try:
+                self._write(mem)
+            except Exception:
+                return None
+            return mem
 
     def delete(self, memory_id: str) -> bool:
         path = self.path_for(memory_id)
@@ -578,6 +674,17 @@ class VaultStorage:
                 history_path.unlink()
             except OSError as exc:
                 logger.warning("failed to remove history sidecar for %s: %s", memory_id, exc)
+        # Also tidy the per-file flock sidecar (``<id>.md.lock``) so a
+        # deleted memoria leaves no orphan lock file. Best-effort —
+        # if another process happens to be holding the lock when we
+        # delete, the unlink still succeeds on POSIX (the inode lives
+        # on until the fd closes); we ignore failures.
+        lock_path = path.with_name(f"{path.name}.lock")
+        if lock_path.exists():
+            try:
+                lock_path.unlink()
+            except OSError as exc:
+                logger.debug("failed to remove lock sidecar for %s: %s", memory_id, exc)
         return True
 
     def get(self, memory_id: str) -> Memory | None:
@@ -603,6 +710,36 @@ class VaultStorage:
         visibility check entirely — useful for admin / reindex flows.
         """
         results: list[Memory] = []
+        for mem in self.iter_memories(
+            type=type,
+            tags=tags,
+            user_id=user_id,
+            viewer_agent_id=viewer_agent_id,
+        ):
+            results.append(mem)
+            if len(results) >= limit:
+                break
+        return results
+
+    def iter_memories(
+        self,
+        *,
+        type: str | None = None,
+        tags: Sequence[str] | None = None,
+        user_id: str | None = None,
+        viewer_agent_id: str | None = None,
+    ) -> Iterator[Memory]:
+        """Yield memories one-by-one (mtime desc), applying optional filters.
+
+        Use this instead of ``list(limit=10**9)`` for full-corpus walks —
+        callers like the BM25 rebuild, the consolidate pair-finder, or the
+        UI stats endpoint don't need every memoria in RAM at once. The yield
+        order is identical to ``list()`` so callers see no behavior change.
+
+        Filters semantics match ``list()`` (type/tags/user_id/visibility).
+        Files that fail to parse are silently skipped — a malformed .md
+        shouldn't block iteration of healthy ones.
+        """
         files = sorted(self.memory_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
         for path in files:
             try:
@@ -617,10 +754,16 @@ class VaultStorage:
                 continue
             if viewer_agent_id is not None and not mem.is_visible_to(viewer_agent_id):
                 continue
-            results.append(mem)
-            if len(results) >= limit:
-                break
-        return results
+            yield mem
+
+    def count(self) -> int:
+        """Return how many .md memorias live in the vault. O(1) glob count.
+
+        Cheaper than ``len(list(limit=10**9))`` because it doesn't parse
+        any frontmatter — useful for stats badges and progress bars where
+        the body content isn't needed.
+        """
+        return sum(1 for _ in self.memory_dir.glob("*.md"))
 
     def _read(self, path: Path) -> Memory:
         post = frontmatter.load(path)

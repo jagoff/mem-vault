@@ -20,6 +20,7 @@ methods produce in-process.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any
@@ -27,6 +28,17 @@ from typing import Any
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Status codes que sí re-tryeamos. 502/503/504 son los típicos de un upstream
+# transitorio (gateway down, servicio reiniciando, timeout entre proxies).
+# 500 NO se re-trya — suele ser un bug en el server, no algo transitorio.
+_RETRYABLE_STATUS = {502, 503, 504}
+
+# Backoff entre intento N y N+1 (segundos). Lista corta = max 3 intentos
+# (initial + 2 retries). Si max_retries=2: backoff[0]=0.5s antes del 1er
+# retry, backoff[1]=1.0s antes del 2do retry. Si max_retries=0 ⇒ no se
+# tocan estos delays porque no hay retries.
+_RETRY_BACKOFF_S = (0.5, 1.0)
 
 # Default timeout para read+write+connect cubriendo cualquier endpoint del
 # servidor remoto. ANTES era 10s, lo cual rompía `save({auto_extract: true})`
@@ -55,6 +67,7 @@ class RemoteMemVaultService:
         timeout: float = DEFAULT_TIMEOUT_S,
         config: Any | None = None,
         token: str | None = None,
+        max_retries: int = 2,
     ):
         # Strip trailing slash so we can join endpoints with f-strings safely.
         self.base_url = base_url.rstrip("/")
@@ -63,6 +76,9 @@ class RemoteMemVaultService:
         # doesn't really need a vault path. We keep an optional reference
         # to the config so those code paths still work.
         self.config = config
+        # Cap retries a algo razonable y NO permitir negativos (un usuario
+        # que pase -1 esperando "infinito" sería un foot-gun).
+        self.max_retries = max(0, int(max_retries))
         # Bearer token resolution order: explicit ``token`` arg > Config
         # field > env var. The env-var fallback exists so the hooks (which
         # build the client without seeing the user's local config) can
@@ -75,6 +91,17 @@ class RemoteMemVaultService:
         headers: dict[str, str] = {}
         if resolved_token:
             headers["Authorization"] = f"Bearer {resolved_token.strip()}"
+            # Plain-HTTP + bearer token = el token viaja en plaintext en cada
+            # request. No fail (a veces tiene sentido en una red privada o
+            # en localhost dev), pero queremos que el usuario lo vea en logs.
+            if self.base_url.lower().startswith("http://"):
+                logger.warning(
+                    "RemoteMemVaultService: bearer token will be transmitted in "
+                    "PLAINTEXT because base_url uses http:// (got %r). Use https:// "
+                    "or unset the token (MEM_VAULT_HTTP_TOKEN / config.http_token / "
+                    "token=...) to avoid leaking credentials on the wire.",
+                    self.base_url,
+                )
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=timeout,
@@ -149,43 +176,124 @@ class RemoteMemVaultService:
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        try:
-            resp = await self._client.request(method, path, params=params, json=json)
-        except httpx.ConnectError as exc:
+        # Total de intentos = 1 (inicial) + max_retries. Si max_retries=0
+        # esto es un solo intento y el loop se comporta como antes.
+        total_attempts = 1 + self.max_retries
+        last_connect_err: httpx.ConnectError | None = None
+        last_timeout_err: httpx.TimeoutException | None = None
+        last_5xx_resp: httpx.Response | None = None
+
+        for attempt in range(total_attempts):
+            # ¿Es el último intento? Si sí, no dormimos después.
+            is_last = attempt == total_attempts - 1
+            try:
+                resp = await self._client.request(method, path, params=params, json=json)
+            except httpx.ConnectError as exc:
+                last_connect_err = exc
+                if is_last:
+                    break
+                # Sleep antes del próximo intento — backoff exponencial fijo.
+                await asyncio.sleep(_RETRY_BACKOFF_S[min(attempt, len(_RETRY_BACKOFF_S) - 1)])
+                logger.info(
+                    "remote %s %s: ConnectError, retrying (%d/%d)",
+                    method,
+                    path,
+                    attempt + 1,
+                    self.max_retries,
+                )
+                continue
+            except httpx.ReadTimeout as exc:
+                # ReadTimeout sí re-tryeamos (servidor tarda un toque pero
+                # eventualmente responde). ConnectTimeout/WriteTimeout caen
+                # acá también porque heredan de TimeoutException; ConnectError
+                # ya está manejado arriba — el resto se trata como timeout.
+                last_timeout_err = exc
+                if is_last:
+                    break
+                await asyncio.sleep(_RETRY_BACKOFF_S[min(attempt, len(_RETRY_BACKOFF_S) - 1)])
+                logger.info(
+                    "remote %s %s: ReadTimeout, retrying (%d/%d)",
+                    method,
+                    path,
+                    attempt + 1,
+                    self.max_retries,
+                )
+                continue
+            except httpx.TimeoutException as exc:
+                # Otros timeouts (connect/write/pool) — NO retry: si no podemos
+                # ni conectar/escribir el request, retry corto raramente ayuda
+                # y enmascararía un problema de red más serio. Devolvemos
+                # como antes (preservando el comportamiento previo del cliente).
+                return {"ok": False, "error": f"mem-vault remote timeout: {exc}"}
+            except Exception as exc:  # pragma: no cover — defensive
+                # Cualquier otra excepción NO es transitoria → no retry.
+                logger.exception("remote request failed: %s %s", method, path)
+                return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+            # Llegamos acá ⇒ tenemos `resp`. Decidir si retry según status.
+            if resp.status_code in (401, 403):
+                # Auth failure — NO retry (el token no se va a "arreglar" solo).
+                return {
+                    "ok": False,
+                    "error": (
+                        f"mem-vault remote rejected request ({resp.status_code}). "
+                        "The server requires a bearer token — set MEM_VAULT_HTTP_TOKEN "
+                        "or pass `token=...` to RemoteMemVaultService."
+                    ),
+                    "code": "unauthorized",
+                }
+            if resp.status_code in _RETRYABLE_STATUS:
+                last_5xx_resp = resp
+                if is_last:
+                    break
+                await asyncio.sleep(_RETRY_BACKOFF_S[min(attempt, len(_RETRY_BACKOFF_S) - 1)])
+                logger.info(
+                    "remote %s %s: %d, retrying (%d/%d)",
+                    method,
+                    path,
+                    resp.status_code,
+                    attempt + 1,
+                    self.max_retries,
+                )
+                continue
+            if resp.status_code >= 500:
+                # 5xx no-retryable (ej. 500, 501, 505) — error definitivo.
+                return {
+                    "ok": False,
+                    "error": f"mem-vault remote returned {resp.status_code}: {resp.text[:200]}",
+                }
+            # 2xx/3xx/4xx no-auth: parsear JSON y devolver. 4xx llega acá y
+            # se devuelve como respuesta JSON normal — el server YA codifica
+            # errores como `{ok: false, ...}`, así que el caller ya sabe.
+            try:
+                data = resp.json()
+            except ValueError:
+                return {"ok": False, "error": f"non-JSON response from {path}"}
+            return data
+
+        # Salimos del loop sin éxito → devolver el último error que vimos.
+        # Prioridad: 5xx (servidor respondió pero con error) > timeout > connect.
+        if last_5xx_resp is not None:
             return {
                 "ok": False,
                 "error": (
-                    f"mem-vault remote server unreachable at {self.base_url}: {exc}. "
+                    f"mem-vault remote returned {last_5xx_resp.status_code} "
+                    f"after {total_attempts} attempts: {last_5xx_resp.text[:200]}"
+                ),
+            }
+        if last_timeout_err is not None:
+            return {"ok": False, "error": f"mem-vault remote timeout: {last_timeout_err}"}
+        if last_connect_err is not None:
+            return {
+                "ok": False,
+                "error": (
+                    f"mem-vault remote server unreachable at {self.base_url}: {last_connect_err}. "
                     "Is the obsidian-rag web server running? "
                     "Check `lsof -i :8765` or unset MEM_VAULT_REMOTE_URL to fall back to local mode."
                 ),
             }
-        except httpx.TimeoutException as exc:
-            return {"ok": False, "error": f"mem-vault remote timeout: {exc}"}
-        except Exception as exc:  # pragma: no cover — defensive
-            logger.exception("remote request failed: %s %s", method, path)
-            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-
-        if resp.status_code in (401, 403):
-            return {
-                "ok": False,
-                "error": (
-                    f"mem-vault remote rejected request ({resp.status_code}). "
-                    "The server requires a bearer token — set MEM_VAULT_HTTP_TOKEN "
-                    "or pass `token=...` to RemoteMemVaultService."
-                ),
-                "code": "unauthorized",
-            }
-        if resp.status_code >= 500:
-            return {
-                "ok": False,
-                "error": f"mem-vault remote returned {resp.status_code}: {resp.text[:200]}",
-            }
-        try:
-            data = resp.json()
-        except ValueError:
-            return {"ok": False, "error": f"non-JSON response from {path}"}
-        return data
+        # No deberíamos llegar acá nunca — defensive fallback.
+        return {"ok": False, "error": "mem-vault remote: unknown error after retries"}
 
     async def close(self) -> None:
         await self._client.aclose()

@@ -177,7 +177,15 @@ def reciprocal_rank_fusion(
 
     Duplicate ids within a single ranking use the first (best) position
     only; a duplicate in a ranker shouldn't inflate its own score.
+
+    ``k`` must be non-negative. Negative ``k`` values would make the
+    contribution ``1/(k + position + 1)`` go negative or explode near
+    zero (when ``k + pos + 1 == 0``), silently inverting the fusion or
+    producing nonsense scores. We fail loudly instead — typo in config
+    or a bad caller is the most likely cause.
     """
+    if k < 0:
+        raise ValueError(f"RRF k must be non-negative, got {k}")
     scores: dict[str, float] = {}
     for rank_list in rankings:
         seen: set[str] = set()
@@ -249,9 +257,12 @@ class HybridRetriever:
         hits the body text where the tag appears in a wikilink. Tags
         alone would miss the body mentions.
         """
-        memorias = self.storage.list(type=None, tags=None, user_id=None, limit=10**9)
+        # Stream through ``iter_memories`` instead of loading the full list
+        # at once — for vaults with thousands of memorias this avoids holding
+        # the entire corpus in RAM at peak. The BM25 index itself is the
+        # only persistent structure (~tokenized strings + counters per doc).
         pairs = []
-        for m in memorias:
+        for m in self.storage.iter_memories():
             parts = [m.name or "", m.body or ""]
             if m.tags:
                 parts.extend(m.tags)
@@ -311,8 +322,17 @@ def fuse_dense_and_bm25(
         if mem_id not in bm25_rank:
             bm25_rank[mem_id] = rank
 
-    dense_ids = [mid for mid, _ in sorted(dense_first.items(), key=lambda x: x[1][0])]
-    bm25_ids = [mid for mid, _ in sorted(bm25_rank.items(), key=lambda x: x[1])]
+    # ``reverse=False`` is explicit on purpose: RRF expects the input lists
+    # ordered by rank position ASCENDING (best = position 0). The default
+    # ``sorted()`` is already ascending, but if a future refactor flips this
+    # to ``reverse=True`` the entire fusion silently inverts (worst hits
+    # become "best"). The keyword arg here + the regression test
+    # ``test_fuse_dense_and_bm25_known_good_ordering`` together guard
+    # against that drift.
+    dense_ids = [
+        mid for mid, _ in sorted(dense_first.items(), key=lambda x: x[1][0], reverse=False)
+    ]
+    bm25_ids = [mid for mid, _ in sorted(bm25_rank.items(), key=lambda x: x[1], reverse=False)]
 
     fused = reciprocal_rank_fusion([dense_ids, bm25_ids], k=rrf_k)
 

@@ -68,6 +68,20 @@ class IndexLockedError(RuntimeError):
     """Raised when the Qdrant collection is locked by another process."""
 
 
+# Substring pinned by qdrant-client>=1.7 when the embedded local Qdrant
+# can't acquire the portalocker file lock on ``state_dir/.lock``. Source:
+# ``qdrant_client/local/qdrant_local.py`` raises a plain ``RuntimeError``
+# whose message starts with
+# ``"Storage folder <path> is already accessed by another instance of
+# Qdrant client."``. We match the lower-cased substring ``"already
+# accessed"`` so a path/collation tweak in upstream doesn't break us.
+#
+# If you bump qdrant-client and this breaks, the regression test
+# ``tests/test_sync.py::test_lock_message_substring_is_still_in_qdrant_source``
+# will fail loud — fix the constant here in step.
+_QDRANT_LOCK_SUBSTR = "already accessed"
+
+
 def _lock_msg() -> str:
     return (
         "Qdrant collection is locked by another process. The MCP server "
@@ -75,6 +89,33 @@ def _lock_msg() -> str:
         "retry. The vault files themselves are not locked — you can still "
         "browse / edit / grep them while this is running."
     )
+
+
+def _is_lock_runtime_error(exc: BaseException) -> bool:
+    """Return True iff ``exc`` is the qdrant-client local lock conflict.
+
+    qdrant-client wraps a ``portalocker.exceptions.LockException`` into a
+    plain ``RuntimeError`` before re-raising — so the original typed
+    exception is gone by the time we catch it. We match by substring on
+    the message (pinned by :data:`_QDRANT_LOCK_SUBSTR`).
+    """
+    return _QDRANT_LOCK_SUBSTR in str(exc).lower()
+
+
+def _is_lock_exception(exc: BaseException) -> bool:
+    """Return True iff ``exc`` is a portalocker file-lock failure.
+
+    qdrant-client *currently* swallows this and re-raises ``RuntimeError``
+    (see ``qdrant_client/local/qdrant_local.py``), so this typed catch is
+    defensive — it covers the case where a future qdrant-client version
+    lets the original exception propagate, or where another path inside
+    mem-vault touches portalocker directly.
+    """
+    try:
+        from portalocker.exceptions import BaseLockException
+    except Exception:  # pragma: no cover - portalocker is a transitive dep
+        return False
+    return isinstance(exc, BaseLockException)
 
 
 def sync_status(config: Config) -> SyncReport:
@@ -107,11 +148,20 @@ def sync_status(config: Config) -> SyncReport:
     except (BlockingIOError, OSError) as exc:
         raise IndexLockedError(_lock_msg()) from exc
     except RuntimeError as exc:
-        # qdrant-client's QdrantLocal converts the underlying BlockingIOError
-        # into a generic RuntimeError with a "already accessed by another
-        # instance" message. Detect by substring rather than re-raising
-        # opaque RuntimeErrors that might be unrelated.
-        if "already accessed" in str(exc).lower():
+        # qdrant-client's QdrantLocal converts the underlying
+        # ``portalocker.exceptions.LockException`` into a generic
+        # ``RuntimeError`` whose message contains "already accessed by
+        # another instance" (see ``_QDRANT_LOCK_SUBSTR``). Detect by
+        # substring so the IndexLockedError keeps surfacing even if
+        # ``portalocker`` is no longer the underlying lib.
+        if _is_lock_runtime_error(exc):
+            raise IndexLockedError(_lock_msg()) from exc
+        raise
+    except Exception as exc:
+        # Defensive: if a future qdrant-client version lets the typed
+        # ``portalocker.exceptions.BaseLockException`` propagate without
+        # wrapping it in ``RuntimeError``, still surface it as a lock.
+        if _is_lock_exception(exc):
             raise IndexLockedError(_lock_msg()) from exc
         raise
 

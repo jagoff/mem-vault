@@ -193,3 +193,128 @@ async def test_save_clean_content_has_empty_redactions_list(redaction_service):
         {"content": "Just a note, nothing credential-shaped here.", "title": "clean"}
     )
     assert res["redactions"] == []
+
+
+# ---------------------------------------------------------------------------
+# Extra patterns added in the audit pass — Stripe, Twilio, SendGrid, GCP
+# ---------------------------------------------------------------------------
+
+
+def test_redacts_stripe_live_secret_key():
+    # Built via concat so GitHub push-protection's secret scanner doesn't
+    # see a single literal that matches Stripe's `sk_live_<entropy>` shape.
+    # The runtime string is identical to the regex's input; the test still
+    # exercises the live-key pattern end-to-end.
+    txt = "billing key: " + "sk_" + "live_" + "51HzZ8aGkxYqFM3pXR7wT5jVbN9dE2cAh"
+    out, hits = redact(txt)
+    assert "sk_live_" not in out
+    assert "[REDACTED:stripe_key]" in out
+    assert any(h.kind == "stripe_key" for h in hits)
+
+
+def test_redacts_stripe_restricted_test_key():
+    txt = "test key: " + "rk_" + "test_" + "AbCd1234EfGh5678IjKl"
+    out, hits = redact(txt)
+    assert "[REDACTED:stripe_key]" in out
+    assert any(h.kind == "stripe_key" for h in hits)
+
+
+def test_redacts_twilio_account_sid():
+    # Concat to dodge GitHub's Twilio `AC<32 hex>` detector on the literal.
+    txt = "TWILIO_SID=" + "AC" + "a1b2c3d4e5f6071829a3b4c5d6e7f8a9"
+    out, hits = redact(txt)
+    assert "ACa1b2c3" not in out
+    assert any(h.kind == "twilio_sid" for h in hits)
+
+
+def test_redacts_sendgrid_api_key():
+    # SG.<22>.<43>
+    twenty_two = "A" * 22
+    forty_three = "B" * 43
+    txt = f"key: SG.{twenty_two}.{forty_three}"
+    out, hits = redact(txt)
+    assert "SG." not in out or "[REDACTED" in out
+    assert any(h.kind == "sendgrid_key" for h in hits)
+
+
+def test_redacts_gcp_service_account_private_key():
+    txt = (
+        '{"type": "service_account", '
+        '"private_key": "-----BEGIN PRIVATE KEY-----\\n'
+        "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ\\n"
+        '-----END PRIVATE KEY-----\\n", '
+        '"client_email": "svc@proj.iam"}'
+    )
+    out, hits = redact(txt)
+    assert any(h.kind == "gcp_service_account" for h in hits)
+    assert "MIIEvQ" not in out
+
+
+def test_github_token_upper_bound_tightened():
+    """Long charset noise (>80 chars) should NOT match the github_token rule."""
+    very_long = "ghp_" + ("A" * 200)
+    out, hits = redact(very_long)
+    assert not any(h.kind == "github_token" for h in hits), (
+        "github_token regex still flagging 200-char strings — upper bound regression"
+    )
+    # But a real-shape token (~40 chars) should still redact.
+    real_shape = "ghp_" + ("A" * 36)
+    out, hits = redact(real_shape)
+    assert any(h.kind == "github_token" for h in hits)
+
+
+# ---------------------------------------------------------------------------
+# Extra patterns added in this pass — Notion, Linear, Slack webhook URL
+# ---------------------------------------------------------------------------
+
+
+def test_redacts_notion_integration_token():
+    raw = "secret_" + ("A" * 43)
+    txt = f"NOTION_TOKEN={raw}"
+    out, hits = redact(txt)
+    assert raw not in out
+    assert "[REDACTED:notion_token]" in out
+    assert any(h.kind == "notion_token" for h in hits)
+
+
+def test_redacts_linear_api_key():
+    raw = "lin_api_" + ("a" * 40)
+    txt = f"LINEAR_API_KEY={raw}"
+    out, hits = redact(txt)
+    assert raw not in out
+    assert "[REDACTED:linear_key]" in out
+    assert any(h.kind == "linear_key" for h in hits)
+
+
+def test_redacts_linear_oauth_key():
+    raw = "lin_oauth_" + ("Z" * 40)
+    txt = f"linear oauth: {raw}"
+    out, hits = redact(txt)
+    assert raw not in out
+    assert "[REDACTED:linear_key]" in out
+    assert any(h.kind == "linear_key" for h in hits)
+
+
+def test_redacts_slack_webhook_url():
+    raw = "https://hooks.slack.com/services/T01ABCDEFGH/B02ABCDEFGH/" + ("X" * 24)
+    txt = f"webhook: {raw}\nsend POST here"
+    out, hits = redact(txt)
+    assert raw not in out
+    assert "[REDACTED:slack_webhook_url]" in out
+    assert any(h.kind == "slack_webhook_url" for h in hits)
+
+
+def test_notion_pattern_does_not_eat_credential_assignment():
+    """``secret = "abc123"`` must keep the ``credential_assignment`` label.
+
+    The Notion regex matches ``secret_<43 base62>`` (with underscore). A
+    plain ``secret = "..."`` assignment has a space/equals after ``secret``,
+    not an underscore, so it should fall through to the generic credential
+    rule untouched.
+    """
+    txt = "secret = 'hunter22abc'"
+    out, hits = redact(txt)
+    assert "hunter22abc" not in out
+    kinds = {h.kind for h in hits}
+    assert "credential_assignment" in kinds, kinds
+    assert "notion_token" not in kinds, kinds

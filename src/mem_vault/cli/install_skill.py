@@ -43,6 +43,30 @@ _DEFAULT_ALIASES: tuple[str, ...] = ("mv", "mem_vault", "memory")
 # Frontmatter key to rewrite per alias copy.
 _NAME_FRONTMATTER_RE = re.compile(r"^name:\s*\S+\s*$", flags=re.MULTILINE)
 
+# Alias must be a plain identifier — letters, digits, underscores. No slashes,
+# dots, spaces, or other shell-meta. The alias is interpolated into the
+# rewritten ``name:`` frontmatter line **and** used as a directory name on
+# disk (``<target>/<alias>/SKILL.md``), so anything more permissive opens the
+# door to surprising filesystem writes (``--alias ../foo``) or broken
+# frontmatter (``--alias 'mv mv'``).
+_ALIAS_RE = re.compile(r"^[a-zA-Z0-9_]+$")
+
+
+def _alias_arg(value: str) -> str:
+    """argparse ``type=`` validator for the ``--alias`` flag.
+
+    Rejects anything that doesn't match ``^[a-zA-Z0-9_]+$``. Surfacing this
+    via ``argparse.ArgumentTypeError`` gives the standard "invalid value"
+    error message + exit code 2 without us having to wire a custom error
+    path.
+    """
+    if not _ALIAS_RE.fullmatch(value):
+        raise argparse.ArgumentTypeError(
+            f"invalid alias {value!r}: must match ^[a-zA-Z0-9_]+$ "
+            "(letters, digits, underscores only — no slashes, dots, spaces)."
+        )
+    return value
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -82,6 +106,17 @@ def add_subparser(sub: argparse._SubParsersAction) -> None:
         help="Install only /mv, skipping the /mem_vault and /memory aliases.",
     )
     p.add_argument(
+        "--alias",
+        action="append",
+        type=_alias_arg,
+        default=None,
+        metavar="NAME",
+        help=(
+            "Install an additional alias on top of the defaults. Repeatable. "
+            "Must match ^[a-zA-Z0-9_]+$ — slashes / dots / spaces are rejected."
+        ),
+    )
+    p.add_argument(
         "--uninstall",
         action="store_true",
         help="Remove the installed skill directories instead of installing.",
@@ -90,7 +125,17 @@ def add_subparser(sub: argparse._SubParsersAction) -> None:
 
 def run(args: argparse.Namespace) -> int:
     target = args.target or _default_skills_dir()
-    aliases: tuple[str, ...] = ("mv",) if args.no_aliases else _DEFAULT_ALIASES
+    base: tuple[str, ...] = ("mv",) if args.no_aliases else _DEFAULT_ALIASES
+    extra: tuple[str, ...] = tuple(getattr(args, "alias", None) or ())
+    # De-dupe while preserving order — extras come after the defaults.
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for candidate in (*base, *extra):
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        ordered.append(candidate)
+    aliases: tuple[str, ...] = tuple(ordered)
 
     if args.uninstall:
         return _uninstall(target=target, aliases=aliases, dry_run=args.dry_run)

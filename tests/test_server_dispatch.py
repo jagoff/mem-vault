@@ -192,6 +192,56 @@ def test_build_service_returns_remote_when_remote_url_set(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Schema ↔ dispatch symmetry
+# ---------------------------------------------------------------------------
+
+
+def test_every_tool_has_a_handler():
+    """Every entry in ``_TOOLS`` must be wired to a service method.
+
+    Regression guard for the structural bug where adding a ``Tool(...)`` to
+    ``_TOOLS`` without updating the dispatch dict surfaced as a runtime
+    ``"Unknown tool"`` envelope — silently broken until someone tried that
+    tool in production. ``_build_handlers`` now enforces the invariant at
+    build time; this test pins it.
+    """
+    from mem_vault.server import _TOOLS, _build_handlers
+
+    service = _RecordingService()
+    handlers = _build_handlers(service)
+
+    tool_names = {tool.name for tool in _TOOLS}
+    handler_names = set(handlers.keys())
+
+    missing_handlers = tool_names - handler_names
+    assert not missing_handlers, (
+        f"Tools without a handler: {sorted(missing_handlers)}. "
+        f"Add the method on MemVaultService or extend _HANDLER_OVERRIDES."
+    )
+    extra_handlers = handler_names - tool_names
+    assert not extra_handlers, (
+        f"Handlers without a Tool schema: {sorted(extra_handlers)}. "
+        f"Either add the Tool(...) entry to _TOOLS or drop the override."
+    )
+    # Every value must actually be callable — guards against e.g. a string
+    # accidentally landing in _HANDLER_OVERRIDES that resolves to a non-method.
+    for name, handler in handlers.items():
+        assert callable(handler), f"Handler for {name!r} is not callable: {handler!r}"
+
+
+def test_build_handlers_raises_on_missing_method():
+    """If a service is missing a method that ``_TOOLS`` expects, build fails fast."""
+    from mem_vault.server import _build_handlers
+
+    class _Incomplete:
+        async def save(self, args):
+            return {"ok": True}
+
+    with pytest.raises(AttributeError, match="missing handler"):
+        _build_handlers(_Incomplete())
+
+
 async def test_call_tool_wrapper_emits_well_formed_json(monkeypatch, tmp_path):
     """Drive the public dispatcher closure directly via _build_server.
 

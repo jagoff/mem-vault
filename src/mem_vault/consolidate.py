@@ -93,7 +93,12 @@ def find_candidate_pairs(
     seen_pairs: set[frozenset[str]] = set()
     pairs: list[Pair] = []
 
-    memories = storage.list(limit=10**9)
+    # Materialize once because we need the by-id lookup AND the iteration
+    # below. Streaming twice (once to build the dict, once to walk) would
+    # double the disk I/O. ``list()`` without a limit cap mirrors the
+    # historical contract — callers who want bounded memory should pass
+    # ``--limit`` to the CLI.
+    memories = list(storage.iter_memories())
     by_id = {m.id: m for m in memories}
 
     for mem in memories:

@@ -39,6 +39,13 @@ import argparse
 import asyncio
 import sys
 
+# How often the per-memory progress line gets emitted while reindexing.
+# Same cadence applies to both the skip path and the (re)embed path so the
+# user sees a consistent rhythm of updates instead of the 25-vs-10 mix the
+# code used to ship with. Set to 10 → moderately verbose; large vaults
+# still get reasonable output without being chatty about every single item.
+_PROGRESS_INTERVAL = 10
+
 
 def add_subparser(sub: argparse._SubParsersAction) -> None:
     p_reindex = sub.add_parser(
@@ -170,7 +177,7 @@ async def run(args: argparse.Namespace) -> int:
                 ):
                     async with counters_lock:
                         counters["skipped"] += 1
-                        if i % 25 == 0 or i == total:
+                        if i % _PROGRESS_INTERVAL == 0 or i == total:
                             print(
                                 f"  [{i:>3}/{total}] "
                                 f"indexed={counters['indexed']} "
@@ -211,7 +218,7 @@ async def run(args: argparse.Namespace) -> int:
                         )
                 async with counters_lock:
                     counters["indexed"] += 1
-                    if i % 10 == 0 or i == total:
+                    if i % _PROGRESS_INTERVAL == 0 or i == total:
                         print(
                             f"  [{i:>3}/{total}] "
                             f"indexed={counters['indexed']} "
@@ -235,13 +242,23 @@ async def run(args: argparse.Namespace) -> int:
     # Orphan sweep: remove index entries whose memory_id has no .md anymore.
     # We only run it when we've actually walked every file (no --limit) and
     # weren't told to start clean (--purge already nuked the collection).
+    # When skipped, surface the reason on stdout so the user doesn't assume
+    # the sweep ran successfully when in fact nothing was reconciled.
     orphans_removed = 0
-    if not args.purge and not args.limit:
+    orphan_status: str
+    if args.purge:
+        orphan_status = "orphan sweep skipped (--purge ran, collection is fresh)"
+        print(f"  {orphan_status}")
+    elif args.limit:
+        orphan_status = "orphan sweep skipped (--limit set, run again without --limit to clean up)"
+        print(f"  {orphan_status}")
+    else:
         orphans_removed = await _sweep_orphans(service, memories)
+        orphan_status = f"orphans_removed={orphans_removed}"
 
     print(
         f"reindex done: indexed={indexed} skipped={skipped} failed={failed} "
-        f"orphans_removed={orphans_removed} total={total}"
+        f"{orphan_status} total={total}"
     )
     return 0 if failed == 0 else 1
 

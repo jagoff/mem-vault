@@ -133,3 +133,38 @@ def test_auto_extract_default_env_parsed_as_bool(tmp_path, monkeypatch):
 
     monkeypatch.setenv("MEM_VAULT_AUTO_EXTRACT", "0")
     assert load_config(config_path=Path("/dev/null")).auto_extract_default is False
+
+
+# ---------------------------------------------------------------------------
+# qdrant_collection sanitization for non-slug agent_ids
+# ---------------------------------------------------------------------------
+
+
+def test_qdrant_collection_sanitizes_agent_id_with_spaces(monkeypatch, tmp_path):
+    """Agent ids with spaces / punctuation must yield a Qdrant-legal name."""
+    from mem_vault.config import load_config
+
+    monkeypatch.setenv("MEM_VAULT_PATH", str(tmp_path))
+    monkeypatch.setenv("MEM_VAULT_AGENT_ID", "claude code")
+    monkeypatch.setenv("MEM_VAULT_STATE_DIR", str(tmp_path / "_state"))
+    monkeypatch.delenv("MEM_VAULT_COLLECTION", raising=False)
+
+    cfg = load_config()
+    assert cfg.qdrant_collection == "mem_vault_claude_code"
+    # Qdrant collection regex: ``^[a-zA-Z0-9_-]+$``
+    import re
+
+    assert re.match(r"^[a-zA-Z0-9_-]+$", cfg.qdrant_collection or "")
+
+
+def test_qdrant_collection_falls_back_when_agent_id_is_only_punctuation(monkeypatch, tmp_path):
+    """If sanitizing yields an empty string, fall back to ``mem_vault``."""
+    from mem_vault.config import load_config
+
+    monkeypatch.setenv("MEM_VAULT_PATH", str(tmp_path))
+    monkeypatch.setenv("MEM_VAULT_AGENT_ID", "@@@")
+    monkeypatch.setenv("MEM_VAULT_STATE_DIR", str(tmp_path / "_state"))
+    monkeypatch.delenv("MEM_VAULT_COLLECTION", raising=False)
+
+    cfg = load_config()
+    assert cfg.qdrant_collection == "mem_vault"
