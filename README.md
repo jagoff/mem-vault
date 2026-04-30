@@ -62,10 +62,34 @@ ollama pull bge-m3          # 1024-dim multilingual embedder
 This installs two binaries on your `PATH`:
 
 - `mem-vault-mcp` — the MCP stdio server (what your agent talks to)
-- `mem-vault` — top-level CLI with subcommands (`serve`, `ui`,
+- `mem-vault` — top-level CLI with subcommands (`serve`, `ui`, `doctor`,
   `import-engram`, `reindex`, `consolidate`, `hook-sessionstart`,
   `hook-userprompt`, `hook-stop`, `version`). Bare `mem-vault` (no args)
   boots the MCP server, identical to `mem-vault-mcp`.
+
+Before you wire an agent, run `mem-vault doctor` to verify the setup:
+
+```
+$ mem-vault doctor
+
+mem-vault doctor
+─────────────────
+  ✓  config           vault=… · ollama=http://localhost:11434 · llm=qwen2.5:3b · embedder=bge-m3:latest
+  ✓  vault            …/99-AI/memory
+  ✓  state            ~/Library/Application Support/mem-vault
+  ✓  ollama           http://localhost:11434 responded in 4ms · 5 models
+  ✓  model:embedder   bge-m3:latest
+  ✓  model:llm        qwen2.5:3b
+  ✓  qdrant           collection=mem_vault · 47 entries
+  ✓  sync             vault=47 files · index in lockstep
+  ✓  rerank           disabled (no fastembed installed; rank stays pure semantic)
+  ✓  feedback         tracking on · boost=0.30
+
+✓ all checks passed
+```
+
+Red cross = hard failure (fix before going further). Warning = non-blocking hint.
+Pass `--skip-ollama` / `--skip-index` to skip the heavier checks in CI.
 
 ## Configure
 

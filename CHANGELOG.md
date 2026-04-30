@@ -6,6 +6,60 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — `mem-vault doctor` (one-shot health diagnostic)
+
+A single command that runs every check new users hit during setup, with a
+short colored report and a non-zero exit code when something is broken.
+Inspired by `brew doctor` / `nvm doctor`.
+
+```
+$ mem-vault doctor
+
+mem-vault doctor
+─────────────────
+  ✓  config           vault=… · ollama=http://localhost:11434 · llm=qwen2.5:3b
+  ✓  vault            …/memory
+  ✓  state            ~/Library/Application Support/mem-vault
+  ✓  ollama           http://localhost:11434 responded in 4ms · 5 models
+  ✓  model:embedder   bge-m3:latest
+  ✓  model:llm        qwen2.5:3b
+  ✓  qdrant           collection=mem_vault · 47 entries
+  ✓  sync             vault=47 files · index in lockstep
+  ✓  rerank           disabled (no fastembed installed; rank stays pure semantic)
+  ✓  feedback         tracking on · boost=0.30
+
+✓ all checks passed
+```
+
+Checks performed:
+
+- **config**: `load_config` succeeds (catches misconfigured `MEM_VAULT_PATH`).
+- **vault**: path exists, is a directory, and we can write a canary file
+  (catches permission surprises).
+- **state**: `state_dir` writable (Qdrant + history.db land).
+- **ollama**: `GET /api/tags` on the configured host; reports latency and
+  model count.
+- **model:embedder** / **model:llm**: each configured model is installed
+  (prefix-matched against installed tags — `qwen2.5:3b` matches
+  `qwen2.5:3b-instruct-q4_K_M`). Emits a `ollama pull …` hint on miss.
+- **qdrant** / **sync**: tries `sync_status`; reports drift counts and
+  falls back to a warning (not an error) when the collection is locked
+  by a running MCP server.
+- **rerank**: cross-signal warning when `fastembed` is installed but
+  `reranker_enabled=False` (user likely forgot the flag), and the
+  reverse — an error when the flag is on but the extra is missing.
+- **fastembed-cache** (macOS): warn if `FASTEMBED_CACHE_PATH` is unset;
+  the default resolves to `/var/folders/…` which gets wiped on reboot.
+- **feedback**: surface `usage_boost_enabled` / `usage_boost` /
+  `usage_tracking_enabled` so the user remembers what's on.
+
+Exit codes: `0` all green · `1` warnings only · `2` at least one hard
+failure. Flags `--skip-ollama` / `--skip-index` for CI / offline dev.
+
+**Tests**: 27 new unit tests in `test_doctor.py` covering every check
+in isolation (stubbed `ollama.Client` + `sync_status`) plus end-to-end
+via `run()`. Suite grows to 412.
+
 ### Added — feedback loop + usage-based ranking (the "self-supervised memory")
 
 The vault now learns what's useful from how the agent actually uses it.
