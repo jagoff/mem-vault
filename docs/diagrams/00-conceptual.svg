@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 540" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+  <defs>
+    <marker id="arr0" markerWidth="12" markerHeight="12" refX="11" refY="4" orient="auto">
+      <path d="M0,0 L11,4 L0,8 Z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="940" height="540" fill="#fefce8"/>
+
+  <!-- Title -->
+  <text x="470" y="38" text-anchor="middle" font-size="22" font-weight="600" fill="#0f172a">¿Qué es mem-vault?</text>
+  <text x="470" y="62" text-anchor="middle" font-size="14" fill="#64748b">Memoria a largo plazo para tu agente AI — guardada como notas en tu Obsidian.</text>
+
+  <!-- TOP ROW: sin mem-vault -->
+  <text x="40" y="115" font-size="13" font-weight="600" fill="#7f1d1d">SIN mem-vault</text>
+
+  <g>
+    <rect x="40" y="130" width="200" height="100" rx="10" fill="white" stroke="#dc2626" stroke-width="1.5"/>
+    <text x="140" y="155" text-anchor="middle" font-size="13" font-weight="600" fill="#7f1d1d">Sesión 1 (lunes)</text>
+    <text x="140" y="178" text-anchor="middle" font-size="11" fill="#1e293b">"Mi proyecto X usa Postgres"</text>
+    <text x="140" y="194" text-anchor="middle" font-size="11" fill="#1e293b">"Prefiero TypeScript"</text>
+    <text x="140" y="210" text-anchor="middle" font-size="11" fill="#1e293b">"No me gustan los emojis"</text>
+    <text x="140" y="223" text-anchor="middle" font-size="9" fill="#94a3b8" font-style="italic">…20 min de contexto</text>
+  </g>
+
+  <text x="280" y="183" text-anchor="middle" font-size="20" fill="#dc2626">→</text>
+
+  <g>
+    <rect x="320" y="130" width="200" height="100" rx="10" fill="white" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="6,3"/>
+    <text x="420" y="155" text-anchor="middle" font-size="13" font-weight="600" fill="#7f1d1d">cerrás la terminal</text>
+    <text x="420" y="184" text-anchor="middle" font-size="32">💨</text>
+    <text x="420" y="215" text-anchor="middle" font-size="11" fill="#991b1b" font-style="italic">memoria evaporada</text>
+  </g>
+
+  <text x="560" y="183" text-anchor="middle" font-size="20" fill="#dc2626">→</text>
+
+  <g>
+    <rect x="600" y="130" width="280" height="100" rx="10" fill="white" stroke="#dc2626" stroke-width="1.5"/>
+    <text x="740" y="155" text-anchor="middle" font-size="13" font-weight="600" fill="#7f1d1d">Sesión 2 (martes)</text>
+    <text x="740" y="178" text-anchor="middle" font-size="11" fill="#1e293b">"¿Qué DB usabas?"</text>
+    <text x="740" y="194" text-anchor="middle" font-size="11" fill="#1e293b">"¿Qué lenguaje preferís?"</text>
+    <text x="740" y="210" text-anchor="middle" font-size="11" fill="#1e293b">[respuesta llena de emojis]</text>
+    <text x="740" y="223" text-anchor="middle" font-size="9" fill="#94a3b8" font-style="italic">repetís todo desde cero</text>
+  </g>
+
+  <!-- Divider -->
+  <line x1="60" y1="270" x2="880" y2="270" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="4,4"/>
+
+  <!-- BOTTOM ROW: con mem-vault -->
+  <text x="40" y="305" font-size="13" font-weight="600" fill="#14532d">CON mem-vault</text>
+
+  <g>
+    <rect x="40" y="320" width="200" height="100" rx="10" fill="white" stroke="#15803d" stroke-width="1.5"/>
+    <text x="140" y="345" text-anchor="middle" font-size="13" font-weight="600" fill="#14532d">Sesión 1 (lunes)</text>
+    <text x="140" y="368" text-anchor="middle" font-size="11" fill="#1e293b">"Mi proyecto X usa Postgres"</text>
+    <text x="140" y="384" text-anchor="middle" font-size="11" fill="#1e293b">"Prefiero TypeScript"</text>
+    <text x="140" y="400" text-anchor="middle" font-size="11" fill="#1e293b">"No me gustan los emojis"</text>
+    <text x="140" y="413" text-anchor="middle" font-size="9" fill="#15803d" font-style="italic">→ guardado en mem-vault</text>
+  </g>
+
+  <text x="280" y="373" text-anchor="middle" font-size="20" fill="#15803d">→</text>
+
+  <g>
+    <rect x="320" y="320" width="200" height="100" rx="10" fill="white" stroke="#15803d" stroke-width="1.5"/>
+    <text x="420" y="345" text-anchor="middle" font-size="13" font-weight="600" fill="#14532d">se guarda en tu vault</text>
+    <text x="420" y="378" text-anchor="middle" font-size="32">📓</text>
+    <text x="420" y="406" text-anchor="middle" font-size="10" font-family="monospace" fill="#166534">99-AI/memory/*.md</text>
+  </g>
+
+  <text x="560" y="373" text-anchor="middle" font-size="20" fill="#15803d">→</text>
+
+  <g>
+    <rect x="600" y="320" width="280" height="100" rx="10" fill="white" stroke="#15803d" stroke-width="1.5"/>
+    <text x="740" y="345" text-anchor="middle" font-size="13" font-weight="600" fill="#14532d">Sesión 2 (martes)</text>
+    <text x="740" y="368" text-anchor="middle" font-size="11" fill="#1e293b">"Refactoreemos el proyecto X"</text>
+    <text x="740" y="386" text-anchor="middle" font-size="11" fill="#15803d" font-style="italic">[el agente ya sabe Postgres,</text>
+    <text x="740" y="400" text-anchor="middle" font-size="11" fill="#15803d" font-style="italic">TS, sin emojis]</text>
+    <text x="740" y="416" text-anchor="middle" font-size="9" fill="#15803d" font-weight="600">arranca al tema directo</text>
+  </g>
+
+  <!-- Bottom: la frase clave -->
+  <g>
+    <rect x="120" y="455" width="700" height="60" rx="10" fill="#0f172a"/>
+    <text x="470" y="481" text-anchor="middle" font-size="13" font-weight="600" fill="#f8fafc">El agente recuerda lo que aprende. Vos podés leer y editar las notas en Obsidian.</text>
+    <text x="470" y="500" text-anchor="middle" font-size="11" fill="#cbd5e1">100 % local · sin nube · sin API keys · todo vive en tu compu</text>
+  </g>
+</svg>

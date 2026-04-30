@@ -41,8 +41,11 @@ inside your Obsidian vault (so iCloud syncs it, Obsidian indexes it, and you
 can edit it by hand), *and* it's embedded into a local Qdrant collection so
 agents can query it semantically.
 
+> **🚀 Quiero entenderlo en 3 minutos.** Overview ejecutivo sin tecnicismos:
+> [`docs/overview.md`](docs/overview.md).
+>
 > **📐 Want the deep-dive?** Architecture, data flow, and design decisions
-> with diagrams: [`docs/architecture.md`](docs/architecture.md).
+> with 7 diagrams: [`docs/architecture.md`](docs/architecture.md).
 
 ## Install
 

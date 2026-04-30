@@ -9,6 +9,10 @@ Este documento es la fuente canónica de "cómo está hecho mem-vault". Si encon
 un comportamiento que no encaja con lo que está acá, es bug en uno de los dos —
 preferentemente en este documento, que es más fácil de actualizar.
 
+> **¿Buscás algo más simple?** El [overview ejecutivo](overview.md) explica qué
+> hace mem-vault, para qué sirve y cómo se ve usándolo — sin meterse en el cómo
+> está implementado. Recomendado como primer contacto.
+
 ---
 
 ## Tabla de contenidos
