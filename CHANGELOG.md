@@ -6,6 +6,50 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — real hybrid retrieval (BM25 + dense + Reciprocal Rank Fusion)
+
+`memory_search` now optionally runs a BM25 sparse retriever in parallel
+to the dense vector search and merges the two rankings with
+[Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf).
+Catches exact-keyword matches (error strings, command names, file
+paths, identifiers) the dense embedder misses.
+
+**How it composes**:
+
+1. Dense bi-encoder (Ollama `bge-m3`) → top `raw_k` hits.
+2. BM25 on the in-memory corpus (`name + body + tags`) → top `raw_k`.
+3. RRF: `score(d) = Σ 1 / (k + rank_i(d))` with `k=60`.
+4. (optional) Cross-encoder reranker → re-scores the fused union.
+5. Usage boost on the rerank/rrf score.
+6. Top-k cut.
+
+No new dependency: the BM25 is inline (~120 LOC, standard Okapi with
+`k1=1.5`, `b=0.75`). For single-user vaults (≤2k memorias) the rebuild
+takes <10 ms; above that consider Qdrant's native sparse support.
+
+**`HybridRetriever`** caches the BM25 index in memory and invalidates
+on every `memory_save` / `memory_update` / `memory_delete` (including
+the auto-link re-write that happens post-save). Invalidate is O(1);
+the rebuild runs lazily on the next search.
+
+**Config** (all off by default, opt-in):
+
+```
+MEM_VAULT_HYBRID=1              # enable
+MEM_VAULT_HYBRID_RRF_K=60       # smoothing constant
+MEM_VAULT_HYBRID_BM25_K1=1.5    # TF saturation
+MEM_VAULT_HYBRID_BM25_B=0.75    # length normalization
+```
+
+**Tests**: 27 new unit tests in `test_hybrid.py`: tokenize, BM25Index
+(empty, single doc, TF saturation, zero-score skip, top-k), RRF
+(single-list, intersection, dedup, k-shape, deterministic ties),
+fuse_dense_and_bm25 (combined, dense metadata preserved, stub for
+BM25-only, empty inputs), HybridRetriever (first-search rebuild,
+invalidate picks up new memoria), and integration (service rescues
+a BM25-only match via RRF; invalidate fires on save + delete). Suite
+grows to 439.
+
 ### Added — `mem-vault doctor` (one-shot health diagnostic)
 
 A single command that runs every check new users hit during setup, with a

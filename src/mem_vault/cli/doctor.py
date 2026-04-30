@@ -382,6 +382,22 @@ def _check_feedback_loop(cfg: Any, report: _Report) -> None:
         )
 
 
+def _check_hybrid(cfg: Any, report: _Report) -> None:
+    """Surface the hybrid-retrieval flag so the user knows it's (not) on."""
+    if cfg.hybrid_enabled:
+        report.add(
+            "hybrid",
+            "ok",
+            f"BM25 + dense + RRF (k={cfg.hybrid_rrf_k})",
+        )
+    else:
+        report.add(
+            "hybrid",
+            "ok",
+            "disabled (pure dense; turn on with MEM_VAULT_HYBRID=1 to fuse BM25)",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Printing
 # ---------------------------------------------------------------------------
@@ -481,6 +497,7 @@ def run(args: argparse.Namespace) -> int:
 
     _check_extras(cfg, report)
     _check_feedback_loop(cfg, report)
+    _check_hybrid(cfg, report)
 
     _render(report)
     return report.exit_code()

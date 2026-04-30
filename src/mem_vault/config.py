@@ -218,6 +218,44 @@ class Config(BaseModel):
             "queries or running benchmarks)."
         ),
     )
+    hybrid_enabled: bool = Field(
+        default=False,
+        description=(
+            "When True, ``memory_search`` runs a BM25 sparse retriever "
+            "alongside the dense vector search and merges the two rankings "
+            "with Reciprocal Rank Fusion (RRF). Catches exact keyword "
+            "matches (error strings, command names, file paths) the dense "
+            "embedder misses. Zero extra deps (inline BM25) and no Qdrant "
+            "changes. Enable via ``MEM_VAULT_HYBRID=1`` or this field."
+        ),
+    )
+    hybrid_rrf_k: int = Field(
+        default=60,
+        description=(
+            "Smoothing constant for Reciprocal Rank Fusion — ``score(d) = "
+            "Σ 1/(k + rank_i(d))``. The 2009 paper uses 60; higher flattens "
+            "the contribution curve (more egalitarian across rankers), "
+            "lower sharpens it (top ranks dominate). Range 10-100; leave "
+            "alone unless you know you want to tilt toward precision or recall."
+        ),
+    )
+    hybrid_bm25_k1: float = Field(
+        default=1.5,
+        description=(
+            "BM25 ``k1`` term-frequency saturation parameter. Classical "
+            "default is 1.5 (robust across corpora). Raise toward 2.0 to "
+            "reward repeated term occurrences more; lower toward 1.0 to "
+            "flatten TF."
+        ),
+    )
+    hybrid_bm25_b: float = Field(
+        default=0.75,
+        description=(
+            "BM25 ``b`` length-normalization parameter in [0, 1]. Default "
+            "0.75; closer to 1.0 punishes long documents more, closer to "
+            "0.0 treats all documents as equal length."
+        ),
+    )
 
     @field_validator("vault_path", "state_dir", mode="before")
     @classmethod
@@ -333,11 +371,15 @@ def load_config(config_path: Path | None = None) -> Config:
         "MEM_VAULT_USAGE_BOOST_ENABLED": "usage_boost_enabled",
         "MEM_VAULT_USAGE_BOOST": "usage_boost",
         "MEM_VAULT_USAGE_TRACKING": "usage_tracking_enabled",
+        "MEM_VAULT_HYBRID": "hybrid_enabled",
+        "MEM_VAULT_HYBRID_RRF_K": "hybrid_rrf_k",
+        "MEM_VAULT_HYBRID_BM25_K1": "hybrid_bm25_k1",
+        "MEM_VAULT_HYBRID_BM25_B": "hybrid_bm25_b",
     }
     for env_var, field in env_map.items():
         if env_var in os.environ:
             value: str | int | bool | float = os.environ[env_var]
-            if field in {"embedder_dims", "max_content_size"}:
+            if field in {"embedder_dims", "max_content_size", "hybrid_rrf_k"}:
                 value = int(value)
             elif field in {
                 "auto_extract_default",
@@ -346,9 +388,16 @@ def load_config(config_path: Path | None = None) -> Config:
                 "reranker_enabled",
                 "usage_boost_enabled",
                 "usage_tracking_enabled",
+                "hybrid_enabled",
             }:
                 value = str(value).lower() in {"1", "true", "yes", "on"}
-            elif field in {"decay_half_life_days", "llm_timeout_s", "usage_boost"}:
+            elif field in {
+                "decay_half_life_days",
+                "llm_timeout_s",
+                "usage_boost",
+                "hybrid_bm25_k1",
+                "hybrid_bm25_b",
+            }:
                 value = float(value)
             merged[field] = value
 

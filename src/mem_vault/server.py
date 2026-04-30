@@ -509,6 +509,18 @@ class MemVaultService:
         # Reranker is opt-in via Config.reranker_enabled; lazily instantiated
         # so the disabled path doesn't even try to import fastembed.
         self._reranker: Any | None = None
+        # Hybrid retriever (BM25 + dense + RRF) — opt-in via
+        # Config.hybrid_enabled. Lazily instantiated (None when disabled)
+        # to keep the dense-only path a zero-cost branch.
+        self._hybrid: Any | None = None
+        if config.hybrid_enabled:
+            from mem_vault.hybrid import HybridRetriever
+
+            self._hybrid = HybridRetriever(
+                self.storage,
+                k1=config.hybrid_bm25_k1,
+                b=config.hybrid_bm25_b,
+            )
 
     async def _to_thread(self, fn, *args, **kwargs):
         return await asyncio.to_thread(fn, *args, **kwargs)
@@ -538,6 +550,16 @@ class MemVaultService:
                 f"Ollama call exceeded {timeout:.0f}s timeout. "
                 "Check `ollama serve` is running and the model is loaded."
             ) from exc
+
+    def _invalidate_hybrid(self) -> None:
+        """Mark the BM25 cache stale. No-op when hybrid is disabled.
+
+        Called from every write handler (save / update / delete) so the
+        next hybrid-enabled search rebuilds against the current vault
+        state. Invalidate is O(1) — just flips a dirty flag.
+        """
+        if self._hybrid is not None:
+            self._hybrid.invalidate()
 
     def _check_content_size(self, content: str | None) -> None:
         """Reject oversized content before it reaches the vault or the index."""
@@ -666,6 +688,7 @@ class MemVaultService:
             user_id=user_id,
             visible_to=visible_to,
         )
+        self._invalidate_hybrid()
 
         index_results: list[dict[str, Any]] = []
         index_metadata = {
@@ -763,6 +786,8 @@ class MemVaultService:
                         content=new_body,
                         related=[mid for mid, _ in related_pairs],
                     )
+                    # Auto-link rewrote the body → invalidate BM25 again.
+                    self._invalidate_hybrid()
                     # Only claim the cross-links once they hit disk. If the
                     # write failed, ``related`` would point at IDs that are
                     # *not* actually persisted in the frontmatter — the
@@ -960,6 +985,24 @@ class MemVaultService:
             logger.warning("search timed out: %s", exc)
             return {"ok": True, "query": query, "count": 0, "results": [], "warning": str(exc)}
 
+        # Hybrid step: run BM25 sparse in parallel to the dense search,
+        # fuse with Reciprocal Rank Fusion. Runs BEFORE rerank so the
+        # cross-encoder sees the richer union (dense ∪ bm25) of
+        # candidates, not dense alone. Graceful no-op when disabled or
+        # when the storage throws (e.g. vault renamed mid-call).
+        if self._hybrid is not None:
+            try:
+                bm25_hits = await self._to_thread(self._hybrid.search, query, top_k=raw_k)
+                from mem_vault.hybrid import fuse_dense_and_bm25
+
+                hits = fuse_dense_and_bm25(
+                    hits or [],
+                    bm25_hits,
+                    rrf_k=self.config.hybrid_rrf_k,
+                )
+            except Exception as exc:
+                logger.warning("hybrid fusion failed (%s); using dense only", exc)
+
         # Optional rerank step: take the bi-encoder candidates and re-score
         # with a cross-encoder. Skipped silently when fastembed isn't
         # installed (LocalReranker.available returns False).
@@ -1096,6 +1139,7 @@ class MemVaultService:
             )
         except FileNotFoundError as exc:
             return {"ok": False, "error": str(exc)}
+        self._invalidate_hybrid()
 
         # We re-index when *anything* the index keeps in metadata changes,
         # not only ``content``: the index payload carries ``tags`` (used to
@@ -1153,6 +1197,7 @@ class MemVaultService:
         existed = await self._to_thread(self.storage.delete, mem_id)
         if not existed:
             return {"ok": False, "error": f"Memory not found: {mem_id}"}
+        self._invalidate_hybrid()
         try:
             removed = await self._to_thread(
                 self.index.delete_by_metadata, "memory_id", mem_id, self.config.user_id
