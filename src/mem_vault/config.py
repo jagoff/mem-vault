@@ -32,6 +32,49 @@ def _default_state_dir() -> Path:
     return Path(user_data_dir("mem-vault", appauthor=False))
 
 
+# ---------------------------------------------------------------------------
+# Env-var → Config-field registry
+# ---------------------------------------------------------------------------
+#
+# Module-level (vs inline in ``load_config``) so external consumers — tests,
+# the ``doctor`` command, docs generators — can introspect "which env vars
+# does mem-vault read?". The contract test in
+# ``tests/test_contracts.py`` uses this to verify every entry maps to a real
+# ``Config`` field, catching a class of typo regressions where someone adds
+# an env var that silently doesn't bind to anything.
+
+ENV_TO_CONFIG_FIELD: dict[str, str] = {
+    "MEM_VAULT_MEMORY_SUBDIR": "memory_subdir",
+    "MEM_VAULT_STATE_DIR": "state_dir",
+    "MEM_VAULT_OLLAMA_HOST": "ollama_host",
+    "MEM_VAULT_LLM_MODEL": "llm_model",
+    "MEM_VAULT_EMBEDDER_MODEL": "embedder_model",
+    "MEM_VAULT_EMBEDDER_DIMS": "embedder_dims",
+    "MEM_VAULT_COLLECTION": "qdrant_collection",
+    "MEM_VAULT_USER_ID": "user_id",
+    "MEM_VAULT_AGENT_ID": "agent_id",
+    "MEM_VAULT_AUTO_EXTRACT": "auto_extract_default",
+    "MEM_VAULT_DECAY_HALF_LIFE_DAYS": "decay_half_life_days",
+    "MEM_VAULT_LLM_TIMEOUT_S": "llm_timeout_s",
+    "MEM_VAULT_MAX_CONTENT_SIZE": "max_content_size",
+    "MEM_VAULT_HTTP_TOKEN": "http_token",
+    "MEM_VAULT_METRICS": "metrics_enabled",
+    "MEM_VAULT_AUTO_LINK": "auto_link_default",
+    "MEM_VAULT_RERANK": "reranker_enabled",
+    "MEM_VAULT_RERANKER_MODEL": "reranker_model",
+    "MEM_VAULT_USAGE_BOOST_ENABLED": "usage_boost_enabled",
+    "MEM_VAULT_USAGE_BOOST": "usage_boost",
+    "MEM_VAULT_USAGE_TRACKING": "usage_tracking_enabled",
+    "MEM_VAULT_HYBRID": "hybrid_enabled",
+    "MEM_VAULT_HYBRID_RRF_K": "hybrid_rrf_k",
+    "MEM_VAULT_HYBRID_BM25_K1": "hybrid_bm25_k1",
+    "MEM_VAULT_HYBRID_BM25_B": "hybrid_bm25_b",
+    "MEM_VAULT_AUTO_CONTRADICT": "auto_contradict_default",
+    "MEM_VAULT_REDACT_SECRETS": "redact_secrets",
+    "MEM_VAULT_PROJECT": "project_default",
+}
+
+
 class Config(BaseModel):
     """Runtime configuration for the mem-vault MCP server."""
 
@@ -390,37 +433,7 @@ def load_config(config_path: Path | None = None) -> Config:
 
     merged: dict = {**file_data, "vault_path": str(vault_path)}
 
-    env_map = {
-        "MEM_VAULT_MEMORY_SUBDIR": "memory_subdir",
-        "MEM_VAULT_STATE_DIR": "state_dir",
-        "MEM_VAULT_OLLAMA_HOST": "ollama_host",
-        "MEM_VAULT_LLM_MODEL": "llm_model",
-        "MEM_VAULT_EMBEDDER_MODEL": "embedder_model",
-        "MEM_VAULT_EMBEDDER_DIMS": "embedder_dims",
-        "MEM_VAULT_COLLECTION": "qdrant_collection",
-        "MEM_VAULT_USER_ID": "user_id",
-        "MEM_VAULT_AGENT_ID": "agent_id",
-        "MEM_VAULT_AUTO_EXTRACT": "auto_extract_default",
-        "MEM_VAULT_DECAY_HALF_LIFE_DAYS": "decay_half_life_days",
-        "MEM_VAULT_LLM_TIMEOUT_S": "llm_timeout_s",
-        "MEM_VAULT_MAX_CONTENT_SIZE": "max_content_size",
-        "MEM_VAULT_HTTP_TOKEN": "http_token",
-        "MEM_VAULT_METRICS": "metrics_enabled",
-        "MEM_VAULT_AUTO_LINK": "auto_link_default",
-        "MEM_VAULT_RERANK": "reranker_enabled",
-        "MEM_VAULT_RERANKER_MODEL": "reranker_model",
-        "MEM_VAULT_USAGE_BOOST_ENABLED": "usage_boost_enabled",
-        "MEM_VAULT_USAGE_BOOST": "usage_boost",
-        "MEM_VAULT_USAGE_TRACKING": "usage_tracking_enabled",
-        "MEM_VAULT_HYBRID": "hybrid_enabled",
-        "MEM_VAULT_HYBRID_RRF_K": "hybrid_rrf_k",
-        "MEM_VAULT_HYBRID_BM25_K1": "hybrid_bm25_k1",
-        "MEM_VAULT_HYBRID_BM25_B": "hybrid_bm25_b",
-        "MEM_VAULT_AUTO_CONTRADICT": "auto_contradict_default",
-        "MEM_VAULT_REDACT_SECRETS": "redact_secrets",
-        "MEM_VAULT_PROJECT": "project_default",
-    }
-    for env_var, field in env_map.items():
+    for env_var, field in ENV_TO_CONFIG_FIELD.items():
         if env_var in os.environ:
             value: str | int | bool | float = os.environ[env_var]
             if field in {"embedder_dims", "max_content_size", "hybrid_rrf_k"}:

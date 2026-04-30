@@ -426,6 +426,18 @@ _TOOLS: list[types.Tool] = [
                 "title": {"type": "string"},
                 "description": {"type": "string"},
                 "tags": {"type": "array", "items": {"type": "string"}},
+                "visible_to": {
+                    "description": (
+                        "Change visibility scope. Pass 'private' to scope "
+                        "to the owner agent, 'public' for everyone, or a "
+                        "list of agent ids for an explicit allowlist. "
+                        "Omit to leave unchanged."
+                    ),
+                    "oneOf": [
+                        {"type": "string", "enum": ["public", "private"]},
+                        {"type": "array", "items": {"type": "string"}},
+                    ],
+                },
             },
             "required": ["id"],
         },
@@ -1485,6 +1497,16 @@ class MemVaultService:
             self._check_content_size(args.get("content"))
         except _ContentTooLargeError as exc:
             return {"ok": False, "error": str(exc), "code": "content_too_large"}
+        # Visibility shorthands: keep symmetric with ``save`` so callers can
+        # change scope on existing memorias without learning a different
+        # spelling. ``None`` means "leave unchanged" (storage.update treats
+        # ``visible_to=None`` as a no-op for the field), so we only normalize
+        # the explicit shorthands.
+        visible_to = args.get("visible_to")
+        if visible_to == "private":
+            visible_to = []
+        elif visible_to == "public":
+            visible_to = ["*"]
         try:
             mem = await self._to_thread(
                 self.storage.update,
@@ -1493,6 +1515,7 @@ class MemVaultService:
                 title=args.get("title"),
                 description=args.get("description"),
                 tags=args.get("tags"),
+                visible_to=visible_to,
             )
         except FileNotFoundError as exc:
             return {"ok": False, "error": str(exc)}
