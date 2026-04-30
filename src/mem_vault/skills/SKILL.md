@@ -14,13 +14,49 @@ Los tres triggers (`/mv`, `/mem_vault`, `/memory`) son **alias-equivalentes**: i
 
 | Primera palabra | Acción | MCP tool |
 |---|---|---|
-| (vacío) | listar últimas 10 | `mcp__mem-vault__memory_list({limit: 10})` |
+| (vacío) | listar últimas 10 + boot briefing si es la primera invocación de la sesión | ver "Boot briefing" abajo |
 | `list` | listar últimas 20 | `mcp__mem-vault__memory_list({limit: 20})` |
-| `save` o `save -e` + texto | guardar (con o sin LLM extract) | `mcp__mem-vault__memory_save({content: <texto>, auto_extract: <true si -e, sino false>})` |
+| `save` o `save -e` + texto | guardar con auto-derivación de title/type/tags | ver "Save flow" abajo |
 | `get` + id | mostrar memoria completa | `mcp__mem-vault__memory_get({id: <id>})` |
 | `update` + id + texto | replace content | `mcp__mem-vault__memory_update({id: <id>, content: <texto>})` |
 | `delete` + id | borrar (CON confirmación) | ver "Delete flow" abajo |
+| `stats` | counts por type, top tags, edades | `mcp__mem-vault__memory_stats({cwd: <cwd>})` |
+| `duplicates` | pairs ≥0.70 candidatos a merge | `mcp__mem-vault__memory_duplicates({cwd: <cwd>})` |
+| `lint` | memorias con problemas (sin tags, sin date, body vacío, etc.) | `mcp__mem-vault__memory_lint({cwd: <cwd>})` |
+| `synth` o `synthesize` + query | resumen LLM-compuesto de lo que el sistema sabe sobre el query | `mcp__mem-vault__memory_synthesize({query: <texto>})` |
 | cualquier otra cosa | search semántico | `mcp__mem-vault__memory_search({query: $ARGUMENTS, k: 5, threshold: 0.1})` |
+
+## Boot briefing — auto-summary al primer `/mv` de la sesión
+
+**Trigger**: la PRIMERA invocación del skill en una sesión nueva. Una vez por sesión.
+
+**Por qué**: el agente entra ciego al corpus disponible. Mostrar un briefing al boot expone las memorias relevantes al cwd y reduce re-descubrimientos.
+
+**Cómo**: `mcp__mem-vault__memory_briefing({cwd: <cwd actual>})` devuelve `{project_tag, total_global, project_total, recent_3, top_tags, lint_summary}`. Renderizá en ≤8 líneas:
+
+```
+📚 mem-vault · <project_total> memorias en `<project_tag>` (<total_global> total)
+  Últimas 3:
+    - `<id-1>` (<edad>) · <type>
+    - `<id-2>` (<edad>) · <type>
+    - `<id-3>` (<edad>) · <type>
+  Top tags: <tag-1> (<n>) · <tag-2> (<n>) · ...
+  ⚠️ <X> con <3 tags · <Y> sin fecha de aprendizaje · <Z> body <100 chars
+```
+
+Si `project_total == 0`: una línea sola: `📚 mem-vault · 0 memorias en `<project_tag>`. Cuando guardes la primera, va a aparecer acá.`. Si todos los lint flags son 0, omití la línea ⚠️.
+
+**Skip flag**: `MEMVAULT_SKIP_BRIEFING=1` deshabilita el briefing.
+
+## Save flow — auto-derivación de title/type/tags
+
+`/mv save <content>` (con o sin `-e`) **NO pide flags al user**. La skill llama a `mcp__mem-vault__memory_derive_metadata({content, cwd})` que devuelve `{title, type, tags, missing_tags}`. Si `missing_tags > 0`, **ANTES** de llamar a `memory_save`, pedí el tag faltante al user en una línea:
+
+```
+Derivé tags: [<tag-1>, <tag-2>]. Pasame uno más para llegar al mínimo de 3:
+```
+
+Si `missing_tags == 0`, llamá directamente a `memory_save` con los valores derivados. Auto-link viene activado por default — el `related:` y la sección `## Memorias relacionadas` con `[[id]]` wikilinks se agregan al body automáticamente.
 
 ## Delete flow (irreversible — pidan confirmación)
 

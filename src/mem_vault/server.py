@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,16 @@ import mcp.types as types
 from mcp.server import Server
 
 from mem_vault.config import Config, load_config
+from mem_vault.discovery import (
+    compute_stats,
+    derive_domain_tags,
+    derive_project_tag,
+    derive_technique_tag,
+    derive_title_from_content,
+    derive_type_from_content,
+    find_duplicate_pairs_by_tag_overlap,
+    lint_memory,
+)
 from mem_vault.index import CircuitBreakerOpenError, VectorIndex, compute_content_hash
 from mem_vault.storage import VaultStorage, slugify
 
@@ -48,6 +59,32 @@ class _LLMTimeoutError(TimeoutError):
     Distinct from :class:`asyncio.TimeoutError` so handlers can render a
     user-friendly message instead of a bare ``TimeoutError`` on the wire.
     """
+
+
+def _insert_wikilinks_section(body: str, related: list[tuple[str, str]]) -> str:
+    """Append a ``## Memorias relacionadas`` section to ``body``.
+
+    Cap at 3 wikilinks (the most-similar by score, since ``related`` is
+    already sorted). Inserted before a trailing ``## Aprendido el ...``
+    section if present, otherwise at the end of the body — that way the
+    "Aprendido el …" closer (the convention from the SKILL.md) stays the
+    last thing the reader sees.
+    """
+    if not related:
+        return body
+    section_lines = ["## Memorias relacionadas"]
+    for mid, desc in related[:3]:
+        if desc:
+            section_lines.append(f"- [[{mid}]] ({desc})")
+        else:
+            section_lines.append(f"- [[{mid}]]")
+    section = "\n".join(section_lines)
+
+    aprendido_match = re.search(r"\n##?\s*Aprendido el\b", body)
+    if aprendido_match:
+        idx = aprendido_match.start()
+        return body[:idx].rstrip() + "\n\n" + section + "\n\n" + body[idx:].lstrip("\n")
+    return body.rstrip() + "\n\n" + section + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +251,91 @@ _TOOLS: list[types.Tool] = [
         },
     ),
     types.Tool(
+        name="memory_briefing",
+        description=(
+            "Compose a project-aware boot briefing: total memorias of the "
+            "current project (resolved from ``cwd``) + total global, last 3 "
+            "by recency, top 5 co-tags, lint summary. Designed for the skill "
+            "to render the 6-line summary on the first ``/mv`` of a session "
+            "so the agent enters the conversation knowing what's in the vault."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "cwd": {
+                    "type": "string",
+                    "description": "Absolute path to the project root. Used to derive the project_tag.",
+                },
+            },
+        },
+    ),
+    types.Tool(
+        name="memory_derive_metadata",
+        description=(
+            "Run the keyword-priority classifiers on a memory body and "
+            "return a suggested ``{title, type, tags, missing_tags}``. "
+            "Intended to be called by the skill *before* ``memory_save`` "
+            "so the user only types the body and the metadata is filled "
+            "in automatically. ``missing_tags > 0`` means the body didn't "
+            "match enough patterns to reach 3 tags — the skill should ask "
+            "the user for one more before saving."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "content": {"type": "string"},
+                "cwd": {"type": "string"},
+            },
+            "required": ["content"],
+        },
+    ),
+    types.Tool(
+        name="memory_stats",
+        description=(
+            "Aggregate counts over the memory corpus: by ``type``, by "
+            "``agent_id``, top tags, and age histogram (today / week / "
+            "month / older). When ``cwd`` is provided, scopes to memorias "
+            "tagged with the resolved ``project_tag``."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {"cwd": {"type": "string"}},
+        },
+    ),
+    types.Tool(
+        name="memory_duplicates",
+        description=(
+            "Surface pairs of memorias with high tag-overlap Jaccard — cheap "
+            "candidate duplicate detection without hitting Qdrant. Use this "
+            "when the user asks 'tengo dos memorias parecidas?' for a quick "
+            "answer; for deep semantic dedup use ``mem-vault consolidate``."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "threshold": {
+                    "type": "number",
+                    "default": 0.7,
+                    "description": "Jaccard threshold; pairs with score < this are skipped.",
+                },
+                "cwd": {"type": "string"},
+            },
+        },
+    ),
+    types.Tool(
+        name="memory_lint",
+        description=(
+            "List memorias with structural issues: <3 tags, missing "
+            "``description``, body shorter than 100 chars, body without "
+            "``## Aprendido el YYYY-MM-DD`` line. Useful before "
+            "``mem-vault consolidate`` to spot underdeveloped entries."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {"cwd": {"type": "string"}},
+        },
+    ),
+    types.Tool(
         name="memory_synthesize",
         description=(
             "Compose an LLM-written summary of what the system knows about "
@@ -331,13 +453,17 @@ class MemVaultService:
         *,
         threshold: float = 0.5,
         k: int = 5,
-    ) -> list[str]:
-        """Find top-k similar memories and return their IDs (excluding self).
+    ) -> list[tuple[str, str]]:
+        """Find top-k similar memorias as ``(id, description)`` tuples.
 
-        Used post-save to populate the ``related`` frontmatter field so the
-        vault organically grows a knowledge graph instead of staying as
-        archipelago of isolated notes. Failures are swallowed — auto-link is
-        best-effort, missing it doesn't fail the save.
+        The pair shape is what the body cross-linker needs (Obsidian
+        wikilinks render best with a short description after them). The
+        frontmatter ``related:`` field uses just the IDs — the caller
+        flattens the tuples there.
+
+        Excludes ``mem_id`` (self), dedupes repeated IDs, swallows index
+        errors. Returns ``[]`` on any failure path so callers can branch
+        with a simple truthiness check.
         """
         if not content.strip():
             return []
@@ -353,17 +479,38 @@ class MemVaultService:
             logger.debug("auto-link search failed for %s: %s", mem_id, exc)
             return []
 
-        related_ids: list[str] = []
+        out: list[tuple[str, str]] = []
+        seen: set[str] = set()
         for hit in hits:
             if not isinstance(hit, dict):
                 continue
             meta = hit.get("metadata") or {}
             h_id = meta.get("memory_id")
-            if h_id and h_id != mem_id and h_id not in related_ids:
-                related_ids.append(str(h_id))
-            if len(related_ids) >= k:
+            if not h_id or h_id == mem_id or h_id in seen:
+                continue
+            seen.add(str(h_id))
+            # Pull the description: prefer a stored memory body (mem0 returns
+            # the indexed text in ``memory``), fall back to the snippet, then
+            # to the empty string. We snip at 60 chars to keep the wikilink
+            # line tight.
+            text = ""
+            mem_field = hit.get("memory")
+            if isinstance(mem_field, str):
+                text = mem_field
+            elif isinstance(mem_field, dict):
+                text = (
+                    mem_field.get("description")
+                    or mem_field.get("body")
+                    or mem_field.get("text")
+                    or ""
+                )
+            if not text:
+                text = hit.get("snippet") or hit.get("text") or ""
+            text = text.strip().replace("\n", " ")
+            out.append((str(h_id), text[:60]))
+            if len(out) >= k:
                 break
-        return related_ids
+        return out
 
     async def save(self, args: dict[str, Any]) -> dict[str, Any]:
         content: str = args["content"]
@@ -444,17 +591,26 @@ class MemVaultService:
                 "path": str(self.storage.path_for(mem.id)),
             }
 
-        # Auto-linking: after a successful index, find similar memorias and
-        # stamp their IDs onto this memory's ``related`` frontmatter. Off by
-        # default for hooks calling save() at high volume; opt in per-call
-        # with ``auto_link=true`` or globally via ``Config.auto_link_default``.
+        # Auto-linking produces two artifacts:
+        # 1. ``related`` IDs stamped on the frontmatter (machine-readable).
+        # 2. A ``## Memorias relacionadas`` section with ``[[id]]`` wikilinks
+        #    appended to the body so Obsidian renders the graph natively.
+        # Off by default for high-volume hooks; opt in per-call with
+        # ``auto_link=true`` or globally via ``Config.auto_link_default``.
         related_ids: list[str] = []
         auto_link = bool(args.get("auto_link", self.config.auto_link_default))
         if auto_link:
-            related_ids = await self._auto_link(mem.id, content, user_id)
-            if related_ids:
+            related_pairs = await self._auto_link(mem.id, content, user_id)
+            related_ids = [mid for mid, _ in related_pairs]
+            if related_pairs:
+                new_body = _insert_wikilinks_section(mem.body or content, related_pairs)
                 try:
-                    mem = await self._to_thread(self.storage.update, mem.id, related=related_ids)
+                    mem = await self._to_thread(
+                        self.storage.update,
+                        mem.id,
+                        content=new_body,
+                        related=related_ids,
+                    )
                 except Exception as exc:
                     logger.warning("auto-link write failed for %s: %s", mem.id, exc)
 
@@ -758,6 +914,177 @@ class MemVaultService:
             removed = 0
         return {"ok": True, "deleted_file": True, "deleted_index_entries": removed}
 
+    # ------------------------------------------------------------------
+    # Discovery / introspection tools
+    # ------------------------------------------------------------------
+
+    async def briefing(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Compose a project-aware boot briefing for a fresh session.
+
+        Used by the skill on the first ``/mv`` of a session: returns
+        ``{total_global, project_tag, project_total, recent_3, top_tags,
+        lint_flags}`` so the agent can render the 6-line summary without
+        a second round-trip.
+        """
+        cwd = args.get("cwd")
+        project_tag = derive_project_tag(cwd, content="") if cwd else None
+
+        all_memories = await self._to_thread(
+            self.storage.list,
+            type=None,
+            tags=None,
+            user_id=None,
+            limit=10**9,
+        )
+        if project_tag:
+            project_memories = [m for m in all_memories if project_tag in (m.tags or [])]
+        else:
+            project_memories = []
+
+        recent_3 = [
+            {"id": m.id, "type": m.type, "name": m.name, "updated": m.updated}
+            for m in project_memories[:3]
+        ]
+        # Top tags within the project (excluding the project_tag itself).
+        from collections import Counter
+
+        tag_counts: Counter[str] = Counter()
+        for m in project_memories:
+            for t in m.tags or []:
+                if t != project_tag:
+                    tag_counts[t] += 1
+        top_tags = tag_counts.most_common(5)
+
+        # Lint summary: count issues across the project memorias.
+        lint_summary = {
+            "few_tags": 0,
+            "no_aprendido": 0,
+            "short_body": 0,
+        }
+        for m in project_memories:
+            issues = lint_memory(m)
+            for issue in issues:
+                if issue.startswith("<3 tags"):
+                    lint_summary["few_tags"] += 1
+                elif "Aprendido el" in issue:
+                    lint_summary["no_aprendido"] += 1
+                elif "body" in issue:
+                    lint_summary["short_body"] += 1
+
+        return {
+            "ok": True,
+            "cwd": cwd,
+            "project_tag": project_tag,
+            "total_global": len(all_memories),
+            "project_total": len(project_memories),
+            "recent_3": recent_3,
+            "top_tags": [{"tag": t, "count": c} for t, c in top_tags],
+            "lint_summary": lint_summary,
+        }
+
+    async def derive_metadata(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Run the auto-derivation classifiers on ``content`` + optional ``cwd``.
+
+        Returns ``{title, type, tags, missing_tags}`` so the skill can
+        either pass them to ``memory_save`` directly or surface the
+        ``missing_tags`` count to ask the user for the third tag (the
+        "<3 tags blocker" rule from the skill).
+        """
+        content = str(args.get("content", ""))
+        cwd = args.get("cwd")
+
+        title = derive_title_from_content(content)
+        mtype = derive_type_from_content(content)
+
+        tags: list[str] = []
+        project_tag = derive_project_tag(cwd, content)
+        if project_tag:
+            tags.append(project_tag)
+        for t in derive_domain_tags(content, cap=3):
+            if t not in tags:
+                tags.append(t)
+        technique = derive_technique_tag(content)
+        if technique and technique not in tags:
+            tags.append(technique)
+
+        # Cap at 6 tags max (more becomes noise).
+        tags = tags[:6]
+
+        return {
+            "ok": True,
+            "title": title,
+            "type": mtype,
+            "tags": tags,
+            "tag_count": len(tags),
+            "missing_tags": max(0, 3 - len(tags)),
+        }
+
+    async def stats(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Aggregate counts (by type, by agent, top tags, age buckets) over the corpus."""
+        cwd = args.get("cwd")
+        project_tag = derive_project_tag(cwd, content="") if cwd else None
+        memories = await self._to_thread(
+            self.storage.list,
+            type=None,
+            tags=[project_tag] if project_tag else None,
+            user_id=None,
+            limit=10**9,
+        )
+        result = compute_stats(memories)
+        result["ok"] = True
+        result["scope"] = project_tag or "global"
+        return result
+
+    async def duplicates(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Surface candidate duplicate pairs by tag-overlap Jaccard.
+
+        Cheap offline detection — no Qdrant calls. For semantic dedup the
+        canonical entrypoint is ``mem-vault consolidate``; this tool is
+        the fast peek that fits inside a chat turn.
+        """
+        threshold = float(args.get("threshold", 0.7))
+        cwd = args.get("cwd")
+        project_tag = derive_project_tag(cwd, content="") if cwd else None
+        memories = await self._to_thread(
+            self.storage.list,
+            type=None,
+            tags=[project_tag] if project_tag else None,
+            user_id=None,
+            limit=10**9,
+        )
+        pairs = find_duplicate_pairs_by_tag_overlap(memories, threshold=threshold)
+        return {
+            "ok": True,
+            "threshold": threshold,
+            "scope": project_tag or "global",
+            "count": len(pairs),
+            "pairs": [{"a": a, "b": b, "jaccard": round(j, 3)} for a, b, j in pairs[:50]],
+        }
+
+    async def lint(self, args: dict[str, Any]) -> dict[str, Any]:
+        """List memorias with structural issues (few tags, no body, etc.)."""
+        cwd = args.get("cwd")
+        project_tag = derive_project_tag(cwd, content="") if cwd else None
+        memories = await self._to_thread(
+            self.storage.list,
+            type=None,
+            tags=[project_tag] if project_tag else None,
+            user_id=None,
+            limit=10**9,
+        )
+        problems: list[dict[str, Any]] = []
+        for m in memories:
+            issues = lint_memory(m)
+            if issues:
+                problems.append({"id": m.id, "name": m.name, "issues": issues})
+        return {
+            "ok": True,
+            "scope": project_tag or "global",
+            "total_scanned": len(memories),
+            "with_issues": len(problems),
+            "problems": problems[:100],
+        }
+
 
 # ---------------------------------------------------------------------------
 # MCP wiring
@@ -775,6 +1102,11 @@ def _build_server(service: Any) -> Server:
         "memory_update": service.update,
         "memory_delete": service.delete,
         "memory_synthesize": service.synthesize,
+        "memory_briefing": service.briefing,
+        "memory_derive_metadata": service.derive_metadata,
+        "memory_stats": service.stats,
+        "memory_duplicates": service.duplicates,
+        "memory_lint": service.lint,
     }
 
     # Metrics sink: disabled by default, opt-in via Config.metrics_enabled.

@@ -23,8 +23,10 @@ from pathlib import Path
 
 import pytest
 
+from mem_vault.config import Config
+from mem_vault.index import _CircuitBreaker
 from mem_vault.retrieval import LocalReranker, _extract_body
-
+from mem_vault.server import MemVaultService
 
 # ---------------------------------------------------------------------------
 # _extract_body — tolerant of mem0 hit shape variants
@@ -203,11 +205,6 @@ def test_reranker_swallows_score_errors(stub_encoder):
 # ---------------------------------------------------------------------------
 # MemVaultService.search integration with reranker
 # ---------------------------------------------------------------------------
-
-
-from mem_vault.config import Config
-from mem_vault.index import _CircuitBreaker
-from mem_vault.server import MemVaultService
 
 
 class _IntegStubIndex:

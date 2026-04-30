@@ -54,6 +54,21 @@ class _RecordingService:
     async def synthesize(self, args):
         return await self._dispatch("synthesize", args)
 
+    async def briefing(self, args):
+        return await self._dispatch("briefing", args)
+
+    async def derive_metadata(self, args):
+        return await self._dispatch("derive_metadata", args)
+
+    async def stats(self, args):
+        return await self._dispatch("stats", args)
+
+    async def duplicates(self, args):
+        return await self._dispatch("duplicates", args)
+
+    async def lint(self, args):
+        return await self._dispatch("lint", args)
+
 
 # ---------------------------------------------------------------------------
 # _build_server — list_tools and call_tool dispatch

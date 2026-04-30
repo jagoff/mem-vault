@@ -120,7 +120,11 @@ class LocalReranker:
             return candidates[:top_k]
 
         # Pair, sort by rerank score desc, stamp the score onto the hit.
-        ranked = sorted(zip(scorable, scores), key=lambda pair: float(pair[1]), reverse=True)
+        ranked = sorted(
+            zip(scorable, scores, strict=False),
+            key=lambda pair: float(pair[1]),
+            reverse=True,
+        )
         out: list[dict[str, Any]] = []
         for hit, s in ranked:
             with_score = dict(hit)
