@@ -221,7 +221,7 @@ _TOOLS: list[types.Tool] = [
             "and asks the local LLM (Ollama) to weave the matched memorias "
             "into a coherent answer in español rioplatense, citing the source "
             "IDs inline. Use this when the user asks an open-ended question "
-            "(\"resumime todo lo que sé sobre X\") — it's the difference "
+            '("resumime todo lo que sé sobre X") — it\'s the difference '
             "between dumping a list of bullets and getting an interlocutor "
             "that actually responds."
         ),
@@ -263,6 +263,9 @@ class MemVaultService:
         self.config = config
         self.storage = VaultStorage(config.memory_dir)
         self.index = VectorIndex(config)
+        # Reranker is opt-in via Config.reranker_enabled; lazily instantiated
+        # so the disabled path doesn't even try to import fastembed.
+        self._reranker: Any | None = None
 
     async def _to_thread(self, fn, *args, **kwargs):
         return await asyncio.to_thread(fn, *args, **kwargs)
@@ -305,6 +308,20 @@ class MemVaultService:
                 f"content too large: {len(content)} chars exceeds limit of {limit}. "
                 "Raise MEM_VAULT_MAX_CONTENT_SIZE or split the memory."
             )
+
+    def _rerank(self, query: str, hits: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
+        """Re-order hits via the local cross-encoder. Sync (called via to_thread).
+
+        Lazily instantiates the ``LocalReranker`` on first use. If the
+        underlying fastembed import fails (extra not installed, model
+        download blocked), the reranker becomes a no-op pass-through —
+        we always return *something*, never an empty list, never raise.
+        """
+        if self._reranker is None:
+            from mem_vault.retrieval import LocalReranker
+
+            self._reranker = LocalReranker(self.config.reranker_model)
+        return self._reranker.rerank(query, hits, top_k=top_k)
 
     async def _auto_link(
         self,
@@ -437,9 +454,7 @@ class MemVaultService:
             related_ids = await self._auto_link(mem.id, content, user_id)
             if related_ids:
                 try:
-                    mem = await self._to_thread(
-                        self.storage.update, mem.id, related=related_ids
-                    )
+                    mem = await self._to_thread(self.storage.update, mem.id, related=related_ids)
                 except Exception as exc:
                     logger.warning("auto-link write failed for %s: %s", mem.id, exc)
 
@@ -596,8 +611,14 @@ class MemVaultService:
         if mtype:
             filters["type"] = mtype
 
-        # Over-fetch so visibility filtering doesn't leave us short.
-        raw_k = max(k, k * 3, 20)
+        # Over-fetch so visibility filtering doesn't leave us short. When
+        # reranking is enabled, fetch even more so the cross-encoder has
+        # a richer candidate set to re-order.
+        if self.config.reranker_enabled:
+            raw_k = max(k * 5, 30)
+        else:
+            raw_k = max(k, k * 3, 20)
+
         try:
             hits = await self._index_call(
                 self.index.search,
@@ -612,6 +633,12 @@ class MemVaultService:
             # only end up here if the asyncio.wait_for tripped first.
             logger.warning("search timed out: %s", exc)
             return {"ok": True, "query": query, "count": 0, "results": [], "warning": str(exc)}
+
+        # Optional rerank step: take the bi-encoder candidates and re-score
+        # with a cross-encoder. Skipped silently when fastembed isn't
+        # installed (LocalReranker.available returns False).
+        if self.config.reranker_enabled and hits:
+            hits = await self._to_thread(self._rerank, query, hits, raw_k)
 
         # Resolve hits → full memory bodies from the vault.
         results: list[dict[str, Any]] = []

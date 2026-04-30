@@ -163,6 +163,27 @@ class Config(BaseModel):
             "via this field / ``MEM_VAULT_AUTO_LINK=0``."
         ),
     )
+    reranker_enabled: bool = Field(
+        default=False,
+        description=(
+            "When True, ``memory_search`` over-fetches a wider candidate set "
+            "and re-orders it through a local cross-encoder reranker before "
+            "returning the top-k. Boosts relevance significantly on noisy "
+            "queries at the cost of ~30-100 ms extra latency per search. "
+            "Requires the ``[hybrid]`` extra (``fastembed``); falls back to "
+            "bi-encoder order silently if the import fails. Enable via "
+            "``MEM_VAULT_RERANK=1`` or this field."
+        ),
+    )
+    reranker_model: str = Field(
+        default="jinaai/jina-reranker-v1-tiny-en",
+        description=(
+            "Cross-encoder model used by the local reranker. Defaults to "
+            "Jina's tiny English-only reranker (~130 MB, ~30 ms for 20 "
+            "candidates on CPU). For multilingual: "
+            "``jinaai/jina-reranker-v2-base-multilingual`` (1.1 GB, slower)."
+        ),
+    )
 
     @field_validator("vault_path", "state_dir", mode="before")
     @classmethod
@@ -273,13 +294,20 @@ def load_config(config_path: Path | None = None) -> Config:
         "MEM_VAULT_HTTP_TOKEN": "http_token",
         "MEM_VAULT_METRICS": "metrics_enabled",
         "MEM_VAULT_AUTO_LINK": "auto_link_default",
+        "MEM_VAULT_RERANK": "reranker_enabled",
+        "MEM_VAULT_RERANKER_MODEL": "reranker_model",
     }
     for env_var, field in env_map.items():
         if env_var in os.environ:
             value: str | int | bool | float = os.environ[env_var]
             if field in {"embedder_dims", "max_content_size"}:
                 value = int(value)
-            elif field in {"auto_extract_default", "metrics_enabled", "auto_link_default"}:
+            elif field in {
+                "auto_extract_default",
+                "metrics_enabled",
+                "auto_link_default",
+                "reranker_enabled",
+            }:
                 value = str(value).lower() in {"1", "true", "yes", "on"}
             elif field in {"decay_half_life_days", "llm_timeout_s"}:
                 value = float(value)

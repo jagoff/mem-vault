@@ -91,9 +91,7 @@ async def test_save_skips_auto_link_when_disabled_per_call(service_factory):
     stub.search_response = [
         {"score": 0.9, "metadata": {"memory_id": "older-1"}},
     ]
-    res = await service.save(
-        {"content": "x", "title": "x", "type": "note", "auto_link": False}
-    )
+    res = await service.save({"content": "x", "title": "x", "type": "note", "auto_link": False})
     assert res["related"] == []
     assert res["memory"]["related"] == []
 
@@ -209,9 +207,7 @@ async def test_synthesize_invokes_llm_with_seeded_memories(service_factory, monk
 async def test_synthesize_returns_llm_timeout_envelope(service_factory, monkeypatch):
     service, stub = service_factory()
     seed = await service.save({"content": "body", "title": "M", "type": "note"})
-    stub.search_response = [
-        {"score": 0.9, "metadata": {"memory_id": seed["memory"]["id"]}}
-    ]
+    stub.search_response = [{"score": 0.9, "metadata": {"memory_id": seed["memory"]["id"]}}]
 
     from mem_vault.server import _LLMTimeoutError
 
@@ -229,9 +225,7 @@ async def test_synthesize_returns_llm_timeout_envelope(service_factory, monkeypa
 async def test_synthesize_returns_generic_error_envelope(service_factory, monkeypatch):
     service, stub = service_factory()
     seed = await service.save({"content": "body", "title": "M", "type": "note"})
-    stub.search_response = [
-        {"score": 0.9, "metadata": {"memory_id": seed["memory"]["id"]}}
-    ]
+    stub.search_response = [{"score": 0.9, "metadata": {"memory_id": seed["memory"]["id"]}}]
 
     async def _boom(prompt):
         raise ValueError("bad thing")
