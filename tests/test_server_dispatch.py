@@ -69,6 +69,9 @@ class _RecordingService:
     async def lint(self, args):
         return await self._dispatch("lint", args)
 
+    async def feedback(self, args):
+        return await self._dispatch("feedback", args)
+
 
 # ---------------------------------------------------------------------------
 # _build_server — list_tools and call_tool dispatch

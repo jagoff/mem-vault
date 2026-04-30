@@ -487,6 +487,171 @@ def test_stop_appends_not_overwrites(monkeypatch, tmp_path):
     assert len(lines) == 2
 
 
+def test_stop_audit_line_includes_auto_feedback_counter(monkeypatch, tmp_path):
+    """The new audit line carries ``auto_feedback=N`` so the user can grep it."""
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setattr("mem_vault.hooks.stop._vault_memory_count", lambda: 5)
+    monkeypatch.setattr("mem_vault.hooks.stop._apply_auto_feedback", lambda p: 3)
+    monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
+
+    from mem_vault.hooks import stop
+
+    importlib.reload(stop)
+    monkeypatch.setattr("mem_vault.hooks.stop._vault_memory_count", lambda: 5)
+    monkeypatch.setattr("mem_vault.hooks.stop._apply_auto_feedback", lambda p: 3)
+    stop.run()
+
+    log_file = tmp_path / ".local" / "share" / "mem-vault" / "sessions.log"
+    line = log_file.read_text(encoding="utf-8").strip()
+    assert "auto_feedback=3" in line
+
+
+def test_stop_auto_feedback_exception_is_swallowed(monkeypatch, tmp_path, capsys):
+    """If _apply_auto_feedback raises, the hook still writes the audit line."""
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setattr("mem_vault.hooks.stop._vault_memory_count", lambda: 1)
+
+    def _boom(payload):
+        raise RuntimeError("disk exploded")
+
+    monkeypatch.setattr("mem_vault.hooks.stop._apply_auto_feedback", _boom)
+    monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
+
+    from mem_vault.hooks import stop
+
+    importlib.reload(stop)
+    monkeypatch.setattr("mem_vault.hooks.stop._vault_memory_count", lambda: 1)
+    monkeypatch.setattr("mem_vault.hooks.stop._apply_auto_feedback", _boom)
+    stop.run()  # must not raise
+
+    log_file = tmp_path / ".local" / "share" / "mem-vault" / "sessions.log"
+    assert log_file.exists()
+    assert "auto_feedback=0" in log_file.read_text()
+    err = capsys.readouterr().err
+    assert "auto-feedback failed" in err
+
+
+# ---------------------------------------------------------------------------
+# find_memory_citations — pure citation detection
+# ---------------------------------------------------------------------------
+
+
+def test_find_citations_wikilinks():
+    from mem_vault.hooks.stop import find_memory_citations
+
+    known = {"idioma_preferido", "rate_limit", "note_x"}
+    text = "Según [[idioma_preferido]] el user usa rioplatense."
+    assert find_memory_citations(text, known) == {"idioma_preferido"}
+
+
+def test_find_citations_inline_code_spans():
+    from mem_vault.hooks.stop import find_memory_citations
+
+    known = {"long_enough_id", "rate_limit", "note_x"}
+    text = "La memoria `rate_limit` dice 60/min."
+    assert find_memory_citations(text, known) == {"rate_limit"}
+
+
+def test_find_citations_bare_mentions_require_min_length():
+    """Bare mentions (no wikilink, no backticks) only count for ids ≥ 8 chars.
+
+    Short ids like ``note_x`` (6 chars) are too risky — they'd match common
+    English/Spanish words. We require 8+ chars before a bare match counts.
+    """
+    from mem_vault.hooks.stop import find_memory_citations
+
+    known = {"feedback_idioma_preferido", "nx"}
+    text = "Esto lo dice feedback_idioma_preferido. Also mentions nx randomly."
+    out = find_memory_citations(text, known)
+    assert "feedback_idioma_preferido" in out
+    assert "nx" not in out  # too short for bare match
+
+
+def test_find_citations_dedupes_within_response():
+    from mem_vault.hooks.stop import find_memory_citations
+
+    known = {"some_long_memo"}
+    text = "[[some_long_memo]] y después `some_long_memo` y bare some_long_memo."
+    # Multiple matches of the same id should collapse to one entry.
+    assert find_memory_citations(text, known) == {"some_long_memo"}
+
+
+def test_find_citations_skips_unknown_ids():
+    from mem_vault.hooks.stop import find_memory_citations
+
+    known = {"known_id_alpha"}
+    text = "[[unknown_id_beta]] this should NOT be included."
+    assert find_memory_citations(text, known) == set()
+
+
+def test_find_citations_empty_text_or_known_returns_empty():
+    from mem_vault.hooks.stop import find_memory_citations
+
+    assert find_memory_citations("", {"x"}) == set()
+    assert find_memory_citations("some text", set()) == set()
+
+
+# ---------------------------------------------------------------------------
+# _apply_auto_feedback — end-to-end wiring with a real storage
+# ---------------------------------------------------------------------------
+
+
+def test_apply_auto_feedback_bumps_cited_memories(monkeypatch, tmp_path):
+    """When the payload carries a ``response`` citing a known id, the
+    storage counters must move."""
+    from mem_vault.config import Config
+    from mem_vault.hooks import stop
+    from mem_vault.storage import VaultStorage
+
+    # Set up a vault with two memorias
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    memory_dir = vault / "memory"
+    memory_dir.mkdir()
+    storage = VaultStorage(memory_dir)
+    storage.save(content="body one", title="Long Enough Id Alpha")
+    storage.save(content="body two", title="Other Long Enough Id")
+
+    cfg = Config(
+        vault_path=str(vault),
+        memory_subdir="memory",
+        state_dir=str(tmp_path / "state"),
+        user_id="t",
+        max_content_size=0,
+        llm_timeout_s=0,
+    )
+    cfg.qdrant_collection = "test"
+    cfg.state_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("mem_vault.config.load_config", lambda: cfg)
+
+    payload = {
+        "response": "[[long_enough_id_alpha]] dice que sí, pero `other_long_enough_id` no.",
+    }
+    bumped = stop._apply_auto_feedback(payload)
+    assert bumped == 2
+
+    reloaded_a = storage.get("long_enough_id_alpha")
+    reloaded_b = storage.get("other_long_enough_id")
+    assert reloaded_a is not None and reloaded_a.last_used != ""
+    assert reloaded_b is not None and reloaded_b.last_used != ""
+    # helpful/unhelpful stay 0 — we bumped usage as neutral signal
+    assert reloaded_a.helpful_count == 0
+    assert reloaded_a.unhelpful_count == 0
+
+
+def test_apply_auto_feedback_disabled_by_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("MEM_VAULT_STOP_AUTO_FEEDBACK", "0")
+    from mem_vault.hooks import stop
+
+    assert stop._apply_auto_feedback({"response": "[[anything]]"}) == 0
+
+
+def test_apply_auto_feedback_no_response_returns_zero(monkeypatch):
+    from mem_vault.hooks import stop
+
+    assert stop._apply_auto_feedback({}) == 0
+
+
 def test_stop_vault_memory_count_returns_minus_one_when_config_fails(monkeypatch):
     """If load_config raises, _vault_memory_count should return -1, not crash."""
 

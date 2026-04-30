@@ -45,6 +45,26 @@ _VALID_TYPES = {"feedback", "preference", "decision", "fact", "note", "bug", "to
 VISIBLE_TO_ALL = "*"
 
 
+def _coerce_int(value: Any) -> int:
+    """Best-effort int parse for frontmatter values. Returns 0 on failure.
+
+    Handles: ``None``, ``int`` passthrough, numeric strings ("3"), and
+    anything else → 0. We swallow errors on purpose — a hand-edited
+    ``usage_count: "abc"`` shouldn't break the reader.
+    """
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        # bool is a subclass of int in Python; coerce to 0/1 explicitly
+        return int(value)
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (ValueError, TypeError):
+        return 0
+
+
 @dataclass
 class Memory:
     """A single memory entry (one .md file in the vault).
@@ -55,6 +75,18 @@ class Memory:
       default for legacy / unset) means every agent. An empty list ``[]``
       means private to ``agent_id`` (and any caller that explicitly asks
       for that agent's memories).
+
+    Usage counters (feedback loop — "memoria viva" amplification):
+    - ``usage_count``: how many times this memory was returned as a hit by
+      ``memory_search``. Auto-incremented post-hoc by the search handler.
+    - ``helpful_count`` / ``unhelpful_count``: explicit thumbs via the
+      ``memory_feedback`` MCP tool, or inferred by the Stop hook when the
+      agent's final response cites the memory id.
+    - ``last_used``: ISO timestamp of the most recent retrieval / feedback
+      event. Useful for dead-memory detection in ``lint`` / ``consolidate``.
+
+    All four are optional in the frontmatter (legacy files default to 0 /
+    ""); the reader handles missing fields gracefully.
     """
 
     id: str
@@ -71,6 +103,10 @@ class Memory:
     contradicts: list[str] = field(default_factory=list)
     related: list[str] = field(default_factory=list)
     visible_to: list[str] = field(default_factory=lambda: [VISIBLE_TO_ALL])
+    usage_count: int = 0
+    helpful_count: int = 0
+    unhelpful_count: int = 0
+    last_used: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
 
     def is_visible_to(self, agent_id: str | None) -> bool:
@@ -110,6 +146,18 @@ class Memory:
         # without sprouting a noisy field they didn't ask for.
         if self.visible_to != [VISIBLE_TO_ALL]:
             meta["visible_to"] = list(self.visible_to)
+        # Usage counters — emitted only when non-zero so pristine memorias
+        # keep their frontmatter tight. Same round-trip principle as
+        # ``visible_to`` / ``related``: don't pollute legacy files that
+        # never saw a feedback event.
+        if self.usage_count:
+            meta["usage_count"] = int(self.usage_count)
+        if self.helpful_count:
+            meta["helpful_count"] = int(self.helpful_count)
+        if self.unhelpful_count:
+            meta["unhelpful_count"] = int(self.unhelpful_count)
+        if self.last_used:
+            meta["last_used"] = self.last_used
         meta.update(self.extra)
         return meta
 
@@ -129,7 +177,27 @@ class Memory:
             "contradicts": self.contradicts,
             "related": self.related,
             "visible_to": self.visible_to,
+            "usage_count": self.usage_count,
+            "helpful_count": self.helpful_count,
+            "unhelpful_count": self.unhelpful_count,
+            "last_used": self.last_used,
         }
+
+    @property
+    def helpful_ratio(self) -> float:
+        """Score in [-1, 1]: positive when thumbs-up dominate, negative otherwise.
+
+        Formula: ``(helpful - unhelpful) / max(1, helpful + unhelpful)``.
+        Neutral (no feedback, or equal counts) returns 0.0. A memory with 3
+        thumbs-up and 1 thumbs-down returns 0.5; 0 and 2 returns -1.0.
+
+        The search-time boost uses ``max(0, helpful_ratio)`` so only
+        positive feedback lifts a memory's rank — negative feedback keeps
+        it in place rather than actively burying it (a memory with one
+        accidental thumbs-down shouldn't disappear from searches).
+        """
+        denom = max(1, self.helpful_count + self.unhelpful_count)
+        return (self.helpful_count - self.unhelpful_count) / denom
 
 
 def slugify(text: str, max_len: int = 64) -> str:
@@ -329,6 +397,66 @@ class VaultStorage:
         self._write(mem)
         return mem
 
+    def record_usage(
+        self,
+        memory_id: str,
+        *,
+        delta: int = 1,
+    ) -> Memory | None:
+        """Increment ``usage_count`` + bump ``last_used`` without touching body/updated.
+
+        Intended for the post-search loop that records every returned hit
+        as "seen once". Keeps ``updated`` untouched so the hash-based
+        incremental reindex doesn't re-embed a memory just because its
+        counter bumped. Returns the updated Memory, or ``None`` if the
+        memory isn't on disk (orphan).
+
+        Failure is swallowed — a concurrent write race (two search
+        threads incrementing the same memory) is harmless if one of them
+        overwrites the other; we'd rather lose a count than crash the
+        search path.
+        """
+        mem = self.get(memory_id)
+        if mem is None:
+            return None
+        mem.usage_count = max(0, mem.usage_count + int(delta))
+        mem.last_used = _now_iso()
+        try:
+            self._write(mem)
+        except Exception:
+            return None
+        return mem
+
+    def record_feedback(
+        self,
+        memory_id: str,
+        *,
+        helpful: bool | None = None,
+    ) -> Memory | None:
+        """Apply a thumbs up/down to the memory counters.
+
+        - ``helpful=True``  → ``helpful_count += 1``
+        - ``helpful=False`` → ``unhelpful_count += 1``
+        - ``helpful=None``  → only bumps ``last_used`` (pure "I used this")
+
+        Also bumps ``last_used``. ``updated`` stays untouched so we don't
+        retrigger re-embedding on a thumbs. Returns the updated Memory,
+        or ``None`` if not on disk.
+        """
+        mem = self.get(memory_id)
+        if mem is None:
+            return None
+        if helpful is True:
+            mem.helpful_count = max(0, mem.helpful_count + 1)
+        elif helpful is False:
+            mem.unhelpful_count = max(0, mem.unhelpful_count + 1)
+        mem.last_used = _now_iso()
+        try:
+            self._write(mem)
+        except Exception:
+            return None
+        return mem
+
     def delete(self, memory_id: str) -> bool:
         path = self.path_for(memory_id)
         if not path.exists():
@@ -396,6 +524,10 @@ class VaultStorage:
             "contradicts",
             "related",
             "visible_to",
+            "usage_count",
+            "helpful_count",
+            "unhelpful_count",
+            "last_used",
         }
         # accept legacy "originSessionId" camelCase from existing files
         origin = meta.pop("origin_session_id", None) or meta.pop("originSessionId", None)
@@ -410,6 +542,9 @@ class VaultStorage:
             visible_to = [str(v) for v in visible_to_raw]
         else:
             visible_to = [str(visible_to_raw)]
+        # Usage counters: tolerate strings / missing / bogus types. We
+        # never want a bad ``usage_count: abc`` in a hand-edited file to
+        # break the reader — coerce, default to 0 on failure.
         return Memory(
             id=path.stem,
             name=str(meta.get("name") or path.stem),
@@ -425,6 +560,10 @@ class VaultStorage:
             contradicts=list(meta.get("contradicts") or []),
             related=[str(r) for r in (meta.get("related") or [])],
             visible_to=visible_to,
+            usage_count=_coerce_int(meta.get("usage_count")),
+            helpful_count=_coerce_int(meta.get("helpful_count")),
+            unhelpful_count=_coerce_int(meta.get("unhelpful_count")),
+            last_used=str(meta.get("last_used") or ""),
             extra=extra,
         )
 

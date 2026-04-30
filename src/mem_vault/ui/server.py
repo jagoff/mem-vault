@@ -259,6 +259,44 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
         # HTMX expects empty 200 → swaps the row out via hx-swap="outerHTML"
         return Response(status_code=200)
 
+    @app.post("/api/memories/{mem_id}/feedback", response_class=HTMLResponse)
+    async def feedback_memory(
+        request: Request,
+        mem_id: str,
+        helpful: str = Form(""),
+    ):
+        """Record a thumbs up/down on a memory from the UI.
+
+        ``helpful`` comes from the form as the string ``"true"`` / ``"false"``
+        / ``""``. We coerce to bool | None and delegate to
+        ``MemVaultService.feedback``; the response re-renders the feedback
+        chunk so HTMX can swap it in place without a page reload.
+        """
+        helpful_value: bool | None
+        val = helpful.strip().lower()
+        if val in {"true", "1", "yes", "up"}:
+            helpful_value = True
+        elif val in {"false", "0", "no", "down"}:
+            helpful_value = False
+        else:
+            helpful_value = None
+        payload = await service.feedback({"id": mem_id, "helpful": helpful_value})
+        if not payload.get("ok"):
+            raise HTTPException(
+                404 if payload.get("code") == "not_found" else 400,
+                payload.get("error", "feedback failed"),
+            )
+        # Fetch the memory again so the template has the full record —
+        # cheap (single .md read) and keeps the chunk self-contained.
+        mem_payload = await service.get({"id": mem_id})
+        if not mem_payload.get("ok"):
+            raise HTTPException(404, "memory vanished")
+        return templates.TemplateResponse(
+            request,
+            "_feedback.html",
+            {"m": mem_payload["memory"]},
+        )
+
     # ----- API: stats -------------------------------------------------------
 
     @app.get("/api/stats", response_class=HTMLResponse)

@@ -1,0 +1,48 @@
+{# Thumbs up/down + usage counters for one memory.
+   Included inline by _detail.html and swapped in place by the POST handler
+   at /api/memories/{id}/feedback. The hx-target on the buttons below
+   points back at the wrapping #feedback-{id} div so the whole chunk
+   re-renders (cheap) instead of individual counters (fragile). #}
+{% set prefix = request.scope.root_path %}
+{% set usage = m.usage_count or 0 %}
+{% set helpful = m.helpful_count or 0 %}
+{% set unhelpful = m.unhelpful_count or 0 %}
+{% set total_votes = helpful + unhelpful %}
+<div class="feedback-row">
+  <div class="feedback-stats" title="Usage signal gathered from search hits and citations in assistant responses.">
+    <span class="feedback-pill" title="Times this memory was returned by memory_search">
+      seen <strong>{{ usage }}</strong>
+    </span>
+    <span class="feedback-pill feedback-up" title="Thumbs up recorded via memory_feedback">
+      👍 <strong>{{ helpful }}</strong>
+    </span>
+    <span class="feedback-pill feedback-down" title="Thumbs down recorded via memory_feedback">
+      👎 <strong>{{ unhelpful }}</strong>
+    </span>
+    {% if m.last_used %}
+    <span class="feedback-pill feedback-used" title="{{ m.last_used }}">
+      last used {{ m.last_used | relative_time }}
+    </span>
+    {% endif %}
+  </div>
+  <div class="feedback-actions">
+    <button type="button"
+            class="thumb thumb-up"
+            title="Mark as helpful"
+            hx-post="{{ prefix }}/api/memories/{{ m.id }}/feedback"
+            hx-vals='{"helpful": "true"}'
+            hx-target="#feedback-{{ m.id }}"
+            hx-swap="innerHTML">
+      👍 helpful
+    </button>
+    <button type="button"
+            class="thumb thumb-down"
+            title="Mark as not helpful"
+            hx-post="{{ prefix }}/api/memories/{{ m.id }}/feedback"
+            hx-vals='{"helpful": "false"}'
+            hx-target="#feedback-{{ m.id }}"
+            hx-swap="innerHTML">
+      👎 not helpful
+    </button>
+  </div>
+</div>

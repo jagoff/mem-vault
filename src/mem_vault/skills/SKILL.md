@@ -27,7 +27,22 @@ Los tres triggers (`/mem_vault`, `/memory`, `/mv`) son **alias-equivalentes**: i
 | `timeline <project>` | línea temporal de memorias con tag `<project>` | "Verbos de descubrimiento" |
 | `lint` | memorias con problemas (sin tags, sin date, body vacío, etc.) | "Verbos de descubrimiento" |
 | `merge <id1> <id2>` | combina 2 memorias en 1 (PIDE confirmación) | "Verbos de descubrimiento" |
+| `feedback <id> up\|down` | thumbs up/down manual sobre memoria usada | "Feedback loop" |
 | cualquier otra cosa | search semántico | `mcp__mem-vault__memory_search({query: $ARGUMENTS, k: 5, threshold: 0.05})` |
+
+## Feedback loop — self-supervised search ranking
+
+Cada vez que `memory_search` devuelve un hit, el MCP server incrementa `usage_count` + `last_used` en el `.md` de esa memoria. El Stop hook además bumpéa `last_used` cuando detecta que el agent citó el id en la respuesta final (wikilink `[[id]]`, backtick `` `id` ``, o mención bare de ≥8 chars).
+
+**Thumbs explícitos** (opcional pero valiosos): cuando el user dice "esta memoria me sirvió" o vos usaste una concretamente, podés dejar señal positiva:
+
+```python
+mcp__mem-vault__memory_feedback({id: "<id>", helpful: true})   # 👍
+mcp__mem-vault__memory_feedback({id: "<id>", helpful: false})  # 👎
+mcp__mem-vault__memory_feedback({id: "<id>"})                  # plain "used" (no polarity)
+```
+
+**Efecto**: `memory_search` multiplica `score × (1 + 0.3 × helpful_ratio)` donde `helpful_ratio = max(0, (helpful − unhelpful) / total)`. Memorias con thumbs-up consistentes suben al top; el thumbs-down sólo neutraliza (no entierra). Configurable via `MEM_VAULT_USAGE_BOOST` (magnitud) y `MEM_VAULT_USAGE_BOOST_ENABLED`.
 
 ## Boot briefing — auto-summary al cargar el skill
 

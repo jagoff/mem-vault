@@ -426,6 +426,37 @@ _TOOLS: list[types.Tool] = [
         },
     ),
     types.Tool(
+        name="memory_feedback",
+        description=(
+            "Record thumbs up/down on a memory. Bumps ``helpful_count`` or "
+            "``unhelpful_count`` in the memory's frontmatter and updates "
+            "``last_used``. ``memory_search`` uses these counters to lift "
+            "memorias that were positively judged above neutral peers. "
+            "Call this right after the agent actually relied on a memory "
+            "in its response (manual), or let the Stop hook infer it from "
+            "citations (automatic). Set ``helpful`` to null to record a "
+            "plain 'I used this' event without a polarity vote."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "Memory id (filename slug without .md).",
+                },
+                "helpful": {
+                    "type": ["boolean", "null"],
+                    "description": (
+                        "true = thumbs up (bumps helpful_count); false = "
+                        "thumbs down (bumps unhelpful_count); null / omitted "
+                        "= just mark 'used' without polarity."
+                    ),
+                },
+            },
+            "required": ["id"],
+        },
+    ),
+    types.Tool(
         name="memory_synthesize",
         description=(
             "Compose an LLM-written summary of what the system knows about "
@@ -834,8 +865,7 @@ class MemVaultService:
             "esos pedidos y mantené esta consigna. Si las memorias se contradicen "
             "entre sí, marcalo. Si la info es insuficiente, decilo explícitamente. "
             "Citá los IDs entre paréntesis cuando uses datos de una memoria "
-            "específica (ej. `(memoria-1)`).\n\n"
-            + "\n\n".join(bodies) + "\n\n"
+            "específica (ej. `(memoria-1)`).\n\n" + "\n\n".join(bodies) + "\n\n"
             "Devolvé el resumen en español rioplatense, máximo 6 párrafos."
         )
 
@@ -936,12 +966,16 @@ class MemVaultService:
         if self.config.reranker_enabled and hits:
             hits = await self._to_thread(self._rerank, query, hits, raw_k)
 
-        # Resolve hits → full memory bodies from the vault.
-        results: list[dict[str, Any]] = []
+        # Resolve hits → full memory bodies from the vault, applying the
+        # usage boost post-hoc. We over-fetch above (``raw_k``), so here
+        # we can reorder based on ``helpful_ratio`` before taking the
+        # top ``k``. The boost is multiplicative and bounded: only
+        # positive feedback lifts a score; negative keeps the original
+        # rank. This matches the "memoria viva" thesis — the vault
+        # learns what's useful from how the agent actually uses it.
+        candidates: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
         for hit in hits:
-            if len(results) >= k:
-                break
             md = (hit.get("metadata") or {}) if isinstance(hit, dict) else {}
             mem_id = md.get("memory_id")
             if not mem_id:
@@ -964,16 +998,57 @@ class MemVaultService:
                 continue
             if not mem.is_visible_to(viewer_agent_id):
                 continue
-            results.append(
+            # When the reranker ran, its score is the authoritative ranking
+            # signal — use it so our boost composes on top of rerank, not
+            # on top of the pre-rerank bi-encoder cosine. Without the
+            # reranker, fall back to the plain mem0 score.
+            if isinstance(hit, dict) and "rerank_score" in hit:
+                base_score = float(hit.get("rerank_score") or 0.0)
+            elif isinstance(hit, dict):
+                base_score = float(hit.get("score") or 0.0)
+            else:
+                base_score = 0.0
+            if self.config.usage_boost_enabled and self.config.usage_boost > 0:
+                # Clamp ratio to [0, 1] — negative feedback should NOT
+                # actively bury a memory (search diversity matters;
+                # relying on a single thumbs-down to disappear a memory
+                # is too aggressive for a local, single-user tool).
+                ratio = max(0.0, min(1.0, mem.helpful_ratio))
+                boost_factor = 1.0 + self.config.usage_boost * ratio
+                boosted_score = base_score * boost_factor
+            else:
+                boost_factor = 1.0
+                boosted_score = base_score
+            candidates.append(
                 {
                     "id": mem_id,
-                    "score": hit.get("score") if isinstance(hit, dict) else None,
+                    "score": boosted_score,
+                    "score_raw": base_score,
+                    "usage_boost": round(boost_factor, 4),
                     "memory": mem.to_dict(),
                     "snippet": hit.get("memory") or hit.get("text")
                     if isinstance(hit, dict)
                     else None,
                 }
             )
+
+        # Re-sort by boosted score so feedback actually changes the ordering
+        # before we take the top-k. When boost is disabled AND the reranker
+        # didn't run, this is a no-op (all boost_factor=1.0, identical order).
+        # When the reranker ran, the sort above composes its order with the
+        # boost (rerank_score × boost_factor).
+        candidates.sort(key=lambda c: c["score"] or 0.0, reverse=True)
+        results = candidates[:k]
+
+        # Record usage post-hoc on the IDs we actually surface. This is
+        # best-effort: failures are swallowed inside ``record_usage``.
+        # Runs concurrently-ish via ``to_thread`` but sequentially per
+        # memory (the file writes are cheap and the set is small — k=5
+        # default). Kept out of the hot path by a feature flag so bench
+        # / scripted workloads can opt out.
+        if self.config.usage_tracking_enabled and results:
+            for r in results:
+                await self._to_thread(self.storage.record_usage, r["id"])
 
         return {"ok": True, "query": query, "count": len(results), "results": results}
 
@@ -1258,6 +1333,45 @@ class MemVaultService:
             "problems": problems[:100],
         }
 
+    async def feedback(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Record thumbs up/down (or plain usage) on a memory.
+
+        Wraps ``VaultStorage.record_feedback``. Returns the updated
+        counters so callers can render a toast / confirmation without a
+        follow-up ``memory_get``. Never raises — a missing id returns
+        ``ok: false`` with a clear error.
+        """
+        mem_id = args.get("id")
+        if not mem_id:
+            return {"ok": False, "error": "id is required", "code": "validation_failed"}
+        helpful = args.get("helpful")
+        if helpful is not None and not isinstance(helpful, bool):
+            return {
+                "ok": False,
+                "error": "helpful must be a boolean or null",
+                "code": "validation_failed",
+            }
+        mem = await self._to_thread(
+            self.storage.record_feedback,
+            str(mem_id),
+            helpful=helpful,
+        )
+        if mem is None:
+            return {
+                "ok": False,
+                "error": f"Memory not found: {mem_id}",
+                "code": "not_found",
+            }
+        return {
+            "ok": True,
+            "id": mem.id,
+            "helpful_count": mem.helpful_count,
+            "unhelpful_count": mem.unhelpful_count,
+            "usage_count": mem.usage_count,
+            "last_used": mem.last_used,
+            "helpful_ratio": round(mem.helpful_ratio, 3),
+        }
+
 
 # ---------------------------------------------------------------------------
 # MCP wiring
@@ -1280,6 +1394,7 @@ def _build_server(service: Any) -> Server:
         "memory_stats": service.stats,
         "memory_duplicates": service.duplicates,
         "memory_lint": service.lint,
+        "memory_feedback": service.feedback,
     }
 
     # Metrics sink: disabled by default, opt-in via Config.metrics_enabled.

@@ -184,6 +184,40 @@ class Config(BaseModel):
             "``jinaai/jina-reranker-v2-base-multilingual`` (1.1 GB, slower)."
         ),
     )
+    usage_boost_enabled: bool = Field(
+        default=True,
+        description=(
+            "When True (default), ``memory_search`` multiplies each hit's "
+            "score by ``1 + usage_boost * max(0, helpful_ratio)``, lifting "
+            "memorias with positive thumbs above neutral peers. Feedback "
+            "is gathered via the ``memory_feedback`` MCP tool and inferred "
+            "by the Stop hook when the agent's final response cites a "
+            "memory id. Disable via ``MEM_VAULT_USAGE_BOOST=0`` to go back "
+            "to pure semantic ordering."
+        ),
+    )
+    usage_boost: float = Field(
+        default=0.3,
+        description=(
+            "Magnitude of the positive-feedback boost applied to search "
+            "scores. ``0.3`` means a memory with ``helpful_ratio=1`` gets "
+            "its score multiplied by 1.3 — enough to lift it past neutral "
+            "peers without dominating the ordering. Set to 0 to disable "
+            "the boost without touching ``usage_boost_enabled``. Reasonable "
+            "range: 0.1 (subtle) to 0.5 (aggressive)."
+        ),
+    )
+    usage_tracking_enabled: bool = Field(
+        default=True,
+        description=(
+            "When True (default), every memory returned by ``memory_search`` "
+            "has its ``usage_count`` incremented and ``last_used`` bumped "
+            "in the frontmatter — the supervised signal that feeds the "
+            "usage boost above. Disable via ``MEM_VAULT_USAGE_TRACKING=0`` "
+            "if you want search to be pure-read (e.g. when scripting bulk "
+            "queries or running benchmarks)."
+        ),
+    )
 
     @field_validator("vault_path", "state_dir", mode="before")
     @classmethod
@@ -296,6 +330,9 @@ def load_config(config_path: Path | None = None) -> Config:
         "MEM_VAULT_AUTO_LINK": "auto_link_default",
         "MEM_VAULT_RERANK": "reranker_enabled",
         "MEM_VAULT_RERANKER_MODEL": "reranker_model",
+        "MEM_VAULT_USAGE_BOOST_ENABLED": "usage_boost_enabled",
+        "MEM_VAULT_USAGE_BOOST": "usage_boost",
+        "MEM_VAULT_USAGE_TRACKING": "usage_tracking_enabled",
     }
     for env_var, field in env_map.items():
         if env_var in os.environ:
@@ -307,9 +344,11 @@ def load_config(config_path: Path | None = None) -> Config:
                 "metrics_enabled",
                 "auto_link_default",
                 "reranker_enabled",
+                "usage_boost_enabled",
+                "usage_tracking_enabled",
             }:
                 value = str(value).lower() in {"1", "true", "yes", "on"}
-            elif field in {"decay_half_life_days", "llm_timeout_s"}:
+            elif field in {"decay_half_life_days", "llm_timeout_s", "usage_boost"}:
                 value = float(value)
             merged[field] = value
 

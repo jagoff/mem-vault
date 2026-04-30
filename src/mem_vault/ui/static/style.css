@@ -467,3 +467,54 @@ dialog.detail::backdrop {
   .meta-grid { grid-template-columns: 1fr; }
   .row-foot { font-size: 10px; }
 }
+
+/* ======= feedback chunk (thumbs + counters) ======= */
+
+.feedback-chunk {
+  margin-top: 16px;
+  padding: 12px 14px;
+  border-top: 1px solid var(--border-strong);
+}
+.feedback-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  justify-content: space-between;
+}
+.feedback-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.feedback-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 12px;
+  background: var(--bg-elev-2);
+  font-size: 12px;
+  color: var(--fg-muted);
+  border: 1px solid var(--border-strong);
+}
+.feedback-pill strong {
+  color: var(--fg);
+  font-weight: 600;
+}
+.feedback-pill.feedback-up { border-color: rgba(74, 222, 128, 0.4); }
+.feedback-pill.feedback-down { border-color: rgba(248, 113, 113, 0.4); }
+.feedback-actions { display: flex; gap: 8px; }
+.thumb {
+  cursor: pointer;
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elev-2);
+  color: var(--fg);
+  font-size: 13px;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.thumb:hover { background: var(--bg-elev-3); }
+.thumb.thumb-up:hover { border-color: rgba(74, 222, 128, 0.6); }
+.thumb.thumb-down:hover { border-color: rgba(248, 113, 113, 0.6); }

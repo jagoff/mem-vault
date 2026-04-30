@@ -55,4 +55,10 @@
       <button type="submit" class="primary">save</button>
     </div>
   </form>
+
+  {# Feedback counters + thumbs buttons. Outside the edit-form so the POST
+     doesn't conflict with the PATCH above (HTML forbids nested forms). #}
+  <div id="feedback-{{ m.id }}" class="feedback-chunk">
+    {% include "_feedback.html" %}
+  </div>
 </dialog>

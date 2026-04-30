@@ -6,6 +6,87 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — feedback loop + usage-based ranking (the "self-supervised memory")
+
+The vault now learns what's useful from how the agent actually uses it.
+Every `memory_search` hit leaves a breadcrumb; every thumbs flip turns the
+ranking dial. No training loop, no eval harness, no external signal —
+just the agent's own citation pattern feeding back into `memory_search`.
+
+**New `Memory` frontmatter fields** (all optional, back-compat):
+
+- `usage_count` — how many times this memory was returned by search.
+- `helpful_count` / `unhelpful_count` — explicit thumbs via
+  `memory_feedback` (or inferred via the Stop hook on citation).
+- `last_used` — ISO timestamp of the most recent retrieval / feedback
+  event, useful for dead-memory detection.
+
+Legacy `.md` files without these fields load with zeros — no migration
+needed. Frontmatter stays tight: zero-valued counters are omitted on
+write so pristine memorias don't sprout noise.
+
+**New `memory_feedback` MCP tool**:
+
+```python
+memory_feedback(id="<id>", helpful=True)   # 👍 helpful_count += 1
+memory_feedback(id="<id>", helpful=False)  # 👎 unhelpful_count += 1
+memory_feedback(id="<id>")                 # plain "used", no polarity
+```
+
+All three bump `last_used`. Storage writes bypass `updated` on purpose
+so the hash-based incremental reindex doesn't re-embed a memory just
+because its counter moved.
+
+**Usage boost in `memory_search`**:
+
+`score` is now multiplied by `1 + usage_boost * max(0, helpful_ratio)`
+where `helpful_ratio = (helpful - unhelpful) / max(1, helpful + unhelpful)`.
+Default boost magnitude is `0.3` — a memory with `helpful_ratio=1` gets
+its score lifted by 30 %, enough to flip a close neighbor below it.
+The clamp at 0 means a single thumbs-down doesn't actively bury a
+memory (clamp to a floor of 1.0, not below); it just neutralizes the
+boost. Over-fetch + reorder happens before the top-`k` cut so feedback
+genuinely changes ordering, not just scores.
+
+Composes with the cross-encoder reranker: when rerank is on, the
+rerank score is the base the boost multiplies (rerank × usage_boost),
+so both signals stack.
+
+Opt out via `MEM_VAULT_USAGE_BOOST_ENABLED=0` (keeps semantic-only
+order) or `MEM_VAULT_USAGE_BOOST=0` (mechanical disable). Per-search
+tracking can be disabled via `MEM_VAULT_USAGE_TRACKING=0` for
+benchmarking / scripted workloads that shouldn't pollute counters.
+
+**Auto-tracking in `memory_search`**: every returned hit has its
+`usage_count += 1` and `last_used` bumped post-hoc. Cheap (one atomic
+`.md` rewrite per hit), best-effort (failures swallowed), and produces
+the signal that feeds the boost above.
+
+**Auto-feedback via citation in the Stop hook**: `mem-vault hook-stop`
+now scans the agent's last response (via `transcript_path` for Claude
+Code, `payload["response"]` direct, or a fallback empty) for memory
+id citations in three forms:
+
+- `[[id]]` Obsidian wikilinks (strongest signal),
+- `` `id` `` inline code spans,
+- bare word-bounded mentions of ids ≥8 chars (pre-filtered against
+  the known-id set to keep false positives near zero).
+
+Each match calls `record_feedback(helpful=None)` — a neutral "this was
+used" bump, no polarity. Controlled via `MEM_VAULT_STOP_AUTO_FEEDBACK`
+(default on). The audit line in `sessions.log` now carries
+`auto_feedback=N` so you can grep how many memories got bumped per
+session.
+
+**Browser UI** picks up the same counters: the detail modal shows
+`seen N · 👍 N · 👎 N · last used Xh ago` pills and two action buttons
+that POST to `/api/memories/{id}/feedback` with `helpful=true|false`.
+HTMX swaps the counter chunk in place without reloading the page.
+
+**Tests**: 42 new unit tests across `test_feedback_loop.py` (storage
+counters + round-trip + service boost) and `test_hooks.py` (citation
+detection + auto-feedback wiring). Total suite grows from 343 → 385.
+
 ### Changed — bundled `SKILL.md` syncs with the in-use richer version
 
 The `SKILL.md` shipped via `mem-vault install-skill` (175 lines) was
