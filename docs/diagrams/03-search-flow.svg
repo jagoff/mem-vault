@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 700" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+  <defs>
+    <marker id="arrow3" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L9,3 L0,6 Z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <rect width="940" height="700" fill="#f9fafb"/>
+
+  <text x="470" y="32" text-anchor="middle" font-size="20" font-weight="600" fill="#0f172a">memory_search flow — hybrid retrieval</text>
+  <text x="470" y="52" text-anchor="middle" font-size="13" fill="#64748b">Dense + BM25 (opt-in) + RRF fusion + cross-encoder rerank (opt-in) + visibility + usage boost</text>
+
+  <!-- Input -->
+  <g>
+    <rect x="320" y="80" width="300" height="60" rx="8" fill="#e0e7ff" stroke="#6366f1" stroke-width="1.5"/>
+    <text x="470" y="105" text-anchor="middle" font-size="13" font-weight="600" fill="#312e81">memory_search tool call</text>
+    <text x="470" y="123" text-anchor="middle" font-size="10" fill="#4338ca" font-family="monospace">{query, k=5, threshold=0.1, type?, project?}</text>
+  </g>
+  <line x1="470" y1="140" x2="470" y2="170" stroke="#475569" stroke-width="2" marker-end="url(#arrow3)"/>
+
+  <!-- Filter resolution -->
+  <g>
+    <rect x="320" y="170" width="300" height="58" rx="8" fill="white" stroke="#1f2937"/>
+    <text x="470" y="193" text-anchor="middle" font-size="12" font-weight="600" fill="#0f172a">resolve filters</text>
+    <text x="470" y="210" text-anchor="middle" font-size="10" fill="#64748b">project: explicit > Config.project_default · type filter</text>
+  </g>
+  <line x1="470" y1="228" x2="470" y2="258" stroke="#475569" stroke-width="2" marker-end="url(#arrow3)"/>
+
+  <!-- Branch: hybrid? -->
+  <g>
+    <rect x="320" y="258" width="300" height="48" rx="8" fill="white" stroke="#1f2937"/>
+    <text x="470" y="280" text-anchor="middle" font-size="12" font-weight="600" fill="#0f172a">¿Config.hybrid_enabled?</text>
+    <text x="470" y="296" text-anchor="middle" font-size="10" fill="#64748b">env: MEM_VAULT_HYBRID=1 (necesita extra `hybrid`)</text>
+  </g>
+
+  <!-- Two branches -->
+  <line x1="320" y1="295" x2="160" y2="335" stroke="#475569" stroke-width="2" marker-end="url(#arrow3)"/>
+  <text x="195" y="320" text-anchor="middle" font-size="11" fill="#475569" font-style="italic">on</text>
+  <line x1="620" y1="295" x2="780" y2="335" stroke="#475569" stroke-width="2" marker-end="url(#arrow3)"/>
+  <text x="745" y="320" text-anchor="middle" font-size="11" fill="#475569" font-style="italic">off (default)</text>
+
+  <!-- Hybrid path -->
+  <g>
+    <rect x="40" y="335" width="240" height="160" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+    <text x="160" y="358" text-anchor="middle" font-size="12" font-weight="600" fill="#1e3a8a">HybridRetriever</text>
+    <line x1="55" y1="368" x2="265" y2="368" stroke="#2563eb" stroke-width="0.5"/>
+
+    <text x="160" y="384" text-anchor="middle" font-size="10" font-weight="600" fill="#1d4ed8">1. Dense kNN over Qdrant</text>
+    <text x="160" y="398" text-anchor="middle" font-size="9" fill="#1e40af">over-fetch 3× k</text>
+
+    <text x="160" y="416" text-anchor="middle" font-size="10" font-weight="600" fill="#1d4ed8">2. BM25 over corpus</text>
+    <text x="160" y="430" text-anchor="middle" font-size="9" fill="#1e40af">k1, b configurables</text>
+
+    <text x="160" y="448" text-anchor="middle" font-size="10" font-weight="600" fill="#1d4ed8">3. Reciprocal Rank Fusion</text>
+    <text x="160" y="462" text-anchor="middle" font-size="9" fill="#1e40af">score = Σ 1 / (k + rank_i)</text>
+
+    <text x="160" y="482" text-anchor="middle" font-size="9" fill="#3730a3" font-style="italic">cache invalidado en cada save</text>
+  </g>
+
+  <!-- Dense-only path -->
+  <g>
+    <rect x="660" y="335" width="240" height="160" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+    <text x="780" y="358" text-anchor="middle" font-size="12" font-weight="600" fill="#1e3a8a">Dense-only (Qdrant kNN)</text>
+    <line x1="675" y1="368" x2="885" y2="368" stroke="#2563eb" stroke-width="0.5"/>
+
+    <text x="780" y="386" text-anchor="middle" font-size="10" fill="#1d4ed8">1. embed query via bge-m3</text>
+    <text x="780" y="402" text-anchor="middle" font-size="9" fill="#1e40af">→ 1024-dim vector</text>
+
+    <text x="780" y="420" text-anchor="middle" font-size="10" fill="#1d4ed8">2. Qdrant cosine search</text>
+    <text x="780" y="436" text-anchor="middle" font-size="9" fill="#1e40af">over-fetch 3× k</text>
+
+    <text x="780" y="454" text-anchor="middle" font-size="10" fill="#1d4ed8">3. ranked by similarity</text>
+    <text x="780" y="470" text-anchor="middle" font-size="9" fill="#1e40af">threshold filter aplica</text>
+
+    <text x="780" y="487" text-anchor="middle" font-size="9" fill="#3730a3" font-style="italic">opcional: payload filters server-side</text>
+  </g>
+
+  <!-- Both lead down to filters -->
+  <line x1="160" y1="495" x2="320" y2="540" stroke="#475569" stroke-width="2" marker-end="url(#arrow3)"/>
+  <line x1="780" y1="495" x2="620" y2="540" stroke="#475569" stroke-width="2" marker-end="url(#arrow3)"/>
+
+  <!-- Visibility filter (post-search) -->
+  <g>
+    <rect x="320" y="540" width="300" height="60" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+    <text x="470" y="563" text-anchor="middle" font-size="12" font-weight="600" fill="#78350f">visibility filter (post-fetch)</text>
+    <text x="470" y="580" text-anchor="middle" font-size="10" fill="#92400e">cargar .md → drop si NOT mem.is_visible_to(viewer)</text>
+    <text x="470" y="594" text-anchor="middle" font-size="9" fill="#a16207" font-style="italic">no se puede pre-filtrar por visibility en Qdrant (privacy boundary en disco)</text>
+  </g>
+  <line x1="470" y1="600" x2="470" y2="620" stroke="#475569" stroke-width="2" marker-end="url(#arrow3)"/>
+
+  <!-- Reranker (opt-in) -->
+  <g>
+    <rect x="320" y="620" width="300" height="62" rx="8" fill="#dcfce7" stroke="#15803d"/>
+    <text x="470" y="643" text-anchor="middle" font-size="12" font-weight="600" fill="#14532d">opcional: cross-encoder rerank</text>
+    <text x="470" y="660" text-anchor="middle" font-size="10" fill="#166534">env MEM_VAULT_RERANK=1 · model BAAI/bge-reranker-v2-m3</text>
+    <text x="470" y="674" text-anchor="middle" font-size="9" fill="#15803d" font-style="italic">re-puntua top-k contra query (más caro, mejor precisión)</text>
+  </g>
+
+  <!-- Output -->
+  <g>
+    <rect x="660" y="540" width="240" height="142" rx="8" fill="white" stroke="#1f2937" stroke-width="1.5"/>
+    <text x="780" y="562" text-anchor="middle" font-size="12" font-weight="600" fill="#0f172a">final scoring</text>
+    <line x1="675" y1="572" x2="885" y2="572" stroke="#1f2937" stroke-width="0.3"/>
+    <text x="780" y="588" text-anchor="middle" font-size="10" fill="#1f2937">score_raw × usage_boost</text>
+    <text x="780" y="602" text-anchor="middle" font-size="9" fill="#475569">(memorias usadas pesan más)</text>
+
+    <text x="780" y="624" text-anchor="middle" font-size="10" font-weight="600" fill="#0f172a">return top-k</text>
+    <text x="780" y="640" text-anchor="middle" font-size="9" fill="#475569">{id, score, score_raw,</text>
+    <text x="780" y="652" text-anchor="middle" font-size="9" fill="#475569">usage_boost, memory{...}, snippet}</text>
+    <text x="780" y="670" text-anchor="middle" font-size="9" fill="#3730a3" font-style="italic">↑ usado por skill /mv</text>
+  </g>
+  <line x1="620" y1="650" x2="660" y2="615" stroke="#475569" stroke-width="2" marker-end="url(#arrow3)"/>
+</svg>

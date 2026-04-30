@@ -1,0 +1,108 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 720" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+  <defs>
+    <marker id="arrow2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L9,3 L0,6 Z" fill="#475569"/>
+    </marker>
+    <marker id="arrow-warn" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L9,3 L0,6 Z" fill="#b45309"/>
+    </marker>
+  </defs>
+
+  <rect width="940" height="720" fill="#f9fafb"/>
+
+  <text x="470" y="32" text-anchor="middle" font-size="20" font-weight="600" fill="#0f172a">memory_save flow</text>
+  <text x="470" y="52" text-anchor="middle" font-size="13" fill="#64748b">Markdown atómico + redacción + LLM extract opt-in + Qdrant + auto-link + auto-contradict</text>
+
+  <!-- 1. Tool call -->
+  <g>
+    <rect x="320" y="80" width="300" height="60" rx="8" fill="#e0e7ff" stroke="#6366f1" stroke-width="1.5"/>
+    <text x="470" y="105" text-anchor="middle" font-size="13" font-weight="600" fill="#312e81">memory_save tool call</text>
+    <text x="470" y="123" text-anchor="middle" font-size="11" fill="#4338ca" font-family="monospace">{content, title?, tags?, type?, auto_extract?, ...}</text>
+  </g>
+  <line x1="470" y1="140" x2="470" y2="170" stroke="#475569" stroke-width="2" marker-end="url(#arrow2)"/>
+
+  <!-- 2. Validation -->
+  <g>
+    <rect x="320" y="170" width="300" height="56" rx="8" fill="white" stroke="#1f2937" stroke-width="1.5"/>
+    <text x="470" y="193" text-anchor="middle" font-size="12" font-weight="600" fill="#0f172a">_check_content_size + visibility shorthand</text>
+    <text x="470" y="212" text-anchor="middle" font-size="10" fill="#64748b">"private" → [] · "public" → ["*"] · default ["*"]</text>
+  </g>
+  <line x1="470" y1="226" x2="470" y2="256" stroke="#475569" stroke-width="2" marker-end="url(#arrow2)"/>
+
+  <!-- 3. Redaction (security) -->
+  <g>
+    <rect x="320" y="256" width="300" height="62" rx="8" fill="#fee2e2" stroke="#dc2626" stroke-width="1.5"/>
+    <text x="470" y="278" text-anchor="middle" font-size="12" font-weight="600" fill="#7f1d1d">redact() — secret scrubber</text>
+    <text x="470" y="296" text-anchor="middle" font-size="10" fill="#991b1b">AWS keys · GitHub tokens · sk-ant-* · OpenAI · ssh keys</text>
+    <text x="470" y="310" text-anchor="middle" font-size="10" fill="#991b1b" font-style="italic">→ [REDACTED:&lt;kind&gt;] (count returned)</text>
+  </g>
+  <line x1="470" y1="318" x2="470" y2="348" stroke="#475569" stroke-width="2" marker-end="url(#arrow2)"/>
+
+  <!-- 4. Branch: auto_extract or literal -->
+  <g>
+    <rect x="320" y="348" width="300" height="56" rx="8" fill="white" stroke="#1f2937" stroke-width="1.5"/>
+    <text x="470" y="370" text-anchor="middle" font-size="12" font-weight="600" fill="#0f172a">¿auto_extract=true?</text>
+    <text x="470" y="388" text-anchor="middle" font-size="10" fill="#64748b">decide entre LLM-extracted facts vs literal body</text>
+  </g>
+
+  <!-- branches -->
+  <line x1="320" y1="390" x2="160" y2="430" stroke="#475569" stroke-width="2" marker-end="url(#arrow2)"/>
+  <text x="200" y="412" text-anchor="middle" font-size="11" fill="#475569" font-style="italic">true</text>
+  <line x1="620" y1="390" x2="780" y2="430" stroke="#475569" stroke-width="2" marker-end="url(#arrow2)"/>
+  <text x="730" y="412" text-anchor="middle" font-size="11" fill="#475569" font-style="italic">false (default)</text>
+
+  <!-- 5a. Ollama LLM extract -->
+  <g>
+    <rect x="40" y="430" width="240" height="80" rx="8" fill="#dcfce7" stroke="#15803d" stroke-width="1.5"/>
+    <text x="160" y="453" text-anchor="middle" font-size="12" font-weight="600" fill="#14532d">Ollama LLM extract</text>
+    <text x="160" y="470" text-anchor="middle" font-size="10" fill="#166534">qwen2.5:3b → canonical facts</text>
+    <text x="160" y="485" text-anchor="middle" font-size="10" fill="#166534">+ semantic dedup vs existentes</text>
+    <text x="160" y="502" text-anchor="middle" font-size="9" fill="#15803d" font-style="italic">timeout 60s · circuit breaker</text>
+  </g>
+
+  <!-- 5b. Literal -->
+  <g>
+    <rect x="660" y="430" width="240" height="80" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+    <text x="780" y="453" text-anchor="middle" font-size="12" font-weight="600" fill="#78350f">storage.save(content)</text>
+    <text x="780" y="471" text-anchor="middle" font-size="10" fill="#92400e">cuerpo literal + frontmatter</text>
+    <text x="780" y="488" text-anchor="middle" font-size="10" fill="#92400e">atomic write (.tmp + rename)</text>
+    <text x="780" y="503" text-anchor="middle" font-size="9" fill="#a16207" font-family="monospace">99-AI/memory/&lt;slug&gt;.md</text>
+  </g>
+
+  <!-- Both lead to indexing -->
+  <line x1="160" y1="510" x2="320" y2="558" stroke="#475569" stroke-width="2" marker-end="url(#arrow2)"/>
+  <line x1="780" y1="510" x2="620" y2="558" stroke="#475569" stroke-width="2" marker-end="url(#arrow2)"/>
+
+  <!-- 6. Qdrant index -->
+  <g>
+    <rect x="320" y="558" width="300" height="62" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+    <text x="470" y="580" text-anchor="middle" font-size="12" font-weight="600" fill="#1e3a8a">VectorIndex.add()</text>
+    <text x="470" y="598" text-anchor="middle" font-size="10" fill="#1d4ed8">embed via bge-m3 → 1024-dim → Qdrant</text>
+    <text x="470" y="612" text-anchor="middle" font-size="10" fill="#1e40af">payload: id, type, tags, content_hash, project</text>
+  </g>
+
+  <!-- 7. Auto-link / Auto-contradict (parallel post-write paths) -->
+  <line x1="320" y1="608" x2="80" y2="660" stroke="#b45309" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow-warn)"/>
+  <line x1="620" y1="608" x2="860" y2="660" stroke="#b45309" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow-warn)"/>
+
+  <g>
+    <rect x="40" y="660" width="280" height="44" rx="6" fill="#fef3c7" stroke="#b45309"/>
+    <text x="180" y="682" text-anchor="middle" font-size="11" font-weight="600" fill="#78350f">auto_link (default ON)</text>
+    <text x="180" y="697" text-anchor="middle" font-size="9" fill="#92400e">search top-5 similares → stamp [[wikilinks]] en frontmatter</text>
+  </g>
+
+  <g>
+    <rect x="620" y="660" width="280" height="44" rx="6" fill="#fef3c7" stroke="#b45309"/>
+    <text x="760" y="682" text-anchor="middle" font-size="11" font-weight="600" fill="#78350f">auto_contradict (opt-in)</text>
+    <text x="760" y="697" text-anchor="middle" font-size="9" fill="#92400e">LLM check vs top-5 → stamp contradicts: en frontmatter</text>
+  </g>
+
+  <!-- Side: invalidation -->
+  <g>
+    <rect x="40" y="556" width="240" height="68" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-dasharray="4,3"/>
+    <text x="160" y="578" text-anchor="middle" font-size="11" font-weight="600" fill="#334155">post-write invalidations</text>
+    <text x="160" y="595" text-anchor="middle" font-size="10" fill="#475569">_invalidate_hybrid()</text>
+    <text x="160" y="612" text-anchor="middle" font-size="10" fill="#475569">_invalidate_corpus_cache()</text>
+  </g>
+  <line x1="320" y1="590" x2="280" y2="590" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="3,3"/>
+</svg>

@@ -41,6 +41,9 @@ inside your Obsidian vault (so iCloud syncs it, Obsidian indexes it, and you
 can edit it by hand), *and* it's embedded into a local Qdrant collection so
 agents can query it semantically.
 
+> **📐 Want the deep-dive?** Architecture, data flow, and design decisions
+> with diagrams: [`docs/architecture.md`](docs/architecture.md).
+
 ## Install
 
 Requires Python 3.11+ and a running [Ollama](https://ollama.com/download).
