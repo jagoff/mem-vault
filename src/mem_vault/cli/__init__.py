@@ -41,6 +41,9 @@ from mem_vault.cli import (
     doctor as _doctor_mod,
 )
 from mem_vault.cli import (
+    eval_cmd as _eval_mod,
+)
+from mem_vault.cli import (
     export_cmd as _export_mod,
 )
 from mem_vault.cli import (
@@ -87,6 +90,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _import_engram_mod.add_subparser(sub)
     _install_skill_mod.add_subparser(sub)
     _doctor_mod.add_subparser(sub)
+    _eval_mod.add_subparser(sub)
 
     return parser
 
@@ -138,6 +142,9 @@ def main() -> None:
 
     if cmd == "doctor":
         sys.exit(_doctor_mod.run(args))
+
+    if cmd == "eval":
+        sys.exit(asyncio.run(_eval_mod.run(args)))
 
     if cmd in {"hook-sessionstart", "hook-userprompt", "hook-stop"}:
         _hooks_mod.run(cmd)

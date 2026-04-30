@@ -398,6 +398,22 @@ def _check_hybrid(cfg: Any, report: _Report) -> None:
         )
 
 
+def _check_project_scope(cfg: Any, report: _Report) -> None:
+    """Surface the active project scope (if any) so the user knows what they're filtering on."""
+    if cfg.project_default:
+        report.add(
+            "project",
+            "ok",
+            f"scope={cfg.project_default} (searches filter to this project by default)",
+        )
+    else:
+        report.add(
+            "project",
+            "ok",
+            "no default scope (global search; set MEM_VAULT_PROJECT=<name> to scope)",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Printing
 # ---------------------------------------------------------------------------
@@ -498,6 +514,7 @@ def run(args: argparse.Namespace) -> int:
     _check_extras(cfg, report)
     _check_feedback_loop(cfg, report)
     _check_hybrid(cfg, report)
+    _check_project_scope(cfg, report)
 
     _render(report)
     return report.exit_code()

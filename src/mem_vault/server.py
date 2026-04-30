@@ -329,6 +329,17 @@ _TOOLS: list[types.Tool] = [
                         {"type": "array", "items": {"type": "string"}},
                     ],
                 },
+                "project": {
+                    "type": "string",
+                    "description": (
+                        "Project scope stamped in the index metadata. "
+                        "``memory_search`` uses it to filter results to "
+                        "memorias from the same project — faster than a "
+                        "tag filter because Qdrant indexes the payload. "
+                        "When omitted, inferred from the first "
+                        "``project:X`` tag or ``Config.project_default``."
+                    ),
+                },
                 "user_id": {"type": "string"},
                 "agent_id": {"type": "string"},
             },
@@ -358,6 +369,14 @@ _TOOLS: list[types.Tool] = [
                     "type": "number",
                     "default": 0.1,
                     "description": "Minimum similarity score (0-1). Lower = more lenient.",
+                },
+                "project": {
+                    "type": "string",
+                    "description": (
+                        "Filter to memorias stamped with this project scope. "
+                        "Pass ``*`` (or empty string) to bypass "
+                        "``Config.project_default`` and search globally."
+                    ),
                 },
             },
             "required": ["query"],
@@ -959,13 +978,32 @@ class MemVaultService:
         )
         self._invalidate_hybrid()
 
+        # Derive the project scope: explicit ``project`` arg > the first
+        # ``project:X`` tag > ``config.project_default``. Stamped into the
+        # Qdrant metadata so ``memory_search`` can filter on it without
+        # scanning tag lists (Qdrant payload index is faster than the
+        # array-contains filter we'd use for tags).
+        explicit_project = args.get("project")
+        project_scope: str | None = None
+        if isinstance(explicit_project, str) and explicit_project.strip():
+            project_scope = explicit_project.strip()
+        else:
+            for t in tags:
+                if isinstance(t, str) and t.startswith("project:"):
+                    project_scope = t.split(":", 1)[1].strip() or None
+                    break
+            if project_scope is None:
+                project_scope = self.config.project_default
+
         index_results: list[dict[str, Any]] = []
-        index_metadata = {
+        index_metadata: dict[str, Any] = {
             "memory_id": mem.id,
             "type": mtype,
             "tags": tags,
             "content_hash": compute_content_hash(content),
         }
+        if project_scope:
+            index_metadata["project"] = project_scope
         try:
             index_results = await self._index_call(
                 self.index.add,
@@ -1254,6 +1292,17 @@ class MemVaultService:
         filters: dict[str, Any] = {}
         if mtype:
             filters["type"] = mtype
+        # Project scope filter: prefer explicit arg, fall back to config
+        # default. An explicit ``project: ""`` or ``"*"`` disables the
+        # filter even when ``project_default`` is set — useful for
+        # global searches from a scoped session.
+        project_arg = args.get("project")
+        if project_arg is None:
+            project_arg = self.config.project_default
+        if isinstance(project_arg, str):
+            project_arg = project_arg.strip()
+            if project_arg and project_arg != "*":
+                filters["project"] = project_arg
 
         # Over-fetch so visibility filtering doesn't leave us short. When
         # reranking is enabled, fetch even more so the cross-encoder has

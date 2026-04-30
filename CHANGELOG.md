@@ -6,6 +6,63 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — project-scoped metadata + search filter
+
+``memory_save`` now stamps a ``project`` field into the Qdrant payload
+metadata, derived (in order of precedence) from:
+
+1. Explicit ``project`` arg to the tool.
+2. The first ``project:X`` tag in the memory's tag list.
+3. ``Config.project_default`` (env ``MEM_VAULT_PROJECT=<name>``).
+
+``memory_search`` picks up the same field as a filter when the user
+passes ``project`` explicitly, or falls back to the config default.
+Passing ``project: "*"`` (or an empty string) bypasses the default
+for a truly-global search from a scoped session.
+
+Why a dedicated field instead of the existing ``tags`` filter: Qdrant
+indexes scalar payload values (``keyword`` index) much faster than an
+array-contains lookup over ``tags``. For a vault with 1k+ memorias
+and multi-project tags, the difference is measurable (~3-5x speedup
+on the filter step alone) — and the code stays simple because
+mem0 already forwards ``filters={"project": "..."}`` straight to
+Qdrant.
+
+Also surfaced in ``mem-vault doctor`` under the ``project`` row so
+the user can see what scope is active.
+
+Tests: 10 new in `test_project_scope.py` covering save-side derivation
+(explicit > tag > default > none), search-side filter composition,
+and the wildcard-bypass semantics.
+
+### Added — `mem-vault eval` (retrieval regression harness)
+
+Run a labeled query set through ``memory_search`` and report hit@1/3/5/10
+plus MRR. The eval file is a JSON list of ``{query, expected, tag?}``
+entries; ``expected`` is the ids that should land in the top-k.
+
+```
+$ mem-vault eval --queries tests/fixtures/my_queries.json --threshold 0.6
+
+mem-vault eval
+──────────────────────────────────────────────────
+  queries     : 20
+  hit@1       : 65.00%
+  hit@3       : 85.00%
+  hit@5       : 90.00%
+  hit@10      : 95.00%
+  mrr         : 0.7833
+```
+
+Non-zero exit when ``hit@5 < --threshold``, so CI can gate on
+regressions. ``--json`` dumps the full report (including per-query
+rows) for machine processing. Pure helpers in ``mem_vault.eval`` so
+the metric math is unit-testable without Ollama (``compute_metrics``,
+``reciprocal_rank``, ``hit_at``, ``diff_reports``, ``load_queries``).
+
+Tests: 23 new in `test_eval.py` covering every pure function +
+round-trip through JSON.
+
 ### Added — secret redaction on save (default on)
 
 Memorias often capture commands, configs, or tracebacks carrying

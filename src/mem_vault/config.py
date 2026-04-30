@@ -283,6 +283,19 @@ class Config(BaseModel):
             "the vault likely syncs to iCloud/Dropbox/git)."
         ),
     )
+    project_default: str | None = Field(
+        default=None,
+        description=(
+            "Default project scope stamped into every memory's index "
+            "metadata and used as the implicit filter for ``memory_search`` "
+            "when the caller doesn't pass ``project``. Typically derived "
+            "from the current repo name (``devin-config``, ``obsidian-rag``, "
+            "``mem-vault``, …). When unset, mem-vault falls back to the "
+            "existing tag-based scope (``project:<leaf>``). Set via "
+            "``MEM_VAULT_PROJECT=mem-vault`` in the MCP server env to "
+            "scope the whole session to one repo."
+        ),
+    )
 
     @field_validator("vault_path", "state_dir", mode="before")
     @classmethod
@@ -404,6 +417,7 @@ def load_config(config_path: Path | None = None) -> Config:
         "MEM_VAULT_HYBRID_BM25_B": "hybrid_bm25_b",
         "MEM_VAULT_AUTO_CONTRADICT": "auto_contradict_default",
         "MEM_VAULT_REDACT_SECRETS": "redact_secrets",
+        "MEM_VAULT_PROJECT": "project_default",
     }
     for env_var, field in env_map.items():
         if env_var in os.environ:
