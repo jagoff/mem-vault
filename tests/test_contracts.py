@@ -33,7 +33,6 @@ from mem_vault.config import ENV_TO_CONFIG_FIELD, Config
 from mem_vault.remote import RemoteMemVaultService
 from mem_vault.server import _HANDLER_OVERRIDES, _TOOLS, MemVaultService
 
-
 # ---------------------------------------------------------------------------
 # Contract 1: every _TOOLS entry has a callable on BOTH service classes
 # ---------------------------------------------------------------------------
@@ -58,9 +57,7 @@ def test_local_service_implements_every_tool():
         fn = getattr(MemVaultService, attr, None)
         if fn is None or not callable(fn):
             missing.append(f"{tool.name} → MemVaultService.{attr}")
-    assert not missing, (
-        f"Tools without a MemVaultService handler:\n  - " + "\n  - ".join(missing)
-    )
+    assert not missing, "Tools without a MemVaultService handler:\n  - " + "\n  - ".join(missing)
 
 
 def test_remote_service_implements_every_tool():
@@ -77,8 +74,8 @@ def test_remote_service_implements_every_tool():
         fn = getattr(svc, attr, None)
         if fn is None or not callable(fn):
             missing.append(f"{tool.name} → RemoteMemVaultService.{attr}")
-    assert not missing, (
-        f"Tools without a RemoteMemVaultService handler:\n  - " + "\n  - ".join(missing)
+    assert not missing, "Tools without a RemoteMemVaultService handler:\n  - " + "\n  - ".join(
+        missing
     )
 
 
@@ -114,7 +111,7 @@ def test_no_orphan_methods_in_local_service():
             if inspect.iscoroutinefunction(attr):
                 orphans.append(name)
     assert not orphans, (
-        f"MemVaultService methods without a matching _TOOLS entry:\n  - "
+        "MemVaultService methods without a matching _TOOLS entry:\n  - "
         + "\n  - ".join(orphans)
         + "\n\nEither declare them in _TOOLS, prefix with `_`, or add to NOT_A_TOOL."
     )
@@ -182,9 +179,7 @@ def test_memory_create_fields_are_consumed_by_save():
         for name in MemoryCreate.model_fields
         if f'"{name}"' not in source and f"'{name}'" not in source
     ]
-    assert not missing, (
-        f"MemoryCreate fields not referenced in MemVaultService.save: {missing}"
-    )
+    assert not missing, f"MemoryCreate fields not referenced in MemVaultService.save: {missing}"
 
 
 def test_memory_update_fields_are_consumed_by_update():
@@ -197,9 +192,7 @@ def test_memory_update_fields_are_consumed_by_update():
         for name in MemoryUpdate.model_fields
         if f'"{name}"' not in source and f"'{name}'" not in source
     ]
-    assert not missing, (
-        f"MemoryUpdate fields not referenced in MemVaultService.update: {missing}"
-    )
+    assert not missing, f"MemoryUpdate fields not referenced in MemVaultService.update: {missing}"
 
 
 def test_synthesize_request_fields_are_consumed():
@@ -212,9 +205,7 @@ def test_synthesize_request_fields_are_consumed():
         for name in SynthesizeRequest.model_fields
         if f'"{name}"' not in source and f"'{name}'" not in source
     ]
-    assert not missing, (
-        f"SynthesizeRequest fields not referenced in synthesize: {missing}"
-    )
+    assert not missing, f"SynthesizeRequest fields not referenced in synthesize: {missing}"
 
 
 def test_derive_metadata_request_fields_are_consumed():
@@ -226,9 +217,7 @@ def test_derive_metadata_request_fields_are_consumed():
         for name in DeriveMetadataRequest.model_fields
         if f'"{name}"' not in source and f"'{name}'" not in source
     ]
-    assert not missing, (
-        f"DeriveMetadataRequest fields not referenced: {missing}"
-    )
+    assert not missing, f"DeriveMetadataRequest fields not referenced: {missing}"
 
 
 def test_feedback_request_fields_are_consumed():

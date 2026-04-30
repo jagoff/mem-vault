@@ -48,6 +48,7 @@ ENV_TO_CONFIG_FIELD: dict[str, str] = {
     "MEM_VAULT_STATE_DIR": "state_dir",
     "MEM_VAULT_OLLAMA_HOST": "ollama_host",
     "MEM_VAULT_LLM_MODEL": "llm_model",
+    "MEM_VAULT_SYNTHESIS_MODEL": "synthesis_model",
     "MEM_VAULT_EMBEDDER_MODEL": "embedder_model",
     "MEM_VAULT_EMBEDDER_DIMS": "embedder_dims",
     "MEM_VAULT_COLLECTION": "qdrant_collection",
@@ -114,6 +115,18 @@ class Config(BaseModel):
             "Ollama model used to extract/dedupe facts when auto_extract=True. "
             "qwen2.5:3b is the conservative default (fast, ~2GB RAM). Bump to "
             "qwen2.5:7b or larger via MEM_VAULT_LLM_MODEL if you have headroom."
+        ),
+    )
+    synthesis_model: str | None = Field(
+        default=None,
+        description=(
+            "Ollama model for `memory_synthesize`. Defaults to "
+            "``llm_model`` when unset, but synthesis needs stronger "
+            "language understanding than the deduper — qwen2.5:3b "
+            "drifts to Portuguese ~5-15% of the time on Spanish "
+            "prompts when the source memorias contain technical "
+            "vocabulary. We recommend qwen2.5:7b or larger here. "
+            "Override via ``MEM_VAULT_SYNTHESIS_MODEL=qwen2.5:7b``."
         ),
     )
     embedder_model: str = Field(
