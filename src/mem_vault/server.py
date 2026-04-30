@@ -28,7 +28,7 @@ import mcp.types as types
 from mcp.server import Server
 
 from mem_vault.config import Config, load_config
-from mem_vault.index import CircuitBreakerOpenError, VectorIndex
+from mem_vault.index import CircuitBreakerOpenError, VectorIndex, compute_content_hash
 from mem_vault.storage import VaultStorage, slugify
 
 logger = logging.getLogger("mem_vault.server")
@@ -302,7 +302,12 @@ class MemVaultService:
                 content,
                 user_id=user_id,
                 agent_id=agent_id,
-                metadata={"memory_id": mem.id, "type": mtype, "tags": tags},
+                metadata={
+                    "memory_id": mem.id,
+                    "type": mtype,
+                    "tags": tags,
+                    "content_hash": compute_content_hash(content),
+                },
                 auto_extract=auto_extract,
             )
         except _LLMTimeoutError as exc:
@@ -465,7 +470,12 @@ class MemVaultService:
                     mem.body,
                     user_id=user_id,
                     agent_id=self.config.agent_id,
-                    metadata={"memory_id": mem.id, "type": mem.type, "tags": mem.tags},
+                    metadata={
+                        "memory_id": mem.id,
+                        "type": mem.type,
+                        "tags": mem.tags,
+                        "content_hash": compute_content_hash(mem.body),
+                    },
                     auto_extract=False,
                 )
             except (_LLMTimeoutError, CircuitBreakerOpenError) as exc:

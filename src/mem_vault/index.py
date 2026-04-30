@@ -17,6 +17,7 @@ Both paths run on localhost: zero API keys, zero outbound calls.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from datetime import UTC, datetime
@@ -27,6 +28,25 @@ from mem0 import Memory as Mem0Memory
 from mem_vault.config import Config
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Content hashing (used for incremental reindex skipping)
+# ---------------------------------------------------------------------------
+
+
+def compute_content_hash(content: str) -> str:
+    """Stable digest used to detect whether a memory body has changed.
+
+    We use the first 16 hex chars of SHA-256 — short enough to compare
+    quickly in metadata payloads, long enough to make collisions a non-
+    issue for a single user's memory corpus (~64 bits of entropy is
+    far above the ~10⁵ memory ceiling we'd plausibly see).
+
+    Whitespace at the edges is stripped before hashing so a trailing
+    newline added by an editor doesn't cause an unnecessary re-embed.
+    """
+    return hashlib.sha256(content.strip().encode("utf-8")).hexdigest()[:16]
 
 
 class CircuitBreakerOpenError(RuntimeError):
@@ -287,20 +307,28 @@ class VectorIndex:
 
         return hits
 
-    def delete_by_metadata(self, key: str, value: str, user_id: str) -> int:
-        """Delete every mem0 entry whose metadata[key] == value. Returns count."""
+    def get_by_metadata(self, key: str, value: str, user_id: str) -> list[dict[str, Any]]:
+        """Fetch every mem0 entry whose metadata[key] == value.
+
+        Returned entries are mem0's raw dicts (with ``id``, ``metadata``,
+        possibly ``memory`` body, etc.). Errors are swallowed — the caller
+        gets ``[]`` and a warning in the log instead of an exception, so
+        higher-level code can fall back to a no-cache codepath gracefully.
+        """
         try:
             entries = self.mem0.get_all(filters={"user_id": user_id, key: value})
         except Exception as exc:
-            logger.warning("mem0 get_all failed (%s); skipping delete", exc)
-            return 0
-        items: list[dict[str, Any]]
+            logger.warning("mem0 get_all failed (%s); returning empty list", exc)
+            return []
         if isinstance(entries, dict):
-            items = list(entries.get("results", []))
-        elif isinstance(entries, list):
-            items = entries
-        else:
-            items = []
+            return list(entries.get("results", []))
+        if isinstance(entries, list):
+            return list(entries)
+        return []
+
+    def delete_by_metadata(self, key: str, value: str, user_id: str) -> int:
+        """Delete every mem0 entry whose metadata[key] == value. Returns count."""
+        items = self.get_by_metadata(key, value, user_id)
         deleted = 0
         for item in items:
             mid = item.get("id") if isinstance(item, dict) else None

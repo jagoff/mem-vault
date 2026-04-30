@@ -267,6 +267,8 @@ class VaultWatcher:
             self._reindex_path(path)
 
     def _reindex_path(self, path: Path) -> None:
+        from mem_vault.index import compute_content_hash
+
         mem_id = path.stem
         if not path.exists():
             self._delete_index(mem_id)
@@ -279,13 +281,19 @@ class VaultWatcher:
         if mem is None:
             self._delete_index(mem_id)
             return
+        body = mem.body or mem.description or mem.name
         try:
             self.index.delete_by_metadata("memory_id", mem.id, mem.user_id)
             self.index.add(
-                mem.body or mem.description or mem.name,
+                body,
                 user_id=mem.user_id,
                 agent_id=mem.agent_id,
-                metadata={"memory_id": mem.id, "type": mem.type, "tags": mem.tags},
+                metadata={
+                    "memory_id": mem.id,
+                    "type": mem.type,
+                    "tags": mem.tags,
+                    "content_hash": compute_content_hash(body),
+                },
                 auto_extract=False,
             )
             logger.info("reindexed %s", mem_id)
