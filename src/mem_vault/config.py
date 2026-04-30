@@ -143,6 +143,15 @@ class Config(BaseModel):
             "abort with a clear error."
         ),
     )
+    metrics_enabled: bool = Field(
+        default=False,
+        description=(
+            "Append a JSONL line per MCP tool call to ``<state_dir>/metrics.jsonl`` "
+            "with ``{ts, tool, duration_ms, ok, error?}``. Useful for profiling "
+            "real workloads without bolting on Prometheus. Off by default to "
+            "stay disk-quiet; enable via ``MEM_VAULT_METRICS=1`` or this field."
+        ),
+    )
 
     @field_validator("vault_path", "state_dir", mode="before")
     @classmethod
@@ -160,6 +169,10 @@ class Config(BaseModel):
     @property
     def history_db(self) -> Path:
         return self.state_dir / "history.db"
+
+    @property
+    def metrics_path(self) -> Path:
+        return self.state_dir / "metrics.jsonl"
 
 
 def _vault_candidates() -> list[Path]:
@@ -244,13 +257,14 @@ def load_config(config_path: Path | None = None) -> Config:
         "MEM_VAULT_LLM_TIMEOUT_S": "llm_timeout_s",
         "MEM_VAULT_MAX_CONTENT_SIZE": "max_content_size",
         "MEM_VAULT_HTTP_TOKEN": "http_token",
+        "MEM_VAULT_METRICS": "metrics_enabled",
     }
     for env_var, field in env_map.items():
         if env_var in os.environ:
             value: str | int | bool | float = os.environ[env_var]
             if field in {"embedder_dims", "max_content_size"}:
                 value = int(value)
-            elif field == "auto_extract_default":
+            elif field in {"auto_extract_default", "metrics_enabled"}:
                 value = str(value).lower() in {"1", "true", "yes", "on"}
             elif field in {"decay_half_life_days", "llm_timeout_s"}:
                 value = float(value)

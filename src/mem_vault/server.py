@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 import mcp.server.stdio
@@ -520,6 +521,11 @@ def _build_server(service: Any) -> Server:
         "memory_delete": service.delete,
     }
 
+    # Metrics sink: disabled by default, opt-in via Config.metrics_enabled.
+    # We attach it unconditionally so the call_tool wrapper has one less
+    # branch — the sink itself short-circuits when disabled.
+    sink = _build_metrics_sink(service)
+
     @server.list_tools()
     async def _list() -> list[types.Tool]:
         return _TOOLS
@@ -528,19 +534,41 @@ def _build_server(service: Any) -> Server:
     async def _call(name: str, arguments: dict[str, Any] | None) -> list[types.TextContent]:
         args = arguments or {}
         handler = handlers.get(name)
-        if handler is None:
-            payload = {"ok": False, "error": f"Unknown tool: {name}"}
-        else:
+
+        async def _invoke() -> dict[str, Any]:
+            if handler is None:
+                return {"ok": False, "error": f"Unknown tool: {name}"}
             try:
-                payload = await handler(args)
+                return await handler(args)
             except Exception as exc:
                 logger.exception("tool %s failed", name)
-                payload = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+        from mem_vault.metrics import time_async_call
+
+        payload = await time_async_call(sink, name, _invoke)
         return [
             types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))
         ]
 
     return server
+
+
+def _build_metrics_sink(service: Any):
+    """Create a ``MetricsSink`` from ``service.config`` when present.
+
+    Falls back to a disabled sink when the service doesn't expose a
+    config (remote stubs in tests, etc.) — this keeps ``_build_server``
+    a no-op for non-local services.
+    """
+    from mem_vault.metrics import MetricsSink
+
+    cfg = getattr(service, "config", None)
+    if cfg is None or not getattr(cfg, "metrics_enabled", False):
+        # Path won't be touched while disabled; supply a benign default
+        # so type checkers stay happy.
+        return MetricsSink(Path("/dev/null"), enabled=False)
+    return MetricsSink(cfg.metrics_path, enabled=True)
 
 
 def build_service(config: Any | None = None):
