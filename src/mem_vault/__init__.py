@@ -15,4 +15,4 @@ from mem_vault.config import Config, load_config
 from mem_vault.storage import Memory, VaultStorage
 
 __all__ = ["Config", "Memory", "VaultStorage", "load_config"]
-__version__ = "0.2.0"
+__version__ = "0.3.0"

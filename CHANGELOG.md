@@ -6,28 +6,176 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Added
-- **`mem-vault install-skill`**: new subcommand that drops a bundled
-  `SKILL.md` template into Devin's user skills directory under three
-  alias names (`/mv`, `/mem_vault`, `/memory`), all routing to the same
-  MCP tools. Cross-platform (macOS / Linux / Windows). Flags:
-  `--target` (custom dir, useful for `.devin/skills` in a repo),
-  `--force` (overwrite existing), `--dry-run` (preview), `--no-aliases`
-  (install only `/mv`), `--uninstall` (remove). Solves the previous
-  manual-symlink dance on a fresh install — `pip install mem-vault &&
+## [0.3.0] - 2026-04-29
+
+The "memoria viva" release — mem-vault stops being a passive archive and
+starts being **active memory** that grows by itself, organizes itself,
+and answers narrative questions instead of just listing bullets. Six
+new MCP tools, two big retrieval upgrades, four lifecycle improvements.
+
+### Added — game changers (memory amplification)
+
+- **SessionStart hook is now cwd-aware**: extracts a project signal
+  from the current working directory (skipping filesystem noise like
+  `/Users/<me>/`, `repositories`, `code`) and pushes memorias tagged
+  with that project to the **top** of the injected context. Three
+  cheap queries per cold start (tag `project:<leaf>`, bare leaf,
+  semantic search) deduped by id. Falls back gracefully when the cwd
+  doesn't resolve. Net effect: re-opening Devin in a repo where you
+  worked before, the agent comes pre-loaded with that project's
+  decisions and gotchas — zero re-explaining.
+
+- **Auto-capture proactive directive in the bundled `SKILL.md`**: the
+  shipped skill now instructs the agent to call `memory_save` at the
+  end of any non-trivial turn (bug fixes with root cause, design
+  decisions with trade-offs, codebase conventions, gotchas, measured
+  performance findings, non-trivial setup steps, explicit user
+  preferences). Includes 4 anti-trigger categories (cosmetic edits,
+  pure exploration, info already in CLAUDE.md/AGENTS.md, explicit
+  "no guardes esto"). Without manually typing `/mv save`, every
+  productive turn now leaves a trace.
+
+- **Auto-linking on save** (`Config.auto_link_default=True`): after a
+  successful `memory_save`, the service runs a second semantic search
+  (threshold 0.5, k=5) and stamps the IDs of similar memorias on the
+  new memory's `related:` frontmatter, AND inserts a
+  `## Memorias relacionadas` section with `[[id]]` Obsidian wikilinks
+  in the body itself (cap 3, placed before any `## Aprendido el ...`
+  closer). Builds an emergent knowledge graph at zero extra cost —
+  Obsidian's graph view becomes navigable without manual curation.
+  Per-call opt-out with `auto_link=false`.
+
+- **`memory_synthesize` MCP tool**: takes a topic/query, runs a wide
+  semantic search (default k=10, threshold 0.1), then asks the local
+  Ollama LLM to compose a narrative summary citing source IDs inline.
+  Converts the vault from "list of bullets" into "interlocutor that
+  responds". Errors come back as structured envelopes
+  (`code: validation_failed | llm_timeout | llm_failed`) so callers
+  can fall back to plain `memory_search` if synthesis isn't available.
+
+- **`memory_briefing` MCP tool**: composable boot summary at the first
+  `/mv` of a session. Returns `{project_tag, total_global,
+  project_total, recent_3, top_tags, lint_summary}` so the skill can
+  render the 8-line briefing without a second round-trip. Lets the
+  agent enter the conversation knowing what's in the vault.
+
+- **`memory_derive_metadata` MCP tool**: server-side classifier that
+  takes content + cwd and returns `{title, type, tags, missing_tags}`
+  using regex-priority tables (type: bug → decision → todo →
+  preference → feedback → fact → note; 20 domain-tag patterns; 7
+  technique-tag patterns; project_tag from cwd with content-based
+  overrides for agent-config paths). The skill uses this *before*
+  `memory_save` so the user only types the body and the metadata gets
+  filled in automatically — `missing_tags > 0` means the body didn't
+  hit enough patterns for ≥3 tags and the skill should ask for one
+  more before saving.
+
+- **Cross-encoder reranker for `memory_search`** (opt-in via
+  `Config.reranker_enabled` + `[hybrid]` extra): wraps `fastembed`'s
+  `TextCrossEncoder` (default `jinaai/jina-reranker-v1-tiny-en`,
+  ~130 MB, ~30-60 ms for 20 candidates on CPU). Over-fetches a wider
+  candidate set from the bi-encoder and re-orders it through a model
+  that sees query+candidate together — captures interactions the
+  embedder alone misses (negation, specificity, entity matching).
+  Falls back silently to bi-encoder order when fastembed isn't
+  installed; never raises.
+
+### Added — discovery / hygiene tools
+
+- **`memory_stats(cwd?)`**: counts by `type`, by `agent_id`, top tags,
+  age histogram (today / week / month / older). Scopes to the
+  resolved `project_tag` when cwd provided.
+- **`memory_duplicates(threshold=0.7, cwd?)`**: surfaces candidate
+  duplicate pairs by tag-overlap Jaccard. Cheap offline check that
+  fits in a chat turn. For deep semantic dedup keep using
+  `mem-vault consolidate`.
+- **`memory_lint(cwd?)`**: list memorias with structural issues
+  (<3 tags, missing description, body shorter than 100 chars, body
+  ≥300 chars without `## Aprendido el YYYY-MM-DD`, missing created).
+
+### Added — incremental reindex
+
+- **Hash-based incremental skip in `mem-vault reindex`**: every
+  indexed memory now carries a `content_hash` (truncated SHA-256) in
+  its Qdrant payload. Subsequent `reindex` runs skip memories whose
+  current hash matches the indexed one — re-embedding only the diff.
+  For stable vaults (most memories unchanged between runs) this is
+  ~50-100× faster. New `--force` flag disables the skip.
+- New helpers: `index.compute_content_hash(content)` and
+  `index.get_by_metadata(key, value, user_id)`.
+
+### Added — observability + ops
+
+- **Optional JSONL metrics sink** (`Config.metrics_enabled`,
+  `MEM_VAULT_METRICS=1`): one structured line per MCP tool call to
+  `<state_dir>/metrics.jsonl` with `{ts, tool, duration_ms, ok,
+  error?}`. Thread-safe append-mode writer that auto-disables on
+  persistent IO error. Designed for `tail -f` + `jq` ad-hoc analysis,
+  no Prometheus dependency.
+- **mypy** added to the dev tooling. Balanced profile (not strict —
+  the FastAPI/MCP decorator soup is too noisy in strict mode) with
+  `check_untyped_defs`, `strict_optional`, `warn_unused_ignores`,
+  `warn_no_return`. CI now runs `mypy` after `ruff check`.
+
+### Added — distribution
+
+- **`mem-vault install-skill`** subcommand: drops a bundled `SKILL.md`
+  template into Devin's user skills directory under three alias names
+  (`/mv`, `/mem_vault`, `/memory`), all routing to the same MCP tools.
+  Cross-platform (macOS / Linux / Windows). Flags: `--target`
+  (custom dir like `.devin/skills` in a repo), `--force` (overwrite),
+  `--dry-run` (preview), `--no-aliases` (only `/mv`), `--uninstall`.
+  Solves the manual-symlink dance — `pip install mem-vault &&
   mem-vault install-skill` now leaves the slash commands ready.
-- **Bundled SKILL.md**: shipped at `mem_vault/skills/SKILL.md` inside
-  the wheel, accessible via `importlib.resources` with an
-  editable-install fallback.
+
+### Changed
+
+- **`cli.py` (891 lines)** is now a `cli/` package with one module per
+  subcommand. `cli/__init__.py` is the dispatcher; `cli/{crud,
+  consolidate, export_cmd, hooks_cmd, import_engram, install_skill,
+  reindex, sync_cmd, ui}.py` each register their own subparsers and
+  expose `run(args)`. Heavy deps are still imported lazily inside the
+  `run` functions so `mem-vault --help` stays instant. Zero
+  user-facing behavior change (entry point still
+  `mem_vault.cli:main`, all flags + help text identical).
+- **Bundled `SKILL.md` generalized for public distribution**: removed
+  paths hardcoded to the author's vault layout
+  (`04-Archive/99-obsidian-system/...`, `01-Projects/...`), bumped
+  default search threshold from 0.05 to 0.1 (matches the MCP server
+  default, fewer noisy hits). Re-ordered the alias header to put
+  `/mv` first (the canonical primary).
+- **`memory_save` schema**: new optional `auto_link` boolean to opt
+  out per-call.
+
+### Robustness (carry-over from 0.2.0, restated for clarity)
+
+- LLM timeout (`MEM_VAULT_LLM_TIMEOUT_S`, default 60 s) wrapping every
+  Ollama call; structured `indexing_error_code: "llm_timeout"`
+  envelope when it trips.
+- Circuit breaker (3 consecutive failures → 30 s open) preventing
+  stacked hangs on a dead Ollama.
+- `MEM_VAULT_MAX_CONTENT_SIZE` (default 1 M chars) rejection before
+  the vault or index is touched.
+- Bearer-token auth on the UI / JSON HTTP server (`MEM_VAULT_HTTP_TOKEN`).
+  `serve()` refuses to bind to a non-loopback host without a token.
+  Constant-time comparison via `secrets.compare_digest`.
 
 ### Tests
-- 19 new tests across `test_install_skill.py` covering: cross-platform
-  default skills dir resolution (POSIX with/without `XDG_CONFIG_HOME`,
-  Windows with/without `APPDATA`), template reading via
-  `importlib.resources` and the FS fallback, frontmatter `name:`
-  rewriting, install (3 aliases / `--no-aliases` / `--force` /
-  `--dry-run` / nested target), uninstall (full / dry-run / preserves
-  user-extra files / no-op when empty). Total suite is now 233 tests.
+
+Total suite is now **323 tests** in ~13 s, zero Ollama / Qdrant required
+(everything stubbed). Highlights of the new coverage:
+
+- `test_breaker.py`, `test_robustness.py`, `test_ui_auth.py` (Phase 1).
+- `test_hooks.py`, `test_server_handlers.py`, `test_server_dispatch.py`,
+  `test_cli_common.py`, `test_cli_import_engram.py`,
+  `test_index_helpers.py` (Phase 3).
+- `test_hash_reindex.py` (incremental reindex).
+- `test_metrics.py` (JSONL sink).
+- `test_install_skill.py` (cross-platform skill installer).
+- `test_linking_synthesize.py` (auto-link + memory_synthesize).
+- `test_reranker.py` (cross-encoder reranker, fastembed stubbed).
+- `test_discovery_tools.py` (briefing + derive_metadata + stats +
+  duplicates + lint + wikilinks insertion).
 
 ## [0.2.0] - 2026-04-29
 
@@ -131,6 +279,7 @@ Initial public release. Everything below shipped between commits
 - **CI** (GitHub Actions): matrix Ubuntu × macOS × Windows × Python
   3.11 / 3.12; lint job with `ruff check` + `ruff format --check`.
 
-[Unreleased]: https://github.com/jagoff/mem-vault/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jagoff/mem-vault/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jagoff/mem-vault/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jagoff/mem-vault/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jagoff/mem-vault/releases/tag/v0.1.0

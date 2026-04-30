@@ -46,7 +46,7 @@ from mem_vault.storage import VaultStorage, slugify
 logger = logging.getLogger("mem_vault.server")
 
 SERVER_NAME = "mem-vault"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.3.0"
 
 
 class _ContentTooLargeError(ValueError):

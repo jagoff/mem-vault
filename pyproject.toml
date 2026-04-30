@@ -1,6 +1,6 @@
 [project]
 name = "mem-vault"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local MCP server that gives AI agents infinite memory backed by an Obsidian vault. 100% local stack: Ollama + Qdrant + sqlite. No API keys."
 readme = "README.md"
 license = { text = "MIT" }
