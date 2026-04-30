@@ -125,6 +125,24 @@ auto_extract_default = false      # opt-in LLM dedup; default off for predictabi
 
 ## Workflow — what using mem-vault feels like
 
+mem-vault grows by **two paths** simultaneously:
+
+1. **Explicit save** — you (or the agent) call `memory_save` for something
+   specific you want remembered.
+2. **Proactive auto-capture** — the agent observes the turn, decides "this
+   is worth remembering for later", and saves on its own. No `/mv save`
+   typed by you. This is where the system actually scales: every productive
+   turn leaves a trace, and one month in you have 10x the relevant context
+   without ever having lifted a finger to curate.
+
+The bundled `SKILL.md` (installed by `mem-vault install-skill`) instructs
+the agent to capture proactively when it sees a real bug fix with root
+cause, a design decision with trade-offs, a workflow discovery, a codebase
+convention, a gotcha, a measured performance finding, or a setup step that
+took non-trivial effort. It explicitly does **not** capture cosmetic
+changes, pure exploration, or anything already in `CLAUDE.md`/`AGENTS.md`.
+You can disable per-session with "no guardes nada en mem-vault esta sesión".
+
 Once configured, you don't think about mem-vault explicitly. Memories
 accumulate as a side effect of normal conversation:
 

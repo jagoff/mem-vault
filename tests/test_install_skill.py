@@ -71,6 +71,25 @@ def test_read_template_returns_real_skill_md():
     assert "Search/save/list/update/delete" in content
 
 
+def test_skill_template_contains_auto_capture_directive():
+    """The bundled SKILL.md must instruct the agent to capture proactively.
+
+    This is the single most important user-facing contract of the skill —
+    without it, the system stays manual-save-only and never grows by
+    itself. If we ship a SKILL.md that lacks the auto-capture section,
+    the whole "memoria que crece sola" promise breaks.
+    """
+    content = install_skill._read_template()
+    assert "Auto-capture proactivo" in content
+    # Must mention all the trigger categories so the agent has criteria.
+    assert "Bug fix" in content
+    assert "Decisión de diseño" in content
+    assert "Convención del codebase" in content
+    assert "Gotcha" in content
+    # Must have an opt-out clause.
+    assert "no guardes nada" in content.lower() or "off the record" in content.lower()
+
+
 def test_read_template_falls_back_to_filesystem(monkeypatch):
     """When ``importlib.resources`` raises, the FS fallback should kick in."""
 

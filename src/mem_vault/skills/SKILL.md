@@ -70,3 +70,70 @@ Si el body de una memoria menciona rutas a archivos `.md` del vault (típicament
 2. **Si el MCP devuelve `ok: false`**, mostrá el `error` literal del MCP. NO inventes mensajes de error.
 3. **Después del comando, frená** — el user invocó el slash command para algo puntual. NO retomes tareas previas automáticamente.
 4. **Si los argumentos son ambiguos** (ej. `/mv get` sin id), pedí el dato faltante en una línea: `Pasame el `<id>` (uno de los slugs que aparecen en `/mv list`).`.
+
+---
+
+## Auto-capture proactivo (el game changer real)
+
+mem-vault no se llena solo con lo que el user te pide guardar con `/mv save`. **El sistema crece cuando vos, como agente, capturás aprendizajes proactivamente al cierre de tareas no-triviales** — sin que el user te lo pida. Cada turno productivo deja huella, y la próxima vez que el user pregunta sobre el mismo tema, vos (u otro agente) tenés contexto inmediato.
+
+**No te limites a lo que el user pidió.** Si en este turno hubo:
+
+- ✅ **Bug fix con root cause no obvio** (más allá de un typo) → guardalo (`type: bug`).
+- ✅ **Decisión de diseño con trade-offs** (qué elegiste, qué descartaste, por qué) → guardalo (`type: decision`).
+- ✅ **Workflow operativo nuevo** (ej. comando git complejo, secuencia de pasos no triviales que descubriste) → guardalo (`type: fact`).
+- ✅ **Convención del codebase** descubierta leyendo (ej. "en este repo `_postprocess_*` siempre devuelve dict con keys `ran`, `ok`, `full`, `ms`") → guardalo (`type: fact`).
+- ✅ **Gotcha / foot-gun / invariante fácil de violar** → guardalo (`type: bug` o `fact`).
+- ✅ **Performance finding empírico con números medidos** (no estimados) → guardalo (`type: fact`).
+- ✅ **Setup operativo no trivial** (env vars, flags de OS, permissions, config previa) → guardalo (`type: fact`).
+- ✅ **Preferencia explícita del user** (ej. "siempre escribime en español rioplatense") → guardalo (`type: preference`).
+- ✅ **Feedback al sistema** (algo que no funcionó como el user esperaba, o cómo prefiere que lo hagas la próxima) → guardalo (`type: feedback`).
+
+**NO guardes** cuando el turno fue:
+
+- ❌ Tarea exploratoria pura (responder pregunta sin acción, leer logs sin acción).
+- ❌ Cambios cosméticos (rename de variable, format, ajustes de copy a pedido literal del user).
+- ❌ Información ya documentada en `CLAUDE.md`/`AGENTS.md`/docstrings del repo (mejor referenciar el archivo, no duplicar).
+- ❌ El user pidió explícitamente "no guardes esto".
+
+**Cuándo dispararlo**: ANTES de mandar tu respuesta final del turno, evaluá silenciosamente "¿hay algo acá que vale la pena guardar para mí-futuro?". Si la respuesta es sí, **llamá a `mcp__mem-vault__memory_save` ANTES de imprimir tu respuesta al user** y mencioná brevemente al final que guardaste (`Guardé esto como memoria: <id>`). Si la respuesta es no, no hagas nada.
+
+**Formato del `content`** (markdown enriquecido, no wall-of-text):
+
+```markdown
+# <título descriptivo>
+
+## Contexto
+Qué proyecto, qué archivo, qué problema. 1-2 párrafos.
+
+## Problema (o "## Causa raíz")
+Qué fallaba y por qué. Repro si aplica.
+
+## Solución
+Bloques de código concretos (```python, ```bash, ```typescript), no solo
+descripción. Copiá el snippet clave.
+
+## Cómo lo medí (o "## Tests")
+Números, comandos para verificar, test names.
+
+## Cuándo aplicar este patrón
+Bajo qué condiciones es relevante (no asumas que el yo-futuro va a recordar
+el contexto entero).
+
+## Aprendido el YYYY-MM-DD
+Fecha + commit SHA si aplica + 1-2 líneas de qué disparó este aprendizaje.
+```
+
+**Args para `memory_save`** (no `auto_extract`, vos ya curaste el contenido):
+
+```
+{
+  "content": "<markdown estructurado como arriba>",
+  "title": "<frase descriptiva, no slug seco>",
+  "type": "<decision | bug | fact | feedback | preference | note>",
+  "tags": ["<proyecto>", "<dominio>", "<técnica>", "..."],   // mínimo 3
+  "auto_extract": false
+}
+```
+
+**Disable**: si el user dice "no guardes nada en mem-vault esta sesión" / "modo silencioso" / "off the record", respetá esa instrucción hasta que la sesión termine. NO anuncies que vas a parar — simplemente cumplí.
