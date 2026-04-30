@@ -30,6 +30,7 @@ import mcp.server.stdio
 import mcp.types as types
 from mcp.server import Server
 
+from mem_vault import __version__
 from mem_vault.config import Config, load_config
 from mem_vault.discovery import (
     compute_stats,
@@ -47,7 +48,7 @@ from mem_vault.storage import VaultStorage
 logger = logging.getLogger("mem_vault.server")
 
 SERVER_NAME = "mem-vault"
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = __version__
 
 
 class _ContentTooLargeError(ValueError):
