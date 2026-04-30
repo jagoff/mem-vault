@@ -143,6 +143,110 @@ async def test_search_with_empty_index_returns_zero_results(service_factory):
     assert res["results"] == []
 
 
+async def test_search_skips_orphan_hits_without_backing_md(service_factory):
+    """A Qdrant hit pointing at a memory_id whose .md was deleted out-of-band
+    must NOT leak into search results. The vault is the source of truth —
+    if the .md is gone, the result doesn't exist.
+    """
+    service, stub = service_factory()
+    stub.hits = [
+        {
+            "score": 0.9,
+            "metadata": {"memory_id": "orphan_id"},
+            "memory": "old body of deleted memory",
+        }
+    ]
+    res = await service.search({"query": "anything", "k": 5})
+    assert res["ok"] is True
+    assert res["count"] == 0
+    assert res["results"] == []
+
+
+async def test_search_orphan_does_not_leak_past_visibility(service_factory):
+    """Without the backing .md we can't enforce visible_to — so the orphan
+    must be skipped, never returned. Otherwise a previously-private memory
+    whose file was removed could leak via the index regardless of viewer.
+    """
+    service, stub = service_factory(agent_id="alice")
+    stub.hits = [
+        {
+            "score": 0.9,
+            "metadata": {"memory_id": "ghost_private"},
+            "memory": "would have been private body",
+        }
+    ]
+    res = await service.search({"query": "x", "viewer_agent_id": "bob"})
+    assert res["count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# auto_extract NOOP fallback — every .md must end up indexed under its memory_id
+# ---------------------------------------------------------------------------
+
+
+async def test_save_auto_extract_noop_falls_back_to_literal(service_factory):
+    """When mem0 returns NOOP / UPDATE only (no ADD under our memory_id),
+    save() must fall back to a literal embed so the .md doesn't end up
+    on disk without any backing index entry.
+    """
+    service, stub = service_factory()
+    add_calls: list[tuple] = []
+
+    def _record_add(content, **kwargs):
+        add_calls.append((content, kwargs))
+        # First call (auto_extract=True) → only NOOP / UPDATE returned.
+        # Second call (literal fallback) → real ADD.
+        if kwargs.get("auto_extract"):
+            return [{"id": "x", "event": "NOOP"}]
+        return [{"id": "y", "event": "ADD"}]
+
+    stub.add = _record_add  # type: ignore[assignment]
+
+    res = await service.save({"content": "duplicate body", "auto_extract": True})
+    assert res["ok"] is True
+    assert res["indexed"] is True
+    assert res["auto_extract_fallback"] == "literal"
+    # We expect exactly two add() calls: the LLM extract, then the literal fallback
+    assert len(add_calls) == 2
+    assert add_calls[0][1].get("auto_extract") is True
+    assert add_calls[1][1].get("auto_extract") is False
+
+
+async def test_save_auto_extract_with_add_does_not_fallback(service_factory):
+    """If mem0's auto_extract returns at least one ADD, the literal fallback
+    must NOT trigger — we accept what the extractor decided to store.
+    """
+    service, stub = service_factory()
+    add_calls: list[tuple] = []
+
+    def _record_add(content, **kwargs):
+        add_calls.append((content, kwargs))
+        return [{"id": "x", "event": "ADD"}]
+
+    stub.add = _record_add  # type: ignore[assignment]
+
+    res = await service.save({"content": "fresh body", "auto_extract": True})
+    assert res["ok"] is True
+    assert res["indexed"] is True
+    assert "auto_extract_fallback" not in res
+    assert len(add_calls) == 1
+
+
+async def test_search_skips_orphans_but_keeps_real_hits(service_factory):
+    """Mix of orphan + real hits: the real one comes through, the orphan is dropped."""
+    service, stub = service_factory()
+    seed = await service.save({"content": "real body", "title": "real", "type": "note"})
+    real_id = seed["memory"]["id"]
+    stub.hits = [
+        {"score": 0.95, "metadata": {"memory_id": "ghost"}, "memory": "phantom"},
+        {"score": 0.85, "metadata": {"memory_id": real_id}, "memory": "real body"},
+    ]
+    res = await service.search({"query": "x", "k": 5})
+    assert res["count"] == 1
+    assert res["results"][0]["id"] == real_id
+    assert res["results"][0]["memory"]["body"] == "real body"
+
+
 # ---------------------------------------------------------------------------
 # list — filters + visibility
 # ---------------------------------------------------------------------------
@@ -307,7 +411,10 @@ async def test_update_reindexes_when_content_changes(service_factory):
     assert add_calls and add_calls[0][0] == "new body"
 
 
-async def test_update_without_content_does_not_reindex(service_factory):
+async def test_update_title_only_does_not_reindex(service_factory):
+    """Title / description live only in the .md frontmatter, never in the
+    Qdrant payload. A title-only update must skip the embed call.
+    """
     service, stub = service_factory()
     seed = await service.save({"content": "body", "title": "T", "type": "note"})
     mem_id = seed["memory"]["id"]
@@ -316,8 +423,61 @@ async def test_update_without_content_does_not_reindex(service_factory):
     res = await service.update({"id": mem_id, "title": "new title only"})
     assert res["ok"] is True
     assert res["memory"]["name"] == "new title only"
-    # No content change → no re-embed pass
+    # No content / tags change → no re-embed pass
     assert stub.delete_log == []
+    # Envelope should not advertise an ``indexed`` field when no reindex was needed
+    assert "indexed" not in res
+    assert "indexing_error" not in res
+
+
+async def test_update_tags_only_reindexes_metadata(service_factory):
+    """A tag-only update must still trigger a re-embed: ``metadata.tags`` is
+    used to filter searches, so leaving the old tags in Qdrant produces drift
+    that compounds over edits.
+    """
+    service, stub = service_factory()
+    seed = await service.save({"content": "body", "title": "T", "tags": ["old"]})
+    mem_id = seed["memory"]["id"]
+
+    add_calls: list[tuple] = []
+    original_add = stub.add
+
+    def _record_add(content, **kwargs):
+        add_calls.append((content, kwargs))
+        return original_add(content, **kwargs)
+
+    stub.add = _record_add  # type: ignore[assignment]
+    stub.delete_log.clear()
+
+    res = await service.update({"id": mem_id, "tags": ["new"]})
+    assert res["ok"] is True
+    assert res["indexed"] is True
+    assert any(call[0] == "memory_id" for call in stub.delete_log)
+    assert add_calls
+    new_metadata = add_calls[0][1].get("metadata") or {}
+    assert new_metadata.get("tags") == ["new"]
+
+
+async def test_update_surfaces_indexing_error_on_reindex_failure(service_factory):
+    """When the post-update re-embed fails, the .md write still succeeds
+    but the response must announce ``indexed=False`` + ``indexing_error``
+    so the caller knows search will miss this memory until reindex.
+    """
+    service, stub = service_factory()
+    seed = await service.save({"content": "old body", "title": "T", "type": "note"})
+    mem_id = seed["memory"]["id"]
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("ollama dead")
+
+    stub.add = _boom  # type: ignore[assignment]
+
+    res = await service.update({"id": mem_id, "content": "new body"})
+    assert res["ok"] is True
+    assert res["memory"]["body"] == "new body"
+    assert res["indexed"] is False
+    assert "indexing_error" in res
+    assert "ollama dead" in res["indexing_error"]
 
 
 async def test_update_missing_id_returns_not_found(service_factory):

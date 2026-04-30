@@ -55,7 +55,12 @@ def test_hash_keeps_internal_whitespace_significant():
 
 
 class _StubIndex:
-    """VectorIndex stand-in that records add / get_by_metadata / delete calls."""
+    """VectorIndex stand-in that records add / get_by_metadata / delete calls.
+
+    Exposes a minimal ``mem0`` facade with ``get_all`` so the orphan-sweep
+    flow in :mod:`mem_vault.cli.reindex` has something to talk to. Tests
+    that don't care about orphan sweeping can ignore it.
+    """
 
     def __init__(self) -> None:
         self.add_calls: list[tuple[str, dict]] = []
@@ -70,8 +75,15 @@ class _StubIndex:
         return self._breaker
 
     @property
-    def mem0(self):  # ``--purge`` reaches into vector_store; tests skip --purge
-        raise RuntimeError("mem0 not available in stub")
+    def mem0(self):  # exposed only so the orphan sweep can call get_all()
+        return self
+
+    def get_all(self, *, filters=None, limit=None):
+        # Flatten ``store`` to a mem0-like ``{"results": [...]}`` payload.
+        out = []
+        for entries in self.store.values():
+            out.extend(entries)
+        return {"results": out}
 
     def add(self, content, *, user_id, agent_id=None, metadata=None, auto_extract=False):
         meta = dict(metadata or {})
@@ -230,3 +242,51 @@ async def test_save_writes_content_hash_into_metadata(monkeypatch, reindex_env):
     assert entries, "save() should have populated the index"
     expected_hash = compute_content_hash("anything")
     assert entries[0]["metadata"]["content_hash"] == expected_hash
+
+
+# ---------------------------------------------------------------------------
+# Orphan sweep — ``reindex`` removes index entries whose .md is gone
+# ---------------------------------------------------------------------------
+
+
+async def test_reindex_sweeps_orphan_index_entries(monkeypatch, reindex_env):
+    """An entry in the Qdrant store whose memory_id has no .md must be
+    removed by ``reindex``. Otherwise search returns ghost results.
+    """
+    service, stub, config = reindex_env
+    ids = await _seed(service, n=2)
+    # Inject a phantom index entry for a memory_id that has no .md.
+    stub.store["ghost_id"] = [
+        {
+            "id": "phantom-1",
+            "metadata": {"memory_id": "ghost_id", "type": "note", "tags": []},
+        }
+    ]
+
+    monkeypatch.setattr("mem_vault.config.load_config", lambda *a, **kw: config)
+    monkeypatch.setattr("mem_vault.server.MemVaultService", lambda cfg: service)
+
+    rc = await reindex_mod.run(_make_args())
+    assert rc == 0
+    assert "ghost_id" not in stub.store
+    # Real memories must remain
+    for mid in ids:
+        assert mid in stub.store
+
+
+async def test_reindex_orphan_sweep_skipped_with_limit(monkeypatch, reindex_env):
+    """``--limit`` walks only N memories so we can't reliably tell
+    orphans from unwalked memories. Sweep must skip in that case.
+    """
+    service, stub, config = reindex_env
+    await _seed(service, n=3)
+    stub.store["ghost_id"] = [
+        {"id": "phantom-1", "metadata": {"memory_id": "ghost_id"}}
+    ]
+
+    monkeypatch.setattr("mem_vault.config.load_config", lambda *a, **kw: config)
+    monkeypatch.setattr("mem_vault.server.MemVaultService", lambda cfg: service)
+
+    await reindex_mod.run(_make_args(limit=1))
+    # Orphan must NOT have been removed because we couldn't walk every file
+    assert "ghost_id" in stub.store

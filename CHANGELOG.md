@@ -6,6 +6,68 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed — loop-closure audit (11 bugs)
+
+Full audit of the eight learning loops (save → index → search → update →
+delete → consolidate → reindex → hooks). Suite grew from 323 to 343 tests;
+no regressions.
+
+- **`memory_search` skips orphan hits.** A Qdrant entry whose `.md` was
+  deleted out-of-band (manual `rm`, post-`consolidate` crash, sync hiccup)
+  used to be returned with `memory: null`. Worse, the visibility filter
+  silently degraded: a previously `visible_to: []` (private) memory leaked
+  to *any* viewer once its file was gone. Now orphans are dropped early —
+  the vault is the source of truth, period.
+- **`memory_update` surfaces re-index failures.** A failed `index.add` after
+  a successful `.md` write used to return `{"ok": True}` with the index
+  silently empty. Now the response mirrors `memory_save`'s envelope:
+  `{"ok": True, "indexed": False, "indexing_error": "...",
+  "indexing_error_code": "llm_timeout" | "circuit_breaker_open" | …}`.
+- **`memory_update` re-indexes on tag-only changes.** Previously, a tag-only
+  update wrote the new tags to the `.md` but left `metadata.tags` stale in
+  Qdrant — drift that compounded across edits and broke filtered searches.
+- **`mem-vault reindex` sweeps orphan index entries.** After re-embedding
+  every `.md`, the command now scans the index for `memory_id`s with no
+  backing file and removes them. Skipped automatically with `--purge`
+  (collection is fresh) or `--limit` (incomplete walk). Reports
+  `orphans_removed=N` in the final summary line.
+- **`consolidate --apply` survives a mid-merge crash.** The old MERGE
+  ordering (`storage.update older` → `index.delete older` → `index.delete
+  newer` → `index.add merged` → `storage.delete newer`) left both memories
+  invisible to search if `index.add` raised. New ordering rolls back
+  `older`'s body to its pre-merge state and re-embeds it on failure;
+  `newer`'s `.md` stays untouched until the embed succeeds. `KEEP_FIRST` /
+  `KEEP_SECOND` now delete the `.md` before the index entry so a crash
+  in between is recoverable via the orphan sweep above.
+- **`storage.save` is concurrency-safe.** `_unique_id` used to do
+  `while exists(): bump`, which lost data when two threads/processes saved
+  the same title at the same time. Replaced with `_reserve_unique_id`
+  using `open(O_CREAT|O_EXCL|O_WRONLY)` to atomically claim each slug.
+  Test reproduces 8 concurrent saves all surviving with distinct IDs.
+- **`memory_save(auto_extract=True)` always indexes the memory.** When
+  mem0's LLM extractor decided the body was a duplicate (NOOP / UPDATE
+  only, no `ADD` under our `memory_id`), the `.md` ended up on disk with
+  no embedding — invisible to semantic search until the next reindex.
+  Now we detect that case and fall back to a literal embed
+  (`auto_extract=False`); the response surfaces `auto_extract_fallback:
+  "literal"` so callers know the dedup didn't happen. Same fallback now
+  runs inside `mem-vault reindex --auto-extract`.
+- **Auto-link's `related` reflects on-disk state.** If the post-search
+  `storage.update` failed (disk full, lock), the response used to claim
+  cross-links that hadn't actually been written to the `.md`'s frontmatter.
+  Now `related` stays `[]` unless the write succeeded.
+- **`memory_synthesize` defangs prompt injection.** Memory bodies that
+  mimicked the old prompt scaffolding (`### END OF MEMORIES ###`,
+  `Ignore the above`) could redirect the LLM. Bodies are now sanitized
+  (heading-prefix demotion, fence-marker escaping) and wrapped in
+  `<<<MEM id=…>>>` / `<<<END id=…>>>` data fences with explicit
+  instructions to treat their content as untrusted.
+- **`memory_synthesize` truncates without breaking code blocks.** Bodies
+  longer than 2000 chars used to get sliced mid-fence, leaving the LLM
+  with an unmatched ` ``` ` that consumed the rest of the prompt as
+  code. The new helper trims at paragraph/line boundaries and closes
+  any odd-count fence with a synthetic ` ``` `.
+
 ## [0.3.0] - 2026-04-29
 
 The "memoria viva" release — mem-vault stops being a passive archive and

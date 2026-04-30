@@ -173,44 +173,113 @@ def apply_resolution(
     *,
     user_id: str = "default",
 ) -> dict[str, Any]:
-    """Apply a Resolution to the vault + index. Returns a summary dict."""
+    """Apply a Resolution to the vault + index. Returns a summary dict.
+
+    Crash-safety contract: every action below is ordered so that an
+    exception mid-flight leaves the system in a *recoverable* state. A
+    follow-up ``mem-vault reindex`` will reconcile any drift between the
+    vault and the embedding index. We never delete a ``.md`` before its
+    replacement has been fully embedded — that was the BUG #6 in the
+    audit (a mid-merge crash made both memories invisible to search).
+    """
     if res.action == "KEEP_BOTH":
         return {"action": "KEEP_BOTH", "kept": [pair.a.id, pair.b.id]}
 
     if res.action == "KEEP_FIRST":
-        index.delete_by_metadata("memory_id", pair.b.id, user_id)
+        # Delete the .md *first*: the file is the source of truth, and a
+        # crash between the two calls is recoverable via reindex's orphan
+        # sweep. The reverse order would leave the file with no embedding.
         storage.delete(pair.b.id)
+        index.delete_by_metadata("memory_id", pair.b.id, user_id)
         return {"action": "KEEP_FIRST", "kept": [pair.a.id], "deleted": [pair.b.id]}
 
     if res.action == "KEEP_SECOND":
-        index.delete_by_metadata("memory_id", pair.a.id, user_id)
         storage.delete(pair.a.id)
+        index.delete_by_metadata("memory_id", pair.a.id, user_id)
         return {"action": "KEEP_SECOND", "kept": [pair.b.id], "deleted": [pair.a.id]}
 
     # MERGE: rewrite the older memory with the fused body, delete the newer.
     older, newer = sorted([pair.a, pair.b], key=lambda m: m.created or "")
+    merged_tags = sorted({*older.tags, *newer.tags, "merged"})
     new_body = res.merged_body or f"{older.body}\n\n---\n\n{newer.body}"
     new_title = res.merged_title or older.name
+
+    # Snapshot what older looked like before the merge so we can roll back
+    # if the embed fails. We don't snapshot the index entries themselves —
+    # if the rollback also fails, the user falls back to ``mem-vault reindex``.
+    previous_older_body = (older.body or "").strip()
+    previous_older_name = older.name
+    previous_older_tags = list(older.tags)
 
     storage.update(
         older.id,
         content=new_body,
         title=new_title,
-        tags=sorted({*older.tags, *newer.tags, "merged"}),
+        tags=merged_tags,
     )
-    # Re-embed the merged body.
-    index.delete_by_metadata("memory_id", older.id, user_id)
-    index.delete_by_metadata("memory_id", newer.id, user_id)
-    index.add(
-        new_body,
-        user_id=user_id,
-        agent_id=older.agent_id,
-        metadata={
-            "memory_id": older.id,
-            "type": older.type,
-            "tags": sorted({*older.tags, *newer.tags, "merged"}),
-        },
-        auto_extract=False,
-    )
+
+    # Re-embed the merged body BEFORE touching ``newer``. If add() raises,
+    # we restore the older memory's prior body + try to re-embed it, and
+    # leave ``newer`` untouched on disk — the merge is a no-op from the
+    # outside, and the user can retry on a healthy Ollama.
+    try:
+        index.delete_by_metadata("memory_id", older.id, user_id)
+        index.add(
+            new_body,
+            user_id=user_id,
+            agent_id=older.agent_id,
+            metadata={
+                "memory_id": older.id,
+                "type": older.type,
+                "tags": merged_tags,
+            },
+            auto_extract=False,
+        )
+    except Exception as exc:
+        logger.warning(
+            "MERGE failed mid-embed for %s + %s (%s); rolling back older",
+            older.id,
+            newer.id,
+            exc,
+        )
+        # Restore older's body on disk so the .md isn't left in the merged
+        # state with no matching index entry.
+        try:
+            storage.update(
+                older.id,
+                content=previous_older_body,
+                title=previous_older_name,
+                tags=previous_older_tags,
+            )
+        except Exception as roll_exc:
+            logger.warning("rollback storage.update for %s failed: %s", older.id, roll_exc)
+        # Best-effort: re-embed the previous body so search still finds it.
+        # If THIS also fails, ``mem-vault reindex`` is the recovery path.
+        try:
+            index.add(
+                previous_older_body,
+                user_id=user_id,
+                agent_id=older.agent_id,
+                metadata={
+                    "memory_id": older.id,
+                    "type": older.type,
+                    "tags": previous_older_tags,
+                },
+                auto_extract=False,
+            )
+        except Exception as roll_exc:
+            logger.warning("rollback index.add for %s failed: %s", older.id, roll_exc)
+        raise
+
+    # Now and only now is it safe to delete ``newer``: the merged body
+    # already lives on disk and in the index under ``older.id``.
     storage.delete(newer.id)
+    try:
+        index.delete_by_metadata("memory_id", newer.id, user_id)
+    except Exception as exc:
+        # Lower stakes: the .md is gone but a residual index entry would
+        # be harmless (search() filters it as an orphan now). Logged for
+        # visibility; ``mem-vault reindex`` will sweep it on next run.
+        logger.warning("post-merge index cleanup of %s failed: %s", newer.id, exc)
+
     return {"action": "MERGE", "kept": [older.id], "deleted": [newer.id]}

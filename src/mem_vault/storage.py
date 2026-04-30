@@ -217,13 +217,33 @@ class VaultStorage:
     def exists(self, memory_id: str) -> bool:
         return self.path_for(memory_id).exists()
 
-    def _unique_id(self, base_slug: str) -> str:
+    def _reserve_unique_id(self, base_slug: str) -> str:
+        """Atomically claim an unused slug by creating an empty placeholder.
+
+        Strategy: try ``open(O_CREAT|O_EXCL|O_WRONLY)`` on each candidate
+        path. ``O_EXCL`` fails immediately if another writer beat us to it,
+        so two concurrent ``save`` calls with the same title get *distinct*
+        IDs (``foo`` and ``foo_2``) instead of clobbering each other.
+        Without this guard, both threads checked ``exists()`` simultaneously
+        — both saw False — both wrote to the same file — one body got lost.
+
+        The placeholder is left empty; the caller (``_write``) replaces it
+        a few microseconds later with ``atomic_write_bytes`` (which uses
+        ``os.replace`` and so is itself atomic). A reader that opens the
+        file in the gap sees an empty markdown file, never a partial one.
+        """
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
         candidate = base_slug
         i = 2
-        while self.exists(candidate):
-            candidate = f"{base_slug}_{i}"
-            i += 1
-        return candidate
+        while True:
+            path = self.path_for(candidate)
+            try:
+                fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                os.close(fd)
+                return candidate
+            except FileExistsError:
+                candidate = f"{base_slug}_{i}"
+                i += 1
 
     def save(
         self,
@@ -259,7 +279,7 @@ class VaultStorage:
             description = content.strip().replace("\n", " ")[:200]
 
         if memory_id is None:
-            memory_id = self._unique_id(slugify(title))
+            memory_id = self._reserve_unique_id(slugify(title))
 
         now = _now_iso()
         mem = Memory(

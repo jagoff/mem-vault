@@ -184,6 +184,43 @@ def test_save_unique_id_when_collision(tmp_path):
     assert c.id == "same_title_3"
 
 
+def test_save_unique_id_under_concurrent_writes(tmp_path):
+    """Two threads saving with the same title must NOT clobber each other.
+
+    Pre-fix, ``_unique_id`` did ``while exists(): bump``; both threads
+    saw exists()==False at the same time, both picked the same slug,
+    one body got overwritten by the other's atomic_write. Now we reserve
+    via ``open(O_CREAT|O_EXCL)`` so only one thread wins each slug.
+    """
+    storage = VaultStorage(tmp_path)
+    barrier = threading.Barrier(8)
+    bodies_seen: set[str] = set()
+    ids_seen: list[str] = []
+    lock = threading.Lock()
+
+    def save_one(idx: int) -> None:
+        body = f"body-{idx}"
+        barrier.wait()
+        m = storage.save(content=body, title="Same Title")
+        with lock:
+            ids_seen.append(m.id)
+            bodies_seen.add(body)
+
+    threads = [threading.Thread(target=save_one, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Eight distinct ids, eight distinct files on disk
+    assert len(set(ids_seen)) == 8
+    files = sorted(p.stem for p in tmp_path.glob("*.md"))
+    assert len(files) == 8
+    # And every body wrote *some* file (no body lost to a clobber)
+    surviving_bodies = {storage.get(mid).body for mid in ids_seen if storage.get(mid)}
+    assert surviving_bodies == bodies_seen
+
+
 def test_save_invalid_type_falls_back_to_note(tmp_path):
     storage = VaultStorage(tmp_path)
     mem = storage.save(content="x", type="weird-unknown-type")

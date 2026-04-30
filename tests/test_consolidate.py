@@ -29,6 +29,11 @@ class FakeIndex:
                 return [h for h in hits if (h.get("score") or 0) >= threshold]
         return []
 
+    def get_by_metadata(self, key, value, user_id):
+        # Stubbed enough for the merge rollback path. Real consolidate uses
+        # this only as best-effort snapshot; returning [] is safe.
+        return []
+
     def delete_by_metadata(self, key, value, user_id):
         self.deletes.append((key, value, user_id))
         return 1
@@ -172,3 +177,142 @@ def test_apply_merge_rewrites_older_keeps_id(tmp_path):
     assert len(fake.adds) == 1
     assert fake.adds[0][1].get("memory_id") == "a"
     assert "merged" in (fake.adds[0][1].get("tags") or [])
+
+
+# ---------------------------------------------------------------------------
+# MERGE crash-safety: a mid-merge index failure must not leave the system
+# with both memories invisible to search. The .md gets rolled back, and the
+# newer.md is left untouched on disk.
+# ---------------------------------------------------------------------------
+
+
+class _CrashingIndex(FakeIndex):
+    """Like FakeIndex but ``add`` raises the first time after the delete.
+
+    We let rollback's add succeed so the test can verify the recovered
+    state — that's the realistic flake (Ollama hiccup on one call, then
+    recovers).
+    """
+
+    def __init__(self):
+        super().__init__(canned={})
+        self._add_calls = 0
+
+    def add(self, content, *, user_id, agent_id=None, metadata=None, auto_extract=False):
+        self._add_calls += 1
+        if self._add_calls == 1:
+            raise RuntimeError("ollama crashed mid-merge")
+        return super().add(
+            content, user_id=user_id, agent_id=agent_id, metadata=metadata
+        )
+
+
+def test_apply_merge_crash_rolls_back_older_and_keeps_newer(tmp_path):
+    storage = VaultStorage(tmp_path)
+    a = storage.save(content="A original body", title="a")
+    b = storage.save(content="B original body", title="b")
+    a.created = "2026-01-01T00:00:00-03:00"
+    b.created = "2026-02-01T00:00:00-03:00"
+    storage._write(a)
+    storage._write(b)
+
+    crashing = _CrashingIndex()
+    pair = Pair(a=storage.get("a"), b=storage.get("b"), score=0.97)
+    res = Resolution(
+        action="MERGE",
+        rationale="overlap",
+        merged_body="Fused body",
+        merged_title="Fused",
+    )
+
+    import pytest
+
+    with pytest.raises(RuntimeError):
+        apply_resolution(storage, crashing, pair, res)
+
+    # older.md must have its original body back (rollback succeeded)
+    a_after = storage.get("a")
+    assert a_after is not None
+    assert a_after.body == "A original body"
+    # newer.md must still exist — we never delete it before the embed succeeds
+    b_after = storage.get("b")
+    assert b_after is not None
+    assert b_after.body == "B original body"
+    # Index recovered: rollback added back the previous body so search finds it
+    assert any(
+        meta.get("memory_id") == "a" and "A original body" in content
+        for content, meta in crashing.adds
+    )
+
+
+class _AddAlwaysCrashingIndex(FakeIndex):
+    """Hard failure mode: every ``add`` raises. Rollback re-add also fails.
+
+    This proves the contract: even when the embed pipeline is fully dead,
+    the .md state stays consistent (older keeps its old body, newer keeps
+    its file). Recovery is then via ``mem-vault reindex``.
+    """
+
+    def __init__(self):
+        super().__init__(canned={})
+
+    def add(self, *args, **kwargs):
+        raise RuntimeError("ollama is dead, all calls fail")
+
+
+def test_apply_merge_total_failure_still_keeps_disk_consistent(tmp_path):
+    storage = VaultStorage(tmp_path)
+    a = storage.save(content="A original body", title="a")
+    b = storage.save(content="B original body", title="b")
+    a.created = "2026-01-01T00:00:00-03:00"
+    b.created = "2026-02-01T00:00:00-03:00"
+    storage._write(a)
+    storage._write(b)
+
+    dead = _AddAlwaysCrashingIndex()
+    pair = Pair(a=storage.get("a"), b=storage.get("b"), score=0.97)
+    res = Resolution(
+        action="MERGE",
+        rationale="overlap",
+        merged_body="Fused body",
+        merged_title="Fused",
+    )
+
+    import pytest
+
+    with pytest.raises(RuntimeError):
+        apply_resolution(storage, dead, pair, res)
+
+    # Both .md files must still be on disk with their original bodies.
+    # The user can run ``mem-vault reindex`` to restore the index.
+    a_after = storage.get("a")
+    b_after = storage.get("b")
+    assert a_after is not None and a_after.body == "A original body"
+    assert b_after is not None and b_after.body == "B original body"
+
+
+def test_apply_keep_first_orders_storage_delete_before_index(tmp_path):
+    """KEEP_FIRST must delete the .md before the index entry. A crash in
+    between is recoverable via reindex's orphan sweep; the reverse order
+    would leave a file with no embedding (silent search miss).
+    """
+    storage, fake, pair = _seeded(tmp_path)
+
+    call_order: list[str] = []
+    real_delete_file = storage.delete
+
+    def spy_delete(mid):
+        call_order.append(f"storage.delete({mid})")
+        return real_delete_file(mid)
+
+    def spy_delete_idx(key, value, user_id):
+        call_order.append(f"index.delete({value})")
+        return 1
+
+    storage.delete = spy_delete  # type: ignore[assignment]
+    fake.delete_by_metadata = spy_delete_idx  # type: ignore[assignment]
+
+    res = Resolution(action="KEEP_FIRST", rationale="A subsumes B")
+    apply_resolution(storage, fake, pair, res)
+
+    assert call_order == [f"storage.delete({pair.b.id})", f"index.delete({pair.b.id})"]
