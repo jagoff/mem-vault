@@ -56,6 +56,9 @@ from mem_vault.cli import (
     install_skill as _install_skill_mod,
 )
 from mem_vault.cli import (
+    metrics as _metrics_mod,
+)
+from mem_vault.cli import (
     reindex as _reindex_mod,
 )
 from mem_vault.cli import (
@@ -91,6 +94,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _install_skill_mod.add_subparser(sub)
     _doctor_mod.add_subparser(sub)
     _eval_mod.add_subparser(sub)
+    _metrics_mod.add_subparser(sub)
 
     return parser
 
@@ -144,6 +148,9 @@ def _dispatch(argv: list[str]) -> None:
 
     if cmd == "eval":
         sys.exit(asyncio.run(_eval_mod.run(args)))
+
+    if cmd == "metrics":
+        sys.exit(_metrics_mod.run(args))
 
     if cmd in {"hook-sessionstart", "hook-userprompt", "hook-stop"}:
         _hooks_mod.run(cmd)
