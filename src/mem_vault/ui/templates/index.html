@@ -37,7 +37,45 @@
   </header>
 
   <main>
-    <section class="controls">
+    {# Tab bar — switches what gets swapped into #rows. Each tab carries the
+       endpoint URL in data-endpoint so the JS hash-router can replay it on
+       reload (#tab=quality → load /api/quality on boot). The All tab keeps
+       the search form active; the others hide it because their datasets are
+       already curated and a free-text query would be a UX dead-end there. #}
+    <nav class="tabs" role="tablist">
+      <button class="tab-btn active" role="tab" data-tab="all"
+              data-endpoint="{{ prefix }}/api/memories"
+              hx-get="{{ prefix }}/api/memories"
+              hx-target="#rows" hx-swap="innerHTML">
+        all <span class="tab-count" id="tab-count-all"></span>
+      </button>
+      <button class="tab-btn" role="tab" data-tab="top"
+              data-endpoint="{{ prefix }}/api/top"
+              hx-get="{{ prefix }}/api/top"
+              hx-target="#rows" hx-swap="innerHTML">
+        top
+      </button>
+      <button class="tab-btn" role="tab" data-tab="quality"
+              data-endpoint="{{ prefix }}/api/quality"
+              hx-get="{{ prefix }}/api/quality"
+              hx-target="#rows" hx-swap="innerHTML">
+        quality <span class="tab-count" id="tab-count-quality"></span>
+      </button>
+      <button class="tab-btn" role="tab" data-tab="duplicates"
+              data-endpoint="{{ prefix }}/api/duplicates"
+              hx-get="{{ prefix }}/api/duplicates"
+              hx-target="#rows" hx-swap="innerHTML">
+        duplicates <span class="tab-count" id="tab-count-duplicates"></span>
+      </button>
+      <button class="tab-btn" role="tab" data-tab="by-project"
+              data-endpoint="{{ prefix }}/api/by-project"
+              hx-get="{{ prefix }}/api/by-project"
+              hx-target="#rows" hx-swap="innerHTML">
+        by project
+      </button>
+    </nav>
+
+    <section class="controls" data-show-on-tab="all">
       <form id="filters"
             hx-get="{{ prefix }}/api/memories"
             hx-target="#rows"
@@ -83,7 +121,72 @@
     // from <body data-prefix="..."> so the same code works in both modes.
     const PREFIX = document.body.dataset.prefix || '';
 
-    // Tiny modal helper. Click a row → fetch detail → populate modal-root.
+    // ------ tab routing ----------------------------------------------------
+    // Tab state is encoded in window.location.hash (#tab=quality, etc.) so a
+    // bookmarked link or browser-back works without server-side state. The
+    // initial load picks up the hash and swaps the corresponding fragment;
+    // clicking a tab updates the hash and lets HTMX do the network call.
+
+    const VALID_TABS = ['all', 'top', 'quality', 'duplicates', 'by-project'];
+
+    function getActiveTab() {
+      const m = window.location.hash.match(/tab=([\w-]+)/);
+      const candidate = m ? m[1] : 'all';
+      return VALID_TABS.includes(candidate) ? candidate : 'all';
+    }
+
+    function setActiveTab(name, { swap = true } = {}) {
+      document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.tab === name);
+      });
+      // Show/hide the search form: only meaningful on the All tab.
+      document.querySelectorAll('[data-show-on-tab]').forEach(el => {
+        el.style.display = el.dataset.showOnTab === name ? '' : 'none';
+      });
+      // Persist in the URL so reload + browser back/forward work.
+      const newHash = `#tab=${name}`;
+      if (window.location.hash !== newHash) {
+        history.replaceState(null, '', newHash);
+      }
+      if (swap) {
+        const btn = document.querySelector(`.tab-btn[data-tab="${name}"]`);
+        if (btn && btn.dataset.endpoint) {
+          htmx.ajax('GET', btn.dataset.endpoint, '#rows');
+        }
+      }
+    }
+
+    // Wire clicks. We let HTMX do the actual swap (declarative is simpler);
+    // we just take care of the active class + URL hash.
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+      btn.addEventListener('click', () => setActiveTab(btn.dataset.tab, { swap: false }));
+    });
+
+    // Boot: honor the hash. We set the active tab WITHOUT triggering a swap
+    // because the #rows section already has a hx-trigger="load" attribute
+    // that fires on page load. That fetches /api/memories. If the hash is
+    // anything other than 'all' we override the boot fetch.
+    window.addEventListener('DOMContentLoaded', () => {
+      const initial = getActiveTab();
+      setActiveTab(initial, { swap: initial !== 'all' });
+    });
+
+    // ------ tab counters ---------------------------------------------------
+    // The header /api/stats refresh leaves a `quality:N` / `duplicates:N` /
+    // `total:N` data pill in the DOM. We mirror those into the tab buttons
+    // so users see "quality 63" / "duplicates 17" without opening the tab.
+    document.body.addEventListener('htmx:afterSwap', (evt) => {
+      if (evt.detail.target && evt.detail.target.id === 'stats') {
+        const total = document.querySelector('[data-stat="total"]')?.dataset?.value;
+        const issues = document.querySelector('[data-stat="with_issues"]')?.dataset?.value;
+        const dups = document.querySelector('[data-stat="duplicates"]')?.dataset?.value;
+        if (total) document.getElementById('tab-count-all').textContent = total;
+        if (issues) document.getElementById('tab-count-quality').textContent = issues;
+        if (dups) document.getElementById('tab-count-duplicates').textContent = dups;
+      }
+    });
+
+    // ------ modal helper ---------------------------------------------------
     document.body.addEventListener('htmx:afterSwap', (evt) => {
       if (evt.detail.target.id === 'modal-root') {
         const dialog = document.querySelector('#modal-root dialog');

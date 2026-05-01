@@ -1,0 +1,32 @@
+{# Quality tab — every memory the lint rules flagged, with the specific
+   issues called out below the row. Click on the row to open the editor and
+   fix the problem. Goal: reduce ``with_issues`` to 0 over time. #}
+{% if not items %}
+  <div class="empty">
+    todas las memorias pasan el lint — nada que arreglar 🎉
+  </div>
+{% else %}
+  <div class="row-count">
+    {{ with_issues }} con problemas de un total de {{ total_scanned }} ·
+    click en una fila para editarla y resolver el flag
+  </div>
+  {% for it in items %}
+    {% set m = it.memory %}
+    <article class="row row-quality" data-id="{{ m.id }}" id="row-{{ m.id }}">
+      <header class="row-head">
+        <span class="type type-{{ m.type }}">{{ m.type }}</span>
+        <h3 class="name">{{ m.name }}</h3>
+        <span class="row-flag row-flag-warn">⚠ {{ it.issues|length }} issue{% if it.issues|length != 1 %}s{% endif %}</span>
+      </header>
+      <ul class="quality-issues">
+        {% for issue in it.issues %}
+          <li>{{ issue }}</li>
+        {% endfor %}
+      </ul>
+      <footer class="row-foot">
+        <code class="id">{{ m.id }}</code>
+        {% if m.updated %}<span class="time">{{ m.updated|relative_time }}</span>{% endif %}
+      </footer>
+    </article>
+  {% endfor %}
+{% endif %}

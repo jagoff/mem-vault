@@ -1,0 +1,51 @@
+{# Duplicates tab — pairs of memories with high tag-jaccard. Each pair
+   renders side-by-side so the user can eyeball which one survives. The
+   action buttons open each memory's edit modal; merging is still manual
+   (use the `mv merge` CLI for the actual fusion — surfaces here for
+   discoverability, not for click-through). #}
+{% if not pairs %}
+  <div class="empty">no hay duplicados con jaccard ≥ {{ threshold }} 🎉</div>
+{% else %}
+  <div class="row-count">
+    {{ count }} par{% if count != 1 %}es{% endif %} con jaccard ≥ {{ threshold }} ·
+    revisá ambos lados, decidí cuál sobrevive y mergeá con
+    <code>mv merge &lt;id1&gt; &lt;id2&gt;</code>
+  </div>
+  {% for p in pairs %}
+    <article class="dup-pair">
+      <div class="dup-meta">
+        <span class="dup-jaccard" title="tag-overlap jaccard">jaccard {{ "%.2f"|format(p.jaccard or 0) }}</span>
+      </div>
+      <div class="dup-grid">
+        <div class="dup-side row" data-id="{{ p.a.id }}">
+          <header class="row-head">
+            <span class="type type-{{ p.a.type }}">{{ p.a.type }}</span>
+            <h3 class="name">{{ p.a.name }}</h3>
+          </header>
+          {% if p.a.description %}<p class="desc">{{ p.a.description }}</p>{% endif %}
+          <footer class="row-foot">
+            <code class="id">{{ p.a.id }}</code>
+            {% if p.a.updated %}<span class="time">{{ p.a.updated|relative_time }}</span>{% endif %}
+            {% if p.a.tags %}
+              <span class="tags">{% for t in p.a.tags[:5] %}<span class="tag">#{{ t }}</span>{% endfor %}</span>
+            {% endif %}
+          </footer>
+        </div>
+        <div class="dup-side row" data-id="{{ p.b.id }}">
+          <header class="row-head">
+            <span class="type type-{{ p.b.type }}">{{ p.b.type }}</span>
+            <h3 class="name">{{ p.b.name }}</h3>
+          </header>
+          {% if p.b.description %}<p class="desc">{{ p.b.description }}</p>{% endif %}
+          <footer class="row-foot">
+            <code class="id">{{ p.b.id }}</code>
+            {% if p.b.updated %}<span class="time">{{ p.b.updated|relative_time }}</span>{% endif %}
+            {% if p.b.tags %}
+              <span class="tags">{% for t in p.b.tags[:5] %}<span class="tag">#{{ t }}</span>{% endfor %}</span>
+            {% endif %}
+          </footer>
+        </div>
+      </div>
+    </article>
+  {% endfor %}
+{% endif %}

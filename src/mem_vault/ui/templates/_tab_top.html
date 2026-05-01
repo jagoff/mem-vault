@@ -1,0 +1,57 @@
+{# Top tab — 4 sub-rankings side by side. Helps the user answer:
+   - "qué memorias me están sirviendo?" (usage)
+   - "qué memorias votaron como helpful?" (helpful)
+   - "qué memorias votaron como NO helpful?" (unhelpful — candidatas a fix/borrar)
+   - "qué memorias nadie usa nunca?" (zombies — candidatas a borrar) #}
+{% set columns = [
+  ('usage', '👁 más usadas', 'devueltas por memory_search', 'usage_count'),
+  ('helpful', '👍 más helpful', 'votos thumbs up', 'helpful_count'),
+  ('unhelpful', '👎 más unhelpful', 'votos thumbs down — revisá', 'unhelpful_count'),
+  ('zombie', '🪦 zombies', 'sin uso ni votos — borrar?', None),
+] %}
+<div class="row-count">
+  4 rankings · top {{ limit }} cada uno · click en un ítem para editarlo
+</div>
+<div class="top-grid">
+  {% for key, label, hint, attr in columns %}
+    <section class="top-col">
+      <header class="top-col-head">
+        <h4 class="top-col-title">{{ label }}</h4>
+        <span class="top-col-hint">{{ hint }}</span>
+      </header>
+      {% set items = rankings[key] %}
+      {% if not items %}
+        <div class="empty top-empty">
+          {% if key in ['helpful', 'unhelpful'] %}
+            sin señal todavía — los hooks de feedback aún no acumularon votos
+          {% elif key == 'usage' %}
+            sin señal — memory_search aún no logueó usos
+          {% else %}
+            no hay zombies 🎉
+          {% endif %}
+        </div>
+      {% else %}
+        <ol class="top-list">
+          {% for m in items %}
+            {% set count = m[attr] if attr else 0 %}
+            {% set needs_work = lint_ids is defined and m.id in lint_ids %}
+            <li class="top-item row" data-id="{{ m.id }}" id="row-{{ m.id }}">
+              <div class="top-item-head">
+                <span class="type type-{{ m.type }}">{{ m.type }}</span>
+                {% if attr %}
+                  <span class="top-item-count">{{ count }}</span>
+                {% elif m.updated %}
+                  <span class="top-item-count">{{ m.updated|relative_time }}</span>
+                {% endif %}
+                {% if needs_work %}
+                  <span class="row-flag row-flag-warn" title="lint flagged">⚠</span>
+                {% endif %}
+              </div>
+              <div class="top-item-name">{{ m.name }}</div>
+            </li>
+          {% endfor %}
+        </ol>
+      {% endif %}
+    </section>
+  {% endfor %}
+</div>

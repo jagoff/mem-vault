@@ -1,7 +1,21 @@
+{# Single memory row. Renders both inside list views and as the swap target
+   after a feedback POST. ``lint_ids`` is the set of IDs lint flagged — when
+   the row's id is in it we paint a "needs work" badge so users curating the
+   list can spot quality issues without leaving the All tab. #}
+{% set prefix = request.scope.root_path %}
+{% set usage = m.usage_count or 0 %}
+{% set helpful = m.helpful_count or 0 %}
+{% set unhelpful = m.unhelpful_count or 0 %}
+{% set has_signal = (usage + helpful + unhelpful) > 0 %}
+{% set is_zombie = (not has_signal) and m.updated %}
+{% set needs_work = lint_ids is defined and m.id in lint_ids %}
 <article class="row" data-id="{{ m.id }}" id="row-{{ m.id }}">
   <header class="row-head">
     <span class="type type-{{ m.type }}">{{ m.type }}</span>
     <h3 class="name">{{ m.name }}</h3>
+    {% if needs_work %}
+      <span class="row-flag row-flag-warn" title="lint flagged this memory — see Quality tab">⚠ needs work</span>
+    {% endif %}
     {% if m._score %}<span class="score">{{ "%.2f"|format(m._score) }}</span>{% endif %}
   </header>
   {% if m.description %}
@@ -11,10 +25,38 @@
     <code class="id">{{ m.id }}</code>
     {% if m.tags %}
       <span class="tags">
-        {% for t in m.tags %}<span class="tag">#{{ t }}</span>{% endfor %}
+        {% for t in m.tags[:6] %}<span class="tag">#{{ t }}</span>{% endfor %}
+        {% if m.tags|length > 6 %}<span class="tag tag-more">+{{ m.tags|length - 6 }}</span>{% endif %}
       </span>
     {% endif %}
     {% if m.updated %}<span class="time">{{ m.updated|relative_time }}</span>{% endif %}
     {% if m.agent_id %}<span class="agent">@{{ m.agent_id }}</span>{% endif %}
+
+    {# Counters strip — only renders if the memory has any signal. Avoids
+       painting `0 0 0` on every zombie row, which is visual noise. #}
+    {% if has_signal %}
+      <span class="row-counters" title="usage / helpful / unhelpful">
+        {% if usage %}<span class="row-counter" title="seen by memory_search">👁 {{ usage }}</span>{% endif %}
+        {% if helpful %}<span class="row-counter row-counter-up" title="thumbs up">👍 {{ helpful }}</span>{% endif %}
+        {% if unhelpful %}<span class="row-counter row-counter-down" title="thumbs down">👎 {{ unhelpful }}</span>{% endif %}
+      </span>
+    {% endif %}
+
+    {# Inline rating actions. Posting `inline=1` makes the endpoint return
+       this entire row HTML (instead of just the modal feedback chunk),
+       which HTMX swaps via outerHTML — counters update live without
+       opening the modal. #}
+    <span class="row-rate">
+      <button type="button" class="rate-btn rate-up" title="Mark as helpful"
+              hx-post="{{ prefix }}/api/memories/{{ m.id }}/feedback"
+              hx-vals='{"helpful": "true", "inline": "1"}'
+              hx-target="#row-{{ m.id }}"
+              hx-swap="outerHTML">👍</button>
+      <button type="button" class="rate-btn rate-down" title="Mark as not helpful"
+              hx-post="{{ prefix }}/api/memories/{{ m.id }}/feedback"
+              hx-vals='{"helpful": "false", "inline": "1"}'
+              hx-target="#row-{{ m.id }}"
+              hx-swap="outerHTML">👎</button>
+    </span>
   </footer>
 </article>

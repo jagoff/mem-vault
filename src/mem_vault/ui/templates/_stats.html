@@ -1,4 +1,23 @@
-<span class="stat-pill" title="total memories">{{ total }} memor{% if total != 1 %}ies{% else %}y{% endif %}</span>
+{# Header stat pills. The hidden data-stat="..." attributes feed the tab
+   counters in index.html (see the htmx:afterSwap listener) so the user
+   sees `quality 63 / duplicates 17` next to each tab without opening it. #}
+<span class="stat-pill" data-stat="total" data-value="{{ total }}" title="total memories">{{ total }} memor{% if total != 1 %}ies{% else %}y{% endif %}</span>
+{% if with_issues %}
+<span class="stat-pill stat-pill-warn" data-stat="with_issues" data-value="{{ with_issues }}"
+      title="memorias with lint issues — see Quality tab"
+      onclick="document.querySelector('.tab-btn[data-tab=&quot;quality&quot;]')?.click()"
+      style="cursor: pointer">
+  ⚠ {{ with_issues }} need{% if with_issues == 1 %}s{% endif %} work
+</span>
+{% endif %}
+{% if duplicates %}
+<span class="stat-pill stat-pill-info" data-stat="duplicates" data-value="{{ duplicates }}"
+      title="duplicate pairs (jaccard ≥ 0.7) — see Duplicates tab"
+      onclick="document.querySelector('.tab-btn[data-tab=&quot;duplicates&quot;]')?.click()"
+      style="cursor: pointer">
+  ⧉ {{ duplicates }} dup{% if duplicates != 1 %}s{% endif %}
+</span>
+{% endif %}
 {% for type, count in by_type.items() %}
   <span class="stat-pill type-{{ type }}" title="{{ count }} {{ type }} memor{% if count != 1 %}ies{% else %}y{% endif %}">{{ type }} · {{ count }}</span>
 {% endfor %}

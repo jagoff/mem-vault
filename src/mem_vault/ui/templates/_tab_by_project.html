@@ -1,0 +1,25 @@
+{# By-project tab — group memorias by their primary project tag. Each
+   project section is collapsable (uses native <details>). The "(other)"
+   bucket catches memorias without a project tag so nothing disappears
+   from the listing. #}
+{% if not groups %}
+  <div class="empty">no hay memorias para agrupar</div>
+{% else %}
+  <div class="row-count">
+    {{ groups|length }} grupo{% if groups|length != 1 %}s{% endif %} ·
+    click en cada nombre para colapsar / expandir
+  </div>
+  {% for project, mems in groups %}
+    <details class="project-group" {% if loop.index <= 2 %}open{% endif %}>
+      <summary class="project-summary">
+        <span class="project-name">{{ project }}</span>
+        <span class="project-count">{{ mems|length }} memor{% if mems|length != 1 %}ies{% else %}y{% endif %}</span>
+      </summary>
+      <div class="project-rows">
+        {% for m in mems %}
+          {% include "_row.html" %}
+        {% endfor %}
+      </div>
+    </details>
+  {% endfor %}
+{% endif %}

@@ -259,7 +259,14 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
     # into a slideshow. The cache is invalidated automatically when the TTL
     # lapses; UI refreshes inherit the lag at most once per ``_STATS_TTL_S``.
     _STATS_TTL_S = 30.0
-    _stats_cache: dict[str, Any] = {"ts": 0.0, "by_type": None, "by_agent": None, "total": 0}
+    _stats_cache: dict[str, Any] = {
+        "ts": 0.0,
+        "by_type": None,
+        "by_agent": None,
+        "total": 0,
+        "with_issues": 0,
+        "duplicates": 0,
+    }
     _types_cache: dict[str, Any] = {"ts": 0.0, "types": None, "tags": None}
     _cache_lock = asyncio.Lock()
 
@@ -292,12 +299,60 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
 
     # ----- API: list / search ----------------------------------------------
 
+    async def _lint_set() -> set[str]:
+        """Returns the set of memory IDs that ``service.lint`` flagged.
+
+        The full lint payload is paginated to 100 entries server-side, but for
+        the UI badge we only need the IDs — anything beyond the cap shows up
+        unflagged, which is fine: the user already gets a yellow pill in the
+        header pointing them at the dedicated Quality tab.
+        """
+        payload = await service.lint({})
+        if not payload.get("ok"):
+            return set()
+        return {p["id"] for p in payload.get("problems", [])}
+
+    def _sort_memories(memories: list[dict[str, Any]], sort: str) -> list[dict[str, Any]]:
+        """Apply a stable sort over the in-memory list.
+
+        Sort keys are lifted from the row counters that ``Memory.to_frontmatter``
+        emits when non-zero. ``zombie`` is the inverse signal — memorias never
+        retrieved AND old enough to plausibly be dead weight; we sort by oldest
+        ``updated`` so the list reads top→bottom as "first candidates to prune".
+        """
+        if not sort:
+            return memories
+        if sort == "usage_desc":
+            return sorted(memories, key=lambda m: int(m.get("usage_count") or 0), reverse=True)
+        if sort == "helpful_desc":
+            return sorted(memories, key=lambda m: int(m.get("helpful_count") or 0), reverse=True)
+        if sort == "unhelpful_desc":
+            return sorted(
+                memories, key=lambda m: int(m.get("unhelpful_count") or 0), reverse=True
+            )
+        if sort == "zombie":
+            zombies = [
+                m
+                for m in memories
+                if int(m.get("usage_count") or 0) == 0
+                and int(m.get("helpful_count") or 0) == 0
+                and int(m.get("unhelpful_count") or 0) == 0
+            ]
+            return sorted(zombies, key=lambda m: m.get("updated") or "")
+        if sort == "recent":
+            return sorted(memories, key=lambda m: m.get("updated") or "", reverse=True)
+        return memories
+
     @app.get("/api/memories", response_class=HTMLResponse)
     async def list_memories(
         request: Request,
         q: str = Query("", description="Optional semantic search query."),
         type: str = Query("", description="Filter by memory type."),
         tag: str = Query("", description="Filter by a single tag."),
+        sort: str = Query(
+            "",
+            description="Optional sort: usage_desc / helpful_desc / unhelpful_desc / zombie / recent.",
+        ),
         limit: int = Query(100, ge=1, le=500),
     ):
         results: list[dict[str, Any]]
@@ -313,11 +368,15 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
                     mem["_score"] = h.get("score")
                     results.append(mem)
         else:
+            # When sorting by usage / zombie we need the FULL corpus, not the
+            # default 100-most-recent slice — otherwise "top usado" only ranks
+            # within the most recent window and silently drops older winners.
+            effective_limit = 500 if sort in {"usage_desc", "helpful_desc", "unhelpful_desc", "zombie"} else limit
             payload = await service.list_(
                 {
                     "type": type or None,
                     "tags": [tag] if tag else None,
-                    "limit": limit,
+                    "limit": effective_limit,
                 }
             )
             results = payload.get("memories", [])
@@ -328,11 +387,22 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
                     if (not type or m.get("type") == type)
                     and (not tag or tag in (m.get("tags") or []))
                 ]
+            if sort:
+                results = _sort_memories(results, sort)[:limit]
 
+        lint_ids = await _lint_set() if results else set()
         return templates.TemplateResponse(
             request,
             "_rows.html",
-            {"memories": results, "searched": searched, "q": q, "type": type, "tag": tag},
+            {
+                "memories": results,
+                "searched": searched,
+                "q": q,
+                "type": type,
+                "tag": tag,
+                "sort": sort,
+                "lint_ids": lint_ids,
+            },
         )
 
     # ----- API: detail / edit / delete -------------------------------------
@@ -390,6 +460,7 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
         request: Request,
         mem_id: str,
         helpful: str = Form(""),
+        inline: str = Form(""),
     ):
         """Record a thumbs up/down on a memory from the UI.
 
@@ -397,6 +468,11 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
         / ``""``. We coerce to bool | None and delegate to
         ``MemVaultService.feedback``; the response re-renders the feedback
         chunk so HTMX can swap it in place without a page reload.
+
+        When ``inline=1`` the response is the FULL row (``_row.html``)
+        instead of just the modal feedback chunk — that's what the new tab
+        UI uses to update counters in place after a thumbs click without
+        reopening the modal.
         """
         helpful_value: bool | None
         val = helpful.strip().lower()
@@ -417,10 +493,165 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
         mem_payload = await service.get({"id": mem_id})
         if not mem_payload.get("ok"):
             raise HTTPException(404, "memory vanished")
+        memory = mem_payload["memory"]
+        if inline.strip() in {"1", "true", "yes"}:
+            lint_ids = await _lint_set()
+            return templates.TemplateResponse(
+                request,
+                "_row.html",
+                {"m": memory, "lint_ids": lint_ids},
+            )
         return templates.TemplateResponse(
             request,
             "_feedback.html",
-            {"m": mem_payload["memory"]},
+            {"m": memory},
+        )
+
+    # ----- API: tab views (Quality / Duplicates / Top / By project) --------
+    #
+    # Each tab is its own HTMX fragment endpoint that swaps into ``#rows``.
+    # Putting them behind dedicated URLs (instead of overloading
+    # ``/api/memories`` with a giant ``view`` enum) keeps the templates
+    # self-contained and the URL hash routing on the client stays simple.
+
+    @app.get("/api/quality", response_class=HTMLResponse)
+    async def quality_view(request: Request):
+        """Render the Quality tab — every memory ``service.lint`` flagged.
+
+        Pre-fetches the full memory dict for each problem so the row card can
+        render its title / description / counters without a second roundtrip.
+        Service.lint is capped at 100 problems server-side; we honor that here.
+        """
+        payload = await service.lint({})
+        problems = payload.get("problems", []) if payload.get("ok") else []
+        # Pull the corpus once and index by id — N reads from disk is cheaper
+        # than N roundtrips to ``service.get`` for large lint lists.
+        corpus = await service.list_({"limit": 500})
+        by_id = {m["id"]: m for m in corpus.get("memories", [])}
+        items = []
+        for p in problems:
+            mem = by_id.get(p["id"])
+            if mem:
+                items.append({"memory": mem, "issues": p.get("issues", [])})
+        return templates.TemplateResponse(
+            request,
+            "_tab_quality.html",
+            {
+                "items": items,
+                "total_scanned": payload.get("total_scanned", 0),
+                "with_issues": payload.get("with_issues", 0),
+            },
+        )
+
+    @app.get("/api/duplicates", response_class=HTMLResponse)
+    async def duplicates_view(
+        request: Request,
+        threshold: float = Query(0.7, ge=0.0, le=1.0),
+    ):
+        """Render the Duplicates tab — pairs with tag-jaccard ≥ threshold."""
+        payload = await service.duplicates({"threshold": threshold})
+        pairs_raw = payload.get("pairs", []) if payload.get("ok") else []
+        corpus = await service.list_({"limit": 500})
+        by_id = {m["id"]: m for m in corpus.get("memories", [])}
+        pairs = []
+        for p in pairs_raw:
+            a, b = by_id.get(p["a"]), by_id.get(p["b"])
+            if a and b:
+                pairs.append({"a": a, "b": b, "jaccard": p.get("jaccard")})
+        return templates.TemplateResponse(
+            request,
+            "_tab_duplicates.html",
+            {
+                "pairs": pairs,
+                "threshold": threshold,
+                "count": payload.get("count", 0),
+            },
+        )
+
+    @app.get("/api/top", response_class=HTMLResponse)
+    async def top_view(request: Request, limit: int = Query(8, ge=1, le=20)):
+        """Render the Top tab — 4 sub-rankings side-by-side.
+
+        Each ranking pulls from the same in-RAM corpus snapshot to minimize
+        disk IO. ``zombie`` is the only ranking that filters before sorting;
+        the other three sort the full corpus and slice the head.
+        """
+        corpus = await service.list_({"limit": 500})
+        memories = corpus.get("memories", [])
+        rankings = {
+            "usage": _sort_memories(list(memories), "usage_desc")[:limit],
+            "helpful": _sort_memories(list(memories), "helpful_desc")[:limit],
+            "unhelpful": _sort_memories(list(memories), "unhelpful_desc")[:limit],
+            "zombie": _sort_memories(list(memories), "zombie")[:limit],
+        }
+        # Filter out zero-count entries from helpful/unhelpful — showing all
+        # zeros is noise; better to render an "all 0 — no signal yet" empty
+        # state for those two columns and let usage + zombies carry the tab
+        # until the feedback hooks accumulate signal.
+        rankings["usage"] = [m for m in rankings["usage"] if int(m.get("usage_count") or 0) > 0]
+        rankings["helpful"] = [
+            m for m in rankings["helpful"] if int(m.get("helpful_count") or 0) > 0
+        ]
+        rankings["unhelpful"] = [
+            m for m in rankings["unhelpful"] if int(m.get("unhelpful_count") or 0) > 0
+        ]
+        lint_ids = await _lint_set()
+        return templates.TemplateResponse(
+            request,
+            "_tab_top.html",
+            {"rankings": rankings, "limit": limit, "lint_ids": lint_ids},
+        )
+
+    @app.get("/api/by-project", response_class=HTMLResponse)
+    async def by_project_view(request: Request):
+        """Render the "By project" tab — group memorias by their primary tag.
+
+        We group by the first tag the memory has under a small whitelist of
+        "project-shaped" tags (lowercase, hyphenated, no whitespace). Any
+        memoria without a project tag goes into a catch-all bucket so it's
+        not invisible. Projects are sorted by count descending so the most
+        active appears first.
+        """
+        corpus = await service.list_({"limit": 500})
+        memories = corpus.get("memories", [])
+        # Count tag frequency to surface the top N project tags. We then
+        # bucket each memory by its first tag that hits the project list,
+        # which usually matches the user's mental model ("this is for
+        # obsidian-rag", "this is for whatsapp-listener", ...).
+        tag_counts: Counter = Counter()
+        for m in memories:
+            for t in (m.get("tags") or []):
+                tag_counts[t] += 1
+        # Heuristic: a "project" tag is one of the top 20 tags AND looks
+        # project-shaped (no spaces, no slashes, not a generic technique
+        # word like "rag" / "frontend"). The user's vault has obsidian-rag,
+        # mem-vault, whatsapp-listener, etc. as the dominant projects.
+        GENERIC_TAGS = {
+            "rag", "frontend", "backend", "launchd", "ollama", "feedback",
+            "bug", "fix", "test", "refactor", "decision", "performance",
+            "ui", "cli", "mcp", "web", "python", "config", "cache",
+        }
+        project_candidates = [
+            t for t, _ in tag_counts.most_common(40)
+            if "-" in t and t not in GENERIC_TAGS
+        ]
+        buckets: dict[str, list[dict[str, Any]]] = {}
+        unsorted: list[dict[str, Any]] = []
+        for m in memories:
+            tags = m.get("tags") or []
+            project = next((t for t in tags if t in project_candidates), None)
+            if project:
+                buckets.setdefault(project, []).append(m)
+            else:
+                unsorted.append(m)
+        groups = sorted(buckets.items(), key=lambda kv: len(kv[1]), reverse=True)
+        if unsorted:
+            groups.append(("(other)", unsorted))
+        lint_ids = await _lint_set()
+        return templates.TemplateResponse(
+            request,
+            "_tab_by_project.html",
+            {"groups": groups, "lint_ids": lint_ids},
         )
 
     # ----- API: stats -------------------------------------------------------
@@ -474,6 +705,23 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
             _types_cache.update({"ts": now, "types": data["types"], "tags": data["tags"]})
             return data
 
+    async def _refresh_health_cache() -> tuple[int, int]:
+        """Refresh with_issues + duplicates counters in the stats cache.
+
+        These two counters power the "Quality · N" / "Duplicates · N" pills
+        in the header. They're computed via dedicated service calls (lint +
+        duplicates) and cached on the same TTL as the corpus stats so a
+        single header refresh isn't a triple disk walk.
+        """
+        lint_payload = await service.lint({})
+        with_issues = int(lint_payload.get("with_issues", 0) or 0)
+        dup_payload = await service.duplicates({"threshold": 0.7})
+        duplicates = int(dup_payload.get("count", 0) or 0)
+        async with _cache_lock:
+            _stats_cache["with_issues"] = with_issues
+            _stats_cache["duplicates"] = duplicates
+        return with_issues, duplicates
+
     @app.get("/api/stats", response_class=HTMLResponse)
     async def stats(request: Request):
         if _stats_fresh():
@@ -481,13 +729,29 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
                 "total": _stats_cache["total"],
                 "by_type": _stats_cache["by_type"] or {},
                 "by_agent": _stats_cache["by_agent"] or {},
+                "with_issues": _stats_cache.get("with_issues", 0),
+                "duplicates": _stats_cache.get("duplicates", 0),
             }
         else:
-            data = await _refresh_stats_cache()
+            base = await _refresh_stats_cache()
+            with_issues, duplicates = await _refresh_health_cache()
+            data = {
+                "total": base["total"],
+                "by_type": base["by_type"],
+                "by_agent": base["by_agent"],
+                "with_issues": with_issues,
+                "duplicates": duplicates,
+            }
         return templates.TemplateResponse(
             request,
             "_stats.html",
-            {"total": data["total"], "by_type": data["by_type"], "by_agent": data["by_agent"]},
+            {
+                "total": data["total"],
+                "by_type": data["by_type"],
+                "by_agent": data["by_agent"],
+                "with_issues": data["with_issues"],
+                "duplicates": data["duplicates"],
+            },
         )
 
     @app.get("/api/types")

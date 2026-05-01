@@ -6,6 +6,81 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-01
+
+**UI overhaul: `/memory/` deja de ser un explorador plano y pasa a ser un
+dashboard de curaduría.** El panel anterior listaba todas las memorias en
+una sola lista con search semántica + filtro por type — útil para encontrar
+una memoria específica, pero no daba ninguna pista de qué necesita atención
+ni cómo se está comportando el corpus.
+
+### Added — 5 tabs (All / Top / Quality / Duplicates / By project)
+
+Tab bar nuevo en `/memory/`. Cada tab es un fragment HTMX dedicado con
+endpoint propio (`/api/quality`, `/api/duplicates`, `/api/top`,
+`/api/by-project`); el state del tab activo se persiste en `window.location.hash`
+así un reload o un bookmark vuelven al mismo lugar.
+
+- **All** — la lista plana de antes, ahora con search semántica y filtro por type.
+- **Top** — 4 sub-rankings side-by-side: 👁 más usadas / 👍 más helpful /
+  👎 más unhelpful (revisar) / 🪦 zombies (sin uso ni votos — candidatas a borrar).
+- **Quality** — todo lo que `service.lint` flagged, con la lista de issues
+  desplegada debajo de cada row para arreglar in-place.
+- **Duplicates** — pares con jaccard ≥ 0.7 mostrados side-by-side, con
+  instrucción de merge via `mv merge <id1> <id2>` (la fusión real sigue siendo
+  CLI, no autoclick — evita merges destructivos no intencionales).
+- **By project** — agrupa memorias por su tag de proyecto principal
+  (heurística: top-tags con guión y no en una whitelist de tags genéricos
+  como `rag`, `frontend`, `launchd`...). Cada grupo es `<details>` collapsable.
+
+### Added — thumbs inline en cada row sin abrir el modal
+
+Antes el thumbs up/down vivía dentro del modal de detalle (`_feedback.html`).
+Para puntuar una memoria había que click → modal → buscar el botón → click.
+Ahora cada row tiene 👍 / 👎 inline (visible on hover) que postean a
+`/api/memories/{id}/feedback?inline=1`. El endpoint devuelve el row entero
+re-renderizado y HTMX hace `outerHTML` swap → el counter se actualiza in-place
+sin abrir nada.
+
+El endpoint POST acepta `inline=1` opcional; sin el flag mantiene el
+comportamiento legacy (devuelve solo el `_feedback.html` chunk para el modal).
+
+### Added — counters condicionales + quality badge en cada row
+
+`_row.html` ahora muestra:
+
+- 👁 `usage_count` / 👍 `helpful_count` / 👎 `unhelpful_count` solo si > 0
+  (evita pintar `0 0 0` en cada zombie row, que es ruido visual).
+- Badge `⚠ needs work` si la memoria está en el set de lint (`lint_ids` que
+  el endpoint inyecta al template). Click en el badge → tab Quality.
+
+### Added — `with_issues` + `duplicates` pills en el header
+
+`/api/stats` ahora devuelve dos pills extra:
+
+- `⚠ N need work` — total de memorias con issues de lint. Click → tab Quality.
+- `⧉ N dups` — total de pares con jaccard ≥ 0.7. Click → tab Duplicates.
+
+Los counters se mirrorean a los tabs (vía `data-stat` attributes) así el user
+ve "quality 63 / duplicates 17" sin abrir el tab. Los datos se cachean junto
+al cache existente de `/api/stats` (TTL 30s) — un solo refresh del header
+hace 1 read del corpus, no 3.
+
+### Added — sort param para `/api/memories`
+
+Sorts soportados: `usage_desc`, `helpful_desc`, `unhelpful_desc`, `zombie`
+(memorias sin signal alguno, ordenadas por `updated` ascendente para que las
+más viejas aparezcan primero), `recent`. Cuando el sort necesita rankear todo
+el corpus (no solo las 100 más recientes) el endpoint sube el límite a 500
+y después slicea. Esto alimenta la tab Top.
+
+### Changed — `_row.html` truncá tags > 6 con un `+N` chip
+
+Memorias con muchos tags (la del wave-2 fine-tunning tiene 11) hacían wrap
+hasta 3 líneas. Ahora se muestran los primeros 6 + un `+N more` chip.
+
+Generated with [Devin](https://cli.devin.ai/docs)
+
 ## [0.4.0] - 2026-04-30
 
 **Beta release.** Project bumps from "Alpha" → "Beta" in pyproject classifiers.
