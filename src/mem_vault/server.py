@@ -1037,6 +1037,25 @@ class MemVaultService:
             hits = []
             dense_warning = f"dense_timeout: {exc} (BM25 fallback)"
 
+        # Silent failure detection: ``index.search`` swallows runtime errors
+        # (RemoteProtocolError, ConnectionError, model eviction mid-flight)
+        # and returns ``[]`` to keep the agent's turn alive. That's the
+        # right call for happy-path UX, but it loses visibility — under
+        # memory pressure the agent has no idea its searches are returning
+        # empty because Ollama crashed, not because no memorias matched.
+        # When hybrid is enabled BM25 still runs against the local vault
+        # (next block) so the response can carry useful results; we just
+        # need to surface the underlying error so the caller knows it ran
+        # in degraded mode. ``_LLMTimeoutError`` already set ``hits = []``
+        # above, so this also catches the timeout path that didn't ``return``.
+        last_dense_error = getattr(self.index, "last_search_error", None)
+        if last_dense_error is not None and dense_warning is None:
+            dense_warning = f"dense_error: {type(last_dense_error).__name__}: {last_dense_error} (BM25 fallback)"
+            logger.warning(
+                "dense search returned empty due to %s; relying on BM25-only",
+                last_dense_error,
+            )
+
         # Hybrid step: run BM25 sparse in parallel to the dense search,
         # fuse with Reciprocal Rank Fusion. Runs BEFORE rerank so the
         # cross-encoder sees the richer union (dense ∪ bm25) of

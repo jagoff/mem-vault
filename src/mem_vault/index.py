@@ -175,11 +175,34 @@ class VectorIndex:
         # ``server.py`` (``asyncio.wait_for``); the breaker is the second
         # layer that prevents stacking hangs once Ollama is unreachable.
         self._breaker = _CircuitBreaker(threshold=3, cooldown_s=30.0)
+        # Silent failure observability: the design choice in ``search`` is to
+        # swallow runtime errors (RemoteProtocolError, ConnectionError, model
+        # eviction mid-flight, …) and return ``[]`` so a missed lookup
+        # doesn't abort the agent's turn. That's friendly for the happy path
+        # but invisible to the caller — under memory pressure the agent
+        # silently loses access to past context. We expose the *last* error
+        # captured by ``search`` (cleared on success) so higher-level code
+        # can render a ``warning: dense_error: ...`` and decide whether to
+        # surface a fallback result. See ``server.search`` for the consumer.
+        self._last_search_error: Exception | None = None
 
     @property
     def breaker(self) -> _CircuitBreaker:
         """Expose the breaker so tests / callers can inspect or reset it."""
         return self._breaker
+
+    @property
+    def last_search_error(self) -> Exception | None:
+        """The last exception captured by :meth:`search` and turned into an
+        empty-list return. ``None`` after a successful search.
+
+        Read once per search call from ``server.py`` to detect silent
+        degraded mode. Writes happen only inside :meth:`search` (and the
+        circuit breaker short-circuit), so there's no cross-thread
+        synchronization concern beyond the GIL — same instance is owned
+        by a single :class:`MemVaultService`.
+        """
+        return self._last_search_error
 
     @property
     def mem0(self) -> Mem0Memory:
@@ -295,6 +318,13 @@ class VectorIndex:
         # still ticks though, so repeated failures will trip it). Returning
         # ``[]`` is friendlier than raising for the agent: a failed search
         # is a missed lookup, not a hard error worth aborting the turn for.
+        # Reset the silent-failure marker before each call. If the search
+        # succeeds, ``last_search_error`` stays ``None`` and callers know
+        # an empty list means "no semantic matches", not "the embedder
+        # crashed". If it fails, we stash the exception so ``server.py``
+        # can render a degraded-mode warning without losing the friendly
+        # empty-list contract.
+        self._last_search_error = None
         try:
             self._breaker.check()
             res = self.mem0.search(
@@ -305,10 +335,12 @@ class VectorIndex:
             )
         except CircuitBreakerOpenError as exc:
             logger.warning("mem0 search short-circuited: %s", exc)
+            self._last_search_error = exc
             return []
         except Exception as exc:
             self._breaker.record_failure()
             logger.warning("mem0 search failed (%s); returning empty list", exc)
+            self._last_search_error = exc
             return []
         self._breaker.record_success()
 

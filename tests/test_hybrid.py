@@ -404,6 +404,99 @@ async def test_dense_timeout_without_hybrid_returns_empty_with_warning(hybrid_se
     assert "Ollama call exceeded" in res["warning"]
 
 
+class _DenseSilentFailStubIndex:
+    """Dense-side stub that simulates the production silent-failure path:
+    runtime error inside ``index.search`` is swallowed, ``[]`` is returned,
+    and ``last_search_error`` is set to the captured exception.
+
+    Mirrors what happens when mem0's underlying httpx call raises
+    ``RemoteProtocolError`` ("Server disconnected") or ``ConnectError``
+    (Ollama killed mid-flight) — the real ``VectorIndex.search`` catches
+    the broad ``Exception`` and stashes it on ``self._last_search_error``.
+    """
+
+    def __init__(self, exc: Exception):
+        self._breaker = _CircuitBreaker(threshold=3, cooldown_s=30.0)
+        self._exc = exc
+        self.last_search_error: Exception | None = None
+
+    @property
+    def breaker(self):
+        return self._breaker
+
+    def add(self, content, **kwargs):
+        return [{"id": "stub"}]
+
+    def search(self, query, **kwargs):
+        # Production behavior: swallow + stash + return [].
+        self.last_search_error = self._exc
+        return []
+
+    def delete_by_metadata(self, *args):
+        return 0
+
+
+async def test_silent_dense_failure_falls_back_to_bm25_with_warning(hybrid_service):
+    """When ``index.search`` swallows a runtime error and returns ``[]``
+    (RemoteProtocolError, ConnectError, etc.), the service should:
+
+    1. Not retry the dense path (the breaker handles repeats).
+    2. Let BM25 run against the local vault and surface its hits.
+    3. Carry a ``warning: dense_error: ...`` so the caller can tell
+       this was a degraded-mode response, not a "no matches" response.
+    """
+    service = hybrid_service()
+    saved = await service.save({"content": "endpoint: rate_limit=60/min", "title": "alpha"})
+
+    class _FakeRemoteProtocolError(Exception):
+        """Stand-in for httpx.RemoteProtocolError without importing httpx."""
+
+    silent_exc = _FakeRemoteProtocolError("Server disconnected without sending a response.")
+    service.index = _DenseSilentFailStubIndex(silent_exc)  # type: ignore[assignment]
+
+    res = await service.search({"query": "rate_limit", "k": 5})
+
+    assert res["ok"] is True
+    assert res["count"] >= 1, "BM25 fallback should surface the keyword match"
+    ids = [r["id"] for r in res["results"]]
+    assert saved["memory"]["id"] in ids
+    assert "warning" in res
+    assert "dense_error" in res["warning"]
+    assert "_FakeRemoteProtocolError" in res["warning"]
+    assert "Server disconnected" in res["warning"]
+    assert "BM25 fallback" in res["warning"]
+
+
+async def test_silent_dense_failure_without_hybrid_still_surfaces_warning(hybrid_service):
+    """Without hybrid, a silent dense failure produces ``count=0`` (no
+    BM25 to rescue) but **still** surfaces ``warning: dense_error: ...``
+    so the caller can tell the empty result came from a runtime error,
+    not from "no matches found". This is a deliberate change from the
+    pre-2026-05-01 behavior where a silent failure was indistinguishable
+    from a clean empty result — that asymmetry was hiding real
+    infrastructure problems from the agent.
+    """
+    service = hybrid_service(hybrid_enabled=False)
+
+    class _FakeConnectError(Exception):
+        pass
+
+    service.index = _DenseSilentFailStubIndex(_FakeConnectError("Ollama unreachable"))  # type: ignore[assignment]
+
+    res = await service.search({"query": "anything", "k": 5})
+
+    assert res["ok"] is True
+    assert res["count"] == 0
+    assert res["results"] == []
+    # Visibility universal: con o sin hybrid, el caller ve que el dense
+    # rebotó. Con hybrid agrega resultados de BM25; sin hybrid solo el
+    # warning. Ambos casos son strictly more informative than empty.
+    assert "warning" in res
+    assert "dense_error" in res["warning"]
+    assert "_FakeConnectError" in res["warning"]
+    assert "Ollama unreachable" in res["warning"]
+
+
 async def test_hybrid_invalidate_is_called_on_save(hybrid_service, monkeypatch):
     service = hybrid_service()
     calls = []
