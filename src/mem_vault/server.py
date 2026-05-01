@@ -1008,6 +1008,16 @@ class MemVaultService:
             # (which the input schema guarantees: minimum=1).
             raw_k = max(k * 3, 20)
 
+        # When the dense embed times out (Ollama down, memory pressure, model
+        # eviction mid-flight) and hybrid is enabled, we want to keep BM25 as
+        # a degraded-but-useful fallback rather than returning an empty list.
+        # That's exactly the case where memory matters most — the system is
+        # already starving Ollama, so the agent loses access to past context
+        # at the worst possible moment. The BM25 path is local-only (no
+        # Ollama call) so it stays responsive even when the embedder is
+        # unreachable. We surface the timeout via ``warning`` so callers can
+        # still tell the search ran in degraded mode.
+        dense_warning: str | None = None
         try:
             hits = await self._index_call(
                 self.index.search,
@@ -1020,8 +1030,12 @@ class MemVaultService:
         except _LLMTimeoutError as exc:
             # search() catches its own breaker errors and returns []; we
             # only end up here if the asyncio.wait_for tripped first.
-            logger.warning("search timed out: %s", exc)
-            return {"ok": True, "query": query, "count": 0, "results": [], "warning": str(exc)}
+            if self._hybrid is None:
+                logger.warning("search timed out: %s", exc)
+                return {"ok": True, "query": query, "count": 0, "results": [], "warning": str(exc)}
+            logger.warning("dense search timed out (%s); falling back to BM25-only", exc)
+            hits = []
+            dense_warning = f"dense_timeout: {exc} (BM25 fallback)"
 
         # Hybrid step: run BM25 sparse in parallel to the dense search,
         # fuse with Reciprocal Rank Fusion. Runs BEFORE rerank so the
@@ -1132,7 +1146,15 @@ class MemVaultService:
             for r in results:
                 await self._to_thread(self.storage.record_usage, r["id"])
 
-        return {"ok": True, "query": query, "count": len(results), "results": results}
+        response: dict[str, Any] = {
+            "ok": True,
+            "query": query,
+            "count": len(results),
+            "results": results,
+        }
+        if dense_warning:
+            response["warning"] = dense_warning
+        return response
 
     async def list_(self, args: dict[str, Any]) -> dict[str, Any]:
         mtype = args.get("type")

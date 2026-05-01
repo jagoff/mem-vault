@@ -339,6 +339,71 @@ async def test_hybrid_disabled_service_has_no_retriever(hybrid_service):
     assert service._hybrid is None
 
 
+class _DenseTimeoutStubIndex:
+    """Dense-side stub that simulates Ollama timing out on every search.
+
+    ``add`` still works (saves persist normally so BM25 has corpus to
+    index). Only ``search`` raises — that's the production fail mode
+    we care about: writes succeed but reads can't reach the embedder.
+    """
+
+    def __init__(self):
+        self._breaker = _CircuitBreaker(threshold=3, cooldown_s=30.0)
+
+    @property
+    def breaker(self):
+        return self._breaker
+
+    def add(self, content, **kwargs):
+        return [{"id": "stub"}]
+
+    def search(self, query, **kwargs):
+        # Mirrors what _index_call wraps after asyncio.wait_for trips.
+        from mem_vault.server import _LLMTimeoutError
+
+        raise _LLMTimeoutError("Ollama call exceeded 1s timeout (test).")
+
+    def delete_by_metadata(self, *args):
+        return 0
+
+
+async def test_hybrid_search_falls_back_to_bm25_when_dense_times_out(hybrid_service):
+    """When the dense embed call times out and hybrid is enabled, BM25
+    should still produce results and the response should carry a
+    ``warning`` flag so callers can tell they ran in degraded mode."""
+    service = hybrid_service()
+    # Save with the real (working) dense stub so the .md exists in the
+    # vault. After the save we swap in the failing stub for the search.
+    saved = await service.save({"content": "endpoint: rate_limit=60/min", "title": "alpha"})
+    service.index = _DenseTimeoutStubIndex()  # type: ignore[assignment]
+
+    res = await service.search({"query": "rate_limit", "k": 5})
+
+    assert res["ok"] is True
+    assert res["count"] >= 1, "BM25 fallback should rescue the keyword match"
+    ids = [r["id"] for r in res["results"]]
+    assert saved["memory"]["id"] in ids
+    assert "warning" in res
+    assert "dense_timeout" in res["warning"]
+    assert "BM25 fallback" in res["warning"]
+
+
+async def test_dense_timeout_without_hybrid_returns_empty_with_warning(hybrid_service):
+    """Without hybrid we keep the legacy behavior: empty results + warning,
+    not a full crash. Guards the regression where the fallback path
+    accidentally also disables the empty-fast-return."""
+    service = hybrid_service(hybrid_enabled=False)
+    service.index = _DenseTimeoutStubIndex()  # type: ignore[assignment]
+
+    res = await service.search({"query": "anything", "k": 5})
+
+    assert res["ok"] is True
+    assert res["count"] == 0
+    assert res["results"] == []
+    assert "warning" in res
+    assert "Ollama call exceeded" in res["warning"]
+
+
 async def test_hybrid_invalidate_is_called_on_save(hybrid_service, monkeypatch):
     service = hybrid_service()
     calls = []
