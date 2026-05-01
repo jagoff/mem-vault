@@ -24,6 +24,16 @@ Conservative by default to avoid bloating the context window:
 
 Like every other hook in this package, it is best-effort: any failure is
 printed to stderr and produces an empty stdout (no-op).
+
+**Canary log** (added 2026-05-01): every invocation appends one JSON line
+to ``<state_dir>/hooks/userprompt.log`` (override path with
+``MEM_VAULT_USERPROMPT_LOG``) recording the timestamp, prompt preview,
+skip reason, results count and latency. Without this we couldn't tell
+whether the hook fires at all, fires and skips, or fires and times out
+silently — every observable failure mode for the auto-search-first feature
+looks the same from the agent's POV (no ``additionalContext`` injected).
+The log is plain JSONL, append-only, best-effort: write failures never
+abort the hook.
 """
 
 from __future__ import annotations
@@ -32,7 +42,9 @@ import asyncio
 import json
 import os
 import sys
+import time
 import unicodedata
+from pathlib import Path
 
 MIN_PROMPT_CHARS = int(os.environ.get("MEM_VAULT_USERPROMPT_MIN_CHARS", "20"))
 TOP_K = int(os.environ.get("MEM_VAULT_USERPROMPT_K", "3"))
@@ -40,6 +52,62 @@ THRESHOLD = float(os.environ.get("MEM_VAULT_USERPROMPT_THRESHOLD", "0.35"))
 MAX_SNIPPET = int(os.environ.get("MEM_VAULT_USERPROMPT_MAX_SNIPPET", "240"))
 SCRIPTS_RAW = os.environ.get("MEM_VAULT_USERPROMPT_SCRIPTS", "").strip()
 SCRIPT_DOMINANCE_THRESHOLD = float(os.environ.get("MEM_VAULT_USERPROMPT_SCRIPT_RATIO", "0.6"))
+
+
+def _default_log_path() -> Path:
+    """Resolve the default canary log path lazily (avoids importing Config
+    at module top — keeps the hook startup fast on cold cache)."""
+    override = os.environ.get("MEM_VAULT_USERPROMPT_LOG", "").strip()
+    if override:
+        return Path(override).expanduser()
+    # Mirror Config._default_state_dir without importing Config (faster).
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support" / "mem-vault"
+    elif sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA")
+        base = Path(local) / "mem-vault" if local else Path.home() / "mem-vault"
+    else:
+        xdg = os.environ.get("XDG_DATA_HOME")
+        base = Path(xdg) / "mem-vault" if xdg else Path.home() / ".local" / "share" / "mem-vault"
+    return base / "hooks" / "userprompt.log"
+
+
+def _log_canary(
+    *,
+    prompt: str,
+    skip_reason: str | None,
+    results_count: int,
+    latency_ms: float,
+    exc: str | None = None,
+) -> None:
+    """Append one JSON line per invocation. Best-effort: never raises.
+
+    The log accumulates; rotate manually or via launchd's log rotation if
+    it grows beyond a few MB. JSONL keeps it `jq`-friendly for ad-hoc
+    audits like ``jq 'select(.skip_reason==null and .results_count==0)'
+    < userprompt.log | tail`` to find prompts that triggered an embed
+    call but matched nothing.
+    """
+    try:
+        path = _default_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        entry: dict[str, object] = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+            "prompt_preview": prompt[:80],
+            "prompt_len": len(prompt),
+            "skip_reason": skip_reason,
+            "results_count": results_count,
+            "latency_ms": round(latency_ms, 1),
+        }
+        if exc:
+            entry["exc"] = exc
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as inner_exc:
+        # Last-resort stderr breadcrumb so the failure isn't completely
+        # silent. Printing to stderr is what other failure paths in this
+        # hook already do (see ``run`` below) — same channel, same UX.
+        print(f"mem-vault: canary log failed: {inner_exc}", file=sys.stderr)
 
 
 # We use unicodedata.name() to bucket each letter into a coarse script. The
@@ -123,18 +191,21 @@ def _should_skip(prompt: str) -> str | None:
     return None
 
 
-async def _gather_context(prompt: str) -> str:
+async def _gather_context(prompt: str) -> tuple[str, int]:
+    """Return ``(injected_context, results_count)``. Empty string + 0 on
+    any failure path so the canary log can still record what happened.
+    """
     try:
         from mem_vault.server import build_service
     except Exception as exc:
         print(f"mem-vault: import failed: {exc}", file=sys.stderr)
-        return ""
+        return "", 0
 
     try:
         service = build_service()
     except Exception as exc:
         print(f"mem-vault: service init failed: {exc}", file=sys.stderr)
-        return ""
+        return "", 0
     try:
         result = await service.search(
             {
@@ -145,10 +216,10 @@ async def _gather_context(prompt: str) -> str:
         )
     except Exception as exc:
         print(f"mem-vault: search failed: {exc}", file=sys.stderr)
-        return ""
+        return "", 0
 
     if not result.get("ok") or not result.get("results"):
-        return ""
+        return "", 0
 
     lines: list[str] = ["## Memorias relevantes al mensaje actual (mem-vault)\n"]
     # Dedup by memory id — ``memory_search`` should already collapse duplicates
@@ -167,10 +238,11 @@ async def _gather_context(prompt: str) -> str:
         score_tag = f" (score {score:.2f})" if isinstance(score, (int, float)) else ""
         lines.append(f"- **{name}**{score_tag} — {descr[:MAX_SNIPPET]}")
 
-    if len(lines) <= 1:
-        return ""
+    count = len(seen)
+    if count == 0:
+        return "", 0
     lines.append("\n_Si necesitás el cuerpo completo de alguna, llamá a `memory_get` con su id._")
-    return "\n".join(lines)
+    return "\n".join(lines), count
 
 
 def run() -> None:
@@ -181,18 +253,39 @@ def run() -> None:
         payload = {}
 
     prompt = str(payload.get("prompt") or payload.get("user_prompt") or "")
+    started = time.monotonic()
     skip_reason = _should_skip(prompt)
     if skip_reason:
         # No-op: empty stdout + exit 0. We log to stderr so users can debug
-        # via Devin's hook output if a prompt unexpectedly didn't trigger.
+        # via Devin's hook output if a prompt unexpectedly didn't trigger,
+        # and append to the canary log so we can audit skip rates over time.
+        latency_ms = (time.monotonic() - started) * 1000
+        _log_canary(
+            prompt=prompt,
+            skip_reason=skip_reason,
+            results_count=0,
+            latency_ms=latency_ms,
+        )
         print(f"mem-vault: skip ({skip_reason})", file=sys.stderr)
         return
 
     context = ""
+    results_count = 0
+    exc_str: str | None = None
     try:
-        context = asyncio.run(_gather_context(prompt))
+        context, results_count = asyncio.run(_gather_context(prompt))
     except Exception as exc:
+        exc_str = f"{type(exc).__name__}: {exc}"
         print(f"mem-vault: UserPromptSubmit hook failed: {exc}", file=sys.stderr)
+
+    latency_ms = (time.monotonic() - started) * 1000
+    _log_canary(
+        prompt=prompt,
+        skip_reason=None,
+        results_count=results_count,
+        latency_ms=latency_ms,
+        exc=exc_str,
+    )
 
     if not context:
         return

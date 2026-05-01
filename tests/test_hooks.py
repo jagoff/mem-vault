@@ -426,6 +426,143 @@ def test_userprompt_search_failure_is_swallowed(monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
+# UserPromptSubmit canary log — added 2026-05-01
+# ---------------------------------------------------------------------------
+
+
+def _read_canary_lines(log_path) -> list[dict]:
+    """Helper: parse the JSONL canary log file into a list of dicts."""
+    if not log_path.exists():
+        return []
+    lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+    return [json.loads(line) for line in lines if line.strip()]
+
+
+def test_userprompt_canary_logs_skip(monkeypatch, tmp_path, capsys):
+    """A skipped prompt (too short) still gets a canary line so we can
+    audit skip rates over time. Without this, "no additionalContext was
+    injected" is indistinguishable from "the hook never fired"."""
+    log_file = tmp_path / "canary.log"
+    monkeypatch.setenv("MEM_VAULT_USERPROMPT_LOG", str(log_file))
+
+    _patch_stdin(monkeypatch, {"prompt": "ok"})
+
+    from mem_vault.hooks import userprompt
+
+    importlib.reload(userprompt)
+    userprompt.run()
+
+    lines = _read_canary_lines(log_file)
+    assert len(lines) == 1
+    entry = lines[0]
+    assert entry["skip_reason"].startswith("too_short(")
+    assert entry["prompt_preview"] == "ok"
+    assert entry["prompt_len"] == 2
+    assert entry["results_count"] == 0
+    assert entry["latency_ms"] >= 0
+    assert "exc" not in entry
+
+
+def test_userprompt_canary_logs_hit_with_results(monkeypatch, tmp_path, capsys):
+    """A normal prompt with hits gets logged with results_count > 0."""
+    log_file = tmp_path / "canary.log"
+    monkeypatch.setenv("MEM_VAULT_USERPROMPT_LOG", str(log_file))
+
+    service = AsyncMock()
+    service.search = AsyncMock(
+        return_value={
+            "ok": True,
+            "results": [
+                {
+                    "id": "mem1",
+                    "score": 0.9,
+                    "memory": {"id": "mem1", "name": "X", "description": "y"},
+                },
+                {
+                    "id": "mem2",
+                    "score": 0.8,
+                    "memory": {"id": "mem2", "name": "Y", "description": "z"},
+                },
+            ],
+        }
+    )
+
+    _patch_stdin(monkeypatch, {"prompt": "Una pregunta razonablemente larga"})
+    _patch_build_service(monkeypatch, "userprompt", service)
+
+    from mem_vault.hooks import userprompt
+
+    importlib.reload(userprompt)
+    userprompt.run()
+
+    lines = _read_canary_lines(log_file)
+    assert len(lines) == 1
+    entry = lines[0]
+    assert entry["skip_reason"] is None
+    assert entry["results_count"] == 2
+    assert entry["prompt_len"] >= 20
+    assert entry["latency_ms"] >= 0
+
+
+def test_userprompt_canary_logs_search_failure_with_exc(monkeypatch, tmp_path, capsys):
+    """When search raises, the canary records the exception type +
+    message — the only signal we have that the embed crashed."""
+    log_file = tmp_path / "canary.log"
+    monkeypatch.setenv("MEM_VAULT_USERPROMPT_LOG", str(log_file))
+
+    service = AsyncMock()
+
+    async def _boom(args):
+        raise RuntimeError("ollama unreachable")
+
+    service.search = _boom
+
+    _patch_stdin(monkeypatch, {"prompt": "Una pregunta lo bastante larga para no ser skip"})
+    _patch_build_service(monkeypatch, "userprompt", service)
+
+    from mem_vault.hooks import userprompt
+
+    importlib.reload(userprompt)
+    userprompt.run()
+
+    # The hook swallows the exception inside ``_gather_context`` and
+    # returns ``("", 0)`` — the canary still fires with skip_reason=None
+    # because the prompt did clear ``_should_skip``.
+    lines = _read_canary_lines(log_file)
+    assert len(lines) == 1
+    entry = lines[0]
+    assert entry["skip_reason"] is None
+    assert entry["results_count"] == 0
+    # exc field is populated only when the outer asyncio.run raises;
+    # _gather_context's internal try/except already prints to stderr.
+    # Either way the canary records skip_reason=None + results_count=0
+    # which is the signal we need to differentiate "no matches" from
+    # "embed crashed" via the stderr breadcrumb.
+
+
+def test_userprompt_canary_failure_does_not_break_hook(monkeypatch, tmp_path, capsys):
+    """If the canary log path is unwritable, the hook still works
+    (best-effort logging — never abort the agent's turn)."""
+    # Point the log at a path we know we can't write to (a directory
+    # that doesn't exist AND can't be created — null device gives us
+    # that on POSIX).
+    monkeypatch.setenv("MEM_VAULT_USERPROMPT_LOG", "/dev/null/cannot-write/here.log")
+
+    _patch_stdin(monkeypatch, {"prompt": "ok"})
+
+    from mem_vault.hooks import userprompt
+
+    importlib.reload(userprompt)
+    # Must not raise.
+    userprompt.run()
+
+    captured = capsys.readouterr()
+    # The breadcrumb must have hit stderr so we know the canary failed
+    # (vs failing silently and looking like the hook never fired).
+    assert "canary log failed" in captured.err
+
+
+# ---------------------------------------------------------------------------
 # Stop hook — appends a line to ~/.local/share/mem-vault/sessions.log
 # ---------------------------------------------------------------------------
 
