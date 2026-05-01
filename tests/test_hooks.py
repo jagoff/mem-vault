@@ -798,3 +798,255 @@ def test_stop_hook_survives_rotation_failure(monkeypatch, tmp_path, capsys):
     assert log_file.exists()
     content = log_file.read_text(encoding="utf-8")
     assert "auto_feedback=" in content
+
+
+# ---------------------------------------------------------------------------
+# SessionStart stats banner — _format_temporal_activity / _format_metrics_24h
+# / _gather_stats / full hook integration
+# ---------------------------------------------------------------------------
+
+
+def test_format_temporal_activity_buckets_correctly():
+    """Memorias dentro de cada ventana se cuentan en TODAS las ventanas más
+    grandes (24h también está dentro de 7d y 30d)."""
+    from datetime import datetime, timedelta
+
+    from mem_vault.hooks.sessionstart import _format_temporal_activity
+
+    now = datetime.now().astimezone()
+    memories = [
+        # Recién creada: 2h atrás → cae en 24h, 7d, 30d
+        {
+            "created": (now - timedelta(hours=2)).isoformat(),
+            "updated": (now - timedelta(hours=2)).isoformat(),
+        },
+        # 5 días atrás → cae en 7d y 30d, NO en 24h
+        {
+            "created": (now - timedelta(days=5)).isoformat(),
+            "updated": (now - timedelta(days=5)).isoformat(),
+        },
+        # 20 días atrás, editada hace 1 día → cuenta como creada en 30d, editada en 7d/24h
+        {
+            "created": (now - timedelta(days=20)).isoformat(),
+            "updated": (now - timedelta(hours=20)).isoformat(),
+        },
+        # 60 días atrás → fuera de todas las ventanas
+        {
+            "created": (now - timedelta(days=60)).isoformat(),
+            "updated": (now - timedelta(days=60)).isoformat(),
+        },
+    ]
+
+    line = _format_temporal_activity(memories)
+    assert line is not None
+    # 24h: +1 nueva (la de 2h), ~1 editada (la de 20d con update reciente)
+    assert "24h: +1 nuevas · ~1 editadas" in line
+    # 7d: +2 nuevas (2h + 5d), ~1 editada
+    assert "7d: +2 nuevas · ~1 editadas" in line
+    # 30d: +3 nuevas (2h + 5d + 20d), ~1 editada
+    assert "30d: +3 nuevas · ~1 editadas" in line
+
+
+def test_format_temporal_activity_returns_none_for_empty_corpus():
+    from mem_vault.hooks.sessionstart import _format_temporal_activity
+
+    assert _format_temporal_activity([]) is None
+
+
+def test_format_temporal_activity_returns_none_when_all_outside_windows():
+    """Vault con memorias muy viejas → ninguna ventana acumula → no banner row."""
+    from datetime import datetime, timedelta
+
+    from mem_vault.hooks.sessionstart import _format_temporal_activity
+
+    very_old = (datetime.now().astimezone() - timedelta(days=400)).isoformat()
+    assert _format_temporal_activity([{"created": very_old, "updated": very_old}]) is None
+
+
+def test_format_temporal_activity_skips_double_count_on_save():
+    """Un save fresco setea created==updated → no debe contar como editada."""
+    from datetime import datetime, timedelta
+
+    from mem_vault.hooks.sessionstart import _format_temporal_activity
+
+    same_ts = (datetime.now().astimezone() - timedelta(hours=2)).isoformat()
+    line = _format_temporal_activity([{"created": same_ts, "updated": same_ts}])
+    assert line is not None
+    assert "+1 nuevas" in line
+    # Editadas debe quedar en cero porque no hay edit real
+    assert "~0 editadas" in line
+
+
+def test_format_metrics_24h_returns_none_when_file_missing(tmp_path):
+    from mem_vault.hooks.sessionstart import _format_metrics_24h
+
+    assert _format_metrics_24h(tmp_path / "metrics.jsonl") is None
+
+
+def test_format_metrics_24h_aggregates_recent_rows(tmp_path):
+    """Una mezcla de calls OK + errores debería rendir count, p50/p95 y error rate."""
+    from datetime import datetime
+
+    from mem_vault.hooks.sessionstart import _format_metrics_24h
+
+    metrics = tmp_path / "metrics.jsonl"
+    now_iso = datetime.now().astimezone().isoformat(timespec="seconds")
+    rows = [
+        {"ts": now_iso, "tool": "memory_search", "duration_ms": 100, "ok": True},
+        {"ts": now_iso, "tool": "memory_search", "duration_ms": 200, "ok": True},
+        {"ts": now_iso, "tool": "memory_save", "duration_ms": 500, "ok": True},
+        {"ts": now_iso, "tool": "memory_save", "duration_ms": 800, "ok": False, "error": "boom"},
+    ]
+    metrics.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    line = _format_metrics_24h(metrics)
+    assert line is not None
+    assert "4 llamadas" in line
+    # 1 error sobre 4 → 25.0%
+    assert "errores 1 (25.0%)" in line
+    # p50 / p95 deben aparecer en milisegundos
+    assert "p50" in line
+    assert "p95" in line
+
+
+def test_format_metrics_24h_skips_stale_rows(tmp_path):
+    """Filas viejas (>24h) no deberían entrar en el resumen."""
+    from datetime import datetime, timedelta
+
+    from mem_vault.hooks.sessionstart import _format_metrics_24h
+
+    metrics = tmp_path / "metrics.jsonl"
+    old_ts = (datetime.now().astimezone() - timedelta(days=3)).isoformat(timespec="seconds")
+    metrics.write_text(
+        json.dumps({"ts": old_ts, "tool": "memory_search", "duration_ms": 50, "ok": True}) + "\n",
+        encoding="utf-8",
+    )
+    assert _format_metrics_24h(metrics) is None
+
+
+def test_sessionstart_emits_stats_banner(monkeypatch, capsys):
+    """Hook completo: cuando service.briefing devuelve datos, el banner sale primero."""
+    service = AsyncMock()
+
+    async def _briefing(args):
+        return {
+            "ok": True,
+            "total_global": 42,
+            "project_total": 7,
+            "project_tag": "project:mem-vault",
+            "top_tags": [
+                {"tag": "decision", "count": 5},
+                {"tag": "bug", "count": 3},
+            ],
+            "lint_summary": {"few_tags": 2, "no_aprendido": 0, "short_body": 1},
+        }
+
+    async def _list(args):
+        # Memoria del proyecto para que la sección "Memorias relevantes"
+        # también se emita y podamos verificar el orden relativo de los
+        # dos bloques en el output.
+        if args.get("tags") == ["project:mem-vault"]:
+            return {
+                "ok": True,
+                "memories": [{"id": "p1", "name": "Decisión X", "description": "..."}],
+            }
+        return {"ok": True, "memories": []}
+
+    async def _duplicates(args):
+        return {"ok": True, "count": 3, "pairs": []}
+
+    service.briefing = _briefing
+    service.list_ = _list
+    service.duplicates = _duplicates
+    service.search = AsyncMock(return_value={"ok": True, "results": []})
+    # config sin metrics_path → el bloque de métricas se skipea
+    service.config = type("Cfg", (), {"metrics_path": None})()
+
+    monkeypatch.setattr(
+        "mem_vault.hooks.sessionstart._resolve_cwd",
+        lambda payload: "/Users/fer/repositories/mem-vault",
+    )
+    _patch_stdin(monkeypatch, {})
+    _patch_build_service(monkeypatch, "sessionstart", service)
+
+    from mem_vault.hooks import sessionstart
+
+    importlib.reload(sessionstart)
+    monkeypatch.setattr(
+        "mem_vault.hooks.sessionstart._resolve_cwd",
+        lambda payload: "/Users/fer/repositories/mem-vault",
+    )
+    sessionstart.run()
+
+    captured = capsys.readouterr()
+    additional = json.loads(captured.out)["hookSpecificOutput"]["additionalContext"]
+
+    # Header del banner
+    assert "## Estadísticas del vault (mem-vault)" in additional
+    # Total global + scope del proyecto
+    assert "**Total**: 42 memorias" in additional
+    assert "`project:mem-vault`: 7" in additional
+    # Top tags
+    assert "`decision` (5)" in additional
+    assert "`bug` (3)" in additional
+    # Lint flags (few_tags + short_body, NO no_aprendido porque está en 0)
+    assert "2 con <3 tags" in additional
+    assert "1 con body corto" in additional
+    assert "no 'Aprendido el'" not in additional
+    # Duplicates (count=3)
+    assert "3 pares pendientes" in additional
+    # El banner debe ir antes del header de Memorias relevantes
+    stats_idx = additional.index("## Estadísticas del vault")
+    memorias_idx = additional.index("## Memorias relevantes")
+    assert stats_idx < memorias_idx
+
+
+def test_sessionstart_stats_silently_skipped_when_briefing_fails(monkeypatch, capsys):
+    """Si briefing/duplicates explotan pero hay memorias relevantes, el hook
+    no debe perder la sección de Memorias — los bloques son independientes."""
+    service = AsyncMock()
+
+    async def _briefing(args):
+        raise RuntimeError("ollama down")
+
+    async def _duplicates(args):
+        raise RuntimeError("storage corrupt")
+
+    async def _list(args):
+        if args.get("type") == "preference":
+            return {
+                "ok": True,
+                "memories": [{"id": "p1", "name": "Pref X", "description": "rioplatense"}],
+            }
+        if args.get("type") == "feedback":
+            return {"ok": True, "memories": []}
+        if args.get("tags"):
+            return {"ok": True, "memories": []}
+        return {"ok": True, "memories": []}
+
+    service.briefing = _briefing
+    service.duplicates = _duplicates
+    service.list_ = _list
+    service.search = AsyncMock(return_value={"ok": True, "results": []})
+
+    monkeypatch.setattr("mem_vault.hooks.sessionstart._resolve_cwd", lambda p: None)
+    _patch_stdin(monkeypatch, {})
+    _patch_build_service(monkeypatch, "sessionstart", service)
+
+    from mem_vault.hooks import sessionstart
+
+    importlib.reload(sessionstart)
+    monkeypatch.setattr("mem_vault.hooks.sessionstart._resolve_cwd", lambda p: None)
+    sessionstart.run()
+
+    captured = capsys.readouterr()
+    additional = json.loads(captured.out)["hookSpecificOutput"]["additionalContext"]
+
+    # No banner header (todas las secciones de stats fallaron / vacías)
+    assert "## Estadísticas del vault" not in additional
+    # Pero la sección de Memorias relevantes sigue ahí
+    assert "## Memorias relevantes (mem-vault)" in additional
+    assert "Pref X" in additional
+    # Los errores se loggean a stderr, no a stdout
+    assert "stats briefing failed" in captured.err
+    assert "stats duplicates failed" in captured.err
