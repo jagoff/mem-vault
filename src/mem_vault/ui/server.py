@@ -1373,17 +1373,28 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
             "reflections": reflections,
         }
 
-    @app.get("/dashboard", response_class=HTMLResponse)
-    async def dashboard_page(request: Request):
+    @app.get("/api/overview", response_class=HTMLResponse)
+    async def overview_fragment(request: Request):
+        """HTMX fragment with the dashboard content (rendered into ``#rows``).
+
+        v0.6.0: the standalone ``/dashboard`` page is gone; the same
+        information lives as a tab inside the main ``/`` page so all
+        mem-vault info stays at a single URL.
+        """
         payload = await _dashboard_payload()
         return templates.TemplateResponse(
             request,
-            "dashboard.html",
-            {"d": payload, "version": __version__},
+            "_tab_overview.html",
+            {"d": payload},
         )
 
     @app.get("/api/dashboard")
     async def dashboard_api():
+        """JSON payload of the overview tab — for CLI watch / external monitors.
+
+        Same data the ``overview`` tab consumes; exposed for tooling that
+        wants programmatic access without scraping HTML.
+        """
         return JSONResponse(await _dashboard_payload())
 
     return app

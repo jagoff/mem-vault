@@ -1,17 +1,17 @@
-"""Tests para el endpoint ``/dashboard`` y ``/api/dashboard`` (v0.6.0).
+"""Tests para la pestaña ``overview`` y el endpoint JSON ``/api/dashboard`` (v0.6.0).
 
-El dashboard agrega TODA la información cross-cutting en una sola página:
-hero KPIs, telemetry, ranker meta, antagonist queue, daemon status,
-corpus distribution, top usadas / helpful / zombies, duplicados, lint
-issues, tensiones, reflections recientes.
+A partir de v0.6.0 el dashboard NO es una página separada — vive como
+una pestaña ``overview`` dentro del panel principal de mem-vault (``/``)
+y se expone también como JSON en ``/api/dashboard``. Estos tests pinean
+ambos contracts:
 
-Estos tests pinean el contract:
-
-- /api/dashboard returns 200 con todas las claves esperadas.
-- /dashboard renderiza HTML con 200 y trae las secciones principales.
-- Best-effort: cada subsistema (telemetry, ranker, antagonist, daemon)
-  degrada a None / dict con error sin tirar el endpoint cuando le falta
-  data.
+- ``GET /api/overview`` retorna el HTML fragment para HTMX.
+- ``GET /api/dashboard`` retorna el JSON con todas las claves esperadas.
+- ``GET /`` (la página principal) incluye la pestaña overview como
+  primera y default.
+- ``GET /dashboard`` (la URL legacy) ya NO existe — devuelve 404.
+- Cada subsistema (telemetry / ranker / antagonist / daemon) degrada a
+  un dict con datos por defecto cuando no hay state populado.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from mem_vault.storage import Memory
 from mem_vault.ui.server import create_app
 
 
-def _make_dashboard_service(memorias: list[Memory] | None = None):
+def _make_overview_service(memorias: list[Memory] | None = None):
     cfg = types.SimpleNamespace(
         http_token=None,
         memory_dir="/tmp/fake-vault",
@@ -35,7 +35,7 @@ def _make_dashboard_service(memorias: list[Memory] | None = None):
         qdrant_collection="test",
         # state_dir solo se toca al leer pickles / SQLite — apuntamos a
         # un dir vacio asi todo degrada a default sin warnings ruidosos.
-        state_dir=__import__("pathlib").Path("/tmp/fake-state-dashboard"),
+        state_dir=__import__("pathlib").Path("/tmp/fake-state-overview"),
     )
 
     class _Storage:
@@ -101,19 +101,19 @@ def _m(
 
 
 @pytest.fixture
-def dashboard_client():
+def overview_client():
     corpus = [
         _m("a", type="decision", related=["b"]),
         _m("b", type="bug", contradicts=["a"]),
         _m("c", type="note", tags=["project:x", "lang:py"], usage_count=5, helpful_count=3),
         _m("d", type="preference", tags=["project:x", "lang:py"]),
     ]
-    service = _make_dashboard_service(corpus)
+    service = _make_overview_service(corpus)
     return TestClient(create_app(service=service))
 
 
-def test_api_dashboard_returns_200_with_all_keys(dashboard_client):
-    resp = dashboard_client.get("/api/dashboard")
+def test_api_dashboard_returns_200_with_all_keys(overview_client):
+    resp = overview_client.get("/api/dashboard")
     assert resp.status_code == 200
     body = resp.json()
     expected_keys = {
@@ -140,8 +140,8 @@ def test_api_dashboard_returns_200_with_all_keys(dashboard_client):
     assert expected_keys <= set(body.keys())
 
 
-def test_api_dashboard_totals_include_by_type(dashboard_client):
-    body = dashboard_client.get("/api/dashboard").json()
+def test_api_dashboard_totals_include_by_type(overview_client):
+    body = overview_client.get("/api/dashboard").json()
     assert body["totals"]["memorias"] == 4
     by_type = body["totals"]["by_type"]
     assert by_type["decision"] == 1
@@ -150,69 +150,98 @@ def test_api_dashboard_totals_include_by_type(dashboard_client):
     assert by_type["preference"] == 1
 
 
-def test_api_dashboard_includes_graph_edge_counts(dashboard_client):
-    body = dashboard_client.get("/api/dashboard").json()
+def test_api_dashboard_includes_graph_edge_counts(overview_client):
+    body = overview_client.get("/api/dashboard").json()
     g = body["graph"]
     assert g["nodes"] == 4
-    # a-b carries both related and contradicts
     assert g["related"] >= 1
     assert g["contradicts"] >= 1
-    # c and d share project:x + lang:py → one cotag edge
     assert g["cotag"] >= 1
 
 
-def test_api_dashboard_top_used_lists_only_used_memorias(dashboard_client):
-    body = dashboard_client.get("/api/dashboard").json()
+def test_api_dashboard_top_used_lists_only_used_memorias(overview_client):
+    body = overview_client.get("/api/dashboard").json()
     used = body["top_used"]
     assert len(used) == 1
     assert used[0]["id"] == "c"
     assert used[0]["usage_count"] == 5
 
 
-def test_api_dashboard_contradictions_list_includes_target_ids(dashboard_client):
-    body = dashboard_client.get("/api/dashboard").json()
+def test_api_dashboard_contradictions_list_includes_target_ids(overview_client):
+    body = overview_client.get("/api/dashboard").json()
     contras = body["contradictions"]
     assert len(contras) == 1
     assert contras[0]["id"] == "b"
     assert contras[0]["contradicts"] == ["a"]
 
 
-def test_api_dashboard_by_project_breakdown(dashboard_client):
-    body = dashboard_client.get("/api/dashboard").json()
+def test_api_dashboard_by_project_breakdown(overview_client):
+    body = overview_client.get("/api/dashboard").json()
     proj = body["totals"]["by_project"]
-    assert proj.get("x") == 2  # c + d both tagged project:x
+    assert proj.get("x") == 2
 
 
-def test_api_dashboard_telemetry_ranker_antagonist_have_subsystem_dicts(dashboard_client):
-    body = dashboard_client.get("/api/dashboard").json()
-    # Cada subsistema retorna un dict (con o sin error/empty data).
+def test_api_dashboard_subsystem_dicts_present(overview_client):
+    body = overview_client.get("/api/dashboard").json()
     assert isinstance(body["telemetry"], dict)
     assert isinstance(body["ranker"], dict)
     assert isinstance(body["antagonist"], dict)
     assert isinstance(body["daemon"], dict)
-    # Defaults razonables cuando no hay state populado:
     assert body["antagonist"]["pending_count"] == 0
     assert body["antagonist"]["enabled"] in (True, False)
 
 
-def test_dashboard_html_renders_with_200(dashboard_client):
-    resp = dashboard_client.get("/dashboard")
+def test_api_overview_renders_html_fragment(overview_client):
+    """``/api/overview`` returns an HTMX fragment (no <html> wrapper)."""
+    resp = overview_client.get("/api/overview")
     assert resp.status_code == 200
     assert "text/html" in resp.headers["content-type"]
+    body = resp.text
+    # Fragment shape: starts with the dashboard <div>, no <html>/<body>.
+    assert "<html" not in body.lower()
+    assert "<body" not in body.lower()
+    assert 'class="dashboard"' in body
+    # Sanity: las secciones principales del overview estan presentes.
+    assert "Telemetry" in body
+    assert "Knowledge graph" in body
+    assert "Antagonist" in body
+
+
+def test_index_page_includes_overview_tab_first(overview_client):
+    """La página principal debe tener la tab ``overview`` como primera + active."""
+    resp = overview_client.get("/")
+    assert resp.status_code == 200
     html = resp.text
-    # Sanity: estructura basica del template presente.
-    assert "memorias" in html
-    assert "Knowledge graph" in html
-    assert "Telemetry" in html
-    assert "Antagonist" in html
-    # Navlinks coherentes
-    assert "/dashboard" in html
-    assert "/graph" in html
+    # Tab overview presente con class active.
+    assert 'data-tab="overview"' in html
+    assert "/api/overview" in html
+    # El boot fetch ahora apunta a /api/overview, no a /api/memories.
+    assert 'hx-get="/api/overview"' in html or "hx-get=\"/api/overview\"" in html
 
 
-def test_dashboard_html_navlinks_present_in_other_pages(dashboard_client):
-    """index.html y graph.html deberian tener el link al dashboard tambien."""
-    home = dashboard_client.get("/").text
-    graph = dashboard_client.get("/graph").text
-    for page in (home, graph):
-        assert ">dashboard<" in page or "/dashboard" in page
+def test_index_page_navlinks_drop_dashboard_link(overview_client):
+    """El link ``dashboard`` debe haberse retirado de las navlinks.
+
+    Excepción: ``dashboard.css`` sigue cargando porque los estilos del
+    overview viven ahí. Lo que importa es que NO haya un ``<a href=
+    "/dashboard">`` en el topbar y que el link visible "dashboard" no
+    aparezca como entrada de navegación.
+    """
+    html = overview_client.get("/").text
+    assert ">dashboard<" not in html  # ningún link visible "dashboard"
+    assert 'href="/dashboard"' not in html  # ni el href en navlinks
+    assert "mem-vault" in html  # el link nuevo está
+
+
+def test_legacy_dashboard_route_returns_404(overview_client):
+    """La página standalone ``/dashboard`` ya no existe."""
+    resp = overview_client.get("/dashboard")
+    assert resp.status_code == 404
+
+
+def test_graph_page_navlinks_drop_dashboard_link(overview_client):
+    """``/graph`` también limpió el link al dashboard ahora obsoleto."""
+    html = overview_client.get("/graph").text
+    assert ">dashboard<" not in html
+    assert 'href="/dashboard"' not in html
+    assert "mem-vault" in html

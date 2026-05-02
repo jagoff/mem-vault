@@ -1,0 +1,430 @@
+{% set prefix = request.scope.root_path %}
+{# Overview tab fragment — renders inside the standalone /memory page's
+   #rows section. The full-page /dashboard route is gone; this is the
+   one place the dashboard content lives, swapped into the tabbed UI
+   like every other view (all / top / quality / duplicates / by-project).
+   See ``ui.server._dashboard_payload`` for the data contract. #}
+<div class="dashboard">
+
+  {# ───────────── HERO: 4 KPIs grandes ───────────── #}
+  <section class="hero">
+    <a href="#tab=all" onclick="setActiveTab('all'); return false;" class="kpi kpi-primary">
+      <div class="kpi-label">memorias</div>
+      <div class="kpi-value">{{ d.totals.memorias }}</div>
+      <div class="kpi-sub">
+        {% set acts = d.activity %}
+        +{{ acts.new_24h }}/24h · +{{ acts.new_7d }}/7d · +{{ acts.new_30d }}/30d
+      </div>
+    </a>
+    {% set tel = d.telemetry %}
+    <div class="kpi {% if tel and tel.total_events %}kpi-ok{% else %}kpi-pending{% endif %}">
+      <div class="kpi-label">citation rate</div>
+      <div class="kpi-value">
+        {% if tel and tel.total_events %}
+          {{ "%.1f"|format(tel.citation_rate * 100) }}%
+        {% else %}—{% endif %}
+      </div>
+      <div class="kpi-sub">
+        {% if tel and tel.total_events %}
+          {{ tel.citations }} de {{ tel.total_events }} hits citados
+        {% else %}
+          sin telemetría todavía — corré searches
+        {% endif %}
+      </div>
+    </div>
+    {% set ant = d.antagonist %}
+    <div class="kpi {% if ant and ant.pending_count > 0 %}kpi-warn{% else %}kpi-ok{% endif %}">
+      <div class="kpi-label">⚠ contradicciones</div>
+      <div class="kpi-value">
+        {% if d.contradictions %}{{ d.contradictions|length }}{% else %}0{% endif %}
+      </div>
+      <div class="kpi-sub">
+        {% if ant and ant.pending_count %}{{ ant.pending_count }} pendientes en cola antagonist{% else %}graph: {{ d.graph.contradicts }} edges contradicts{% endif %}
+      </div>
+    </div>
+    {% set dae = d.daemon %}
+    <div class="kpi {% if dae and dae.loaded %}kpi-ok{% elif dae and dae.loaded == False %}kpi-warn{% else %}kpi-pending{% endif %}">
+      <div class="kpi-label">reflection daemon</div>
+      <div class="kpi-value">
+        {% if dae and dae.loaded %}✓ ON{% elif dae and dae.loaded == False %}OFF{% else %}—{% endif %}
+      </div>
+      <div class="kpi-sub">
+        {% if dae and dae.last_reflection %}última: {{ dae.last_reflection_at[:10] }}{% else %}sin reflections aún{% endif %}
+      </div>
+    </div>
+  </section>
+
+  {# ───────────── ROW 1: subsistemas v0.6 ───────────── #}
+  <section class="dash-grid grid-3">
+
+    <article class="card">
+      <header>
+        <h3>📊 Telemetry</h3>
+        <span class="card-tag">v0.6 closed-loop foundation</span>
+      </header>
+      {% if tel and not tel.error %}
+      <dl class="card-stats">
+        <dt>events</dt><dd>{{ tel.total_events }}</dd>
+        <dt>queries únicas</dt><dd>{{ tel.unique_queries }}</dd>
+        <dt>citations</dt><dd>{{ tel.citations }}</dd>
+        {% if tel.avg_cited_rank is not none %}
+        <dt>avg cited rank</dt><dd>{{ "%.2f"|format(tel.avg_cited_rank) }}</dd>
+        {% endif %}
+        <dt>db size</dt><dd>{{ (tel.db_size_bytes / 1024)|round(1) }} KB</dd>
+      </dl>
+      <footer class="card-foot">
+        <code>{{ tel.db_path }}</code>
+      </footer>
+      {% else %}
+      <p class="card-empty">Sin eventos. Activá <code>MEM_VAULT_TELEMETRY=1</code> y corré searches.</p>
+      {% endif %}
+    </article>
+
+    <article class="card">
+      <header>
+        <h3>🤖 Learned ranker</h3>
+        <span class="card-tag">v0.6 game-changer #1</span>
+      </header>
+      {% set rnk = d.ranker %}
+      {% if rnk and not rnk.error and rnk.active_pickle_exists %}
+      <dl class="card-stats">
+        <dt>versión</dt><dd>v{{ rnk.version }}</dd>
+        <dt>status</dt>
+        <dd>
+          {% if rnk.enabled %}<span class="badge badge-ok">ENABLED</span>
+          {% else %}<span class="badge badge-warn">disabled</span>{% endif %}
+        </dd>
+        <dt>n_train</dt><dd>{{ rnk.n_train }} ({{ rnk.n_positive }}+/{{ rnk.n_negative }}-)</dd>
+        {% if rnk.auc is not none %}
+        <dt>AUC (held)</dt><dd>{{ "%.3f"|format(rnk.auc) }}</dd>
+        {% endif %}
+      </dl>
+      {% if not rnk.enabled %}
+      <p class="hint">Activar: <code>export MEM_VAULT_LEARNED_RANKER=1</code></p>
+      {% endif %}
+      {% else %}
+      <p class="card-empty">Sin modelo entrenado.</p>
+      <p class="hint">Cuando tengas ≥50 events + ≥5 citations, corré:</p>
+      <pre class="snip">mem-vault ranker-train</pre>
+      {% endif %}
+    </article>
+
+    <article class="card">
+      <header>
+        <h3>⚠ Antagonist</h3>
+        <span class="card-tag">v0.6 game-changer #3a</span>
+      </header>
+      {% if ant and not ant.error %}
+      <dl class="card-stats">
+        <dt>status</dt>
+        <dd>
+          {% if ant.enabled %}<span class="badge badge-ok">ENABLED</span>
+          {% else %}<span class="badge badge-warn">disabled</span>{% endif %}
+        </dd>
+        <dt>pendientes</dt><dd>{{ ant.pending_count }}</dd>
+      </dl>
+      {% if ant["items"] %}
+      <ul class="mini-list">
+        {% for it in ant["items"] %}
+        <li>
+          <strong>{{ it.cited_name or it.cited_id }}</strong>
+          <span class="muted">↯ {{ it.contradicts_ids|length }} tensiones</span>
+        </li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+      {% if not ant.enabled %}
+      <p class="hint">Activar: <code>export MEM_VAULT_ANTAGONIST=1</code></p>
+      {% endif %}
+      {% else %}
+      <p class="card-empty">Antagonist no disponible.</p>
+      {% endif %}
+    </article>
+
+    <article class="card">
+      <header>
+        <h3>🌙 Reflection daemon</h3>
+        <span class="card-tag">v0.6 game-changer #3b</span>
+      </header>
+      {% if dae and not dae.error %}
+      <dl class="card-stats">
+        <dt>plataforma</dt><dd>{{ dae.system }}</dd>
+        <dt>label</dt><dd><code>{{ dae.label }}</code></dd>
+        <dt>cargado</dt>
+        <dd>
+          {% if dae.loaded %}<span class="badge badge-ok">YES</span>
+          {% elif dae.loaded == False %}<span class="badge badge-danger">NO</span>
+          {% else %}<span class="muted">—</span>{% endif %}
+        </dd>
+        {% if dae.last_reflection %}
+        <dt>última reflection</dt><dd><code>{{ dae.last_reflection }}</code></dd>
+        {% endif %}
+      </dl>
+      <p class="hint">{{ dae.detail or "" }}</p>
+      {% if not dae.loaded %}
+      <p class="hint">Instalar: <code>mem-vault install-daemon</code></p>
+      {% endif %}
+      {% else %}
+      <p class="card-empty">No se pudo verificar el daemon.</p>
+      {% endif %}
+    </article>
+
+    <article class="card">
+      <header>
+        <h3>🕸 Knowledge graph</h3>
+        <span class="card-tag">v0.6 game-changer #2</span>
+      </header>
+      <dl class="card-stats">
+        <dt>nodos</dt><dd>{{ d.graph.nodes }}</dd>
+        <dt>related</dt><dd><span class="edge-pill edge-related">{{ d.graph.related }}</span></dd>
+        <dt>contradicts</dt><dd><span class="edge-pill edge-contradicts">{{ d.graph.contradicts }}</span></dd>
+        <dt>co-tag</dt><dd><span class="edge-pill edge-cotag">{{ d.graph.cotag }}</span></dd>
+      </dl>
+      <a class="card-action" href="{{ prefix }}/graph">abrir grafo →</a>
+    </article>
+
+    <article class="card">
+      <header>
+        <h3>📈 Actividad</h3>
+      </header>
+      <dl class="card-stats">
+        <dt>nuevas 24h</dt><dd>+{{ d.activity.new_24h }}</dd>
+        <dt>editadas 24h</dt><dd>~{{ d.activity.updated_24h }}</dd>
+        <dt>nuevas 7d</dt><dd>+{{ d.activity.new_7d }}</dd>
+        <dt>editadas 7d</dt><dd>~{{ d.activity.updated_7d }}</dd>
+        <dt>nuevas 30d</dt><dd>+{{ d.activity.new_30d }}</dd>
+        <dt>editadas 30d</dt><dd>~{{ d.activity.updated_30d }}</dd>
+      </dl>
+    </article>
+
+  </section>
+
+  {# ───────────── ROW 2: distribuciones ───────────── #}
+  <section class="dash-grid grid-3">
+
+    <article class="card">
+      <header><h3>Tipos</h3></header>
+      <ul class="bar-list">
+      {% set total = d.totals.memorias %}
+      {% for t, n in d.totals.by_type.items() %}
+        <li>
+          <span class="bar-label type type-{{ t }}">{{ t }}</span>
+          <span class="bar"><span class="bar-fill" style="width: {{ (n / total * 100) if total else 0 }}%"></span></span>
+          <span class="bar-count">{{ n }}</span>
+        </li>
+      {% endfor %}
+      </ul>
+    </article>
+
+    <article class="card">
+      <header><h3>Por agente</h3></header>
+      <ul class="bar-list">
+      {% for ag, n in d.totals.by_agent.items() %}
+        <li>
+          <span class="bar-label">{{ ag }}</span>
+          <span class="bar"><span class="bar-fill" style="width: {{ (n / total * 100) if total else 0 }}%"></span></span>
+          <span class="bar-count">{{ n }}</span>
+        </li>
+      {% endfor %}
+      </ul>
+    </article>
+
+    <article class="card">
+      <header><h3>Por proyecto</h3></header>
+      {% if d.totals.by_project %}
+      <ul class="bar-list">
+      {% set max_proj = d.totals.by_project.values()|list|max %}
+      {% for p, n in d.totals.by_project.items() %}
+        <li>
+          <span class="bar-label"><code>{{ p }}</code></span>
+          <span class="bar"><span class="bar-fill" style="width: {{ (n / max_proj * 100) if max_proj else 0 }}%"></span></span>
+          <span class="bar-count">{{ n }}</span>
+        </li>
+      {% endfor %}
+      </ul>
+      {% else %}
+      <p class="card-empty">Sin tags <code>project:foo</code>.</p>
+      {% endif %}
+    </article>
+
+  </section>
+
+  {# ───────────── ROW 3: top tags ───────────── #}
+  <section class="dash-grid grid-1">
+    <article class="card">
+      <header><h3>Top tags</h3></header>
+      <div class="tag-cloud">
+      {% for tag, n in d.totals.top_tags %}
+        <span class="tag-chip">#{{ tag }} <span class="tag-count">{{ n }}</span></span>
+      {% endfor %}
+      </div>
+    </article>
+  </section>
+
+  {# ───────────── ROW 4: salud del corpus ───────────── #}
+  <section class="dash-grid grid-2">
+
+    <article class="card">
+      <header>
+        <h3>👁 Más usadas</h3>
+        {% if d.top_used %}<span class="card-tag">{{ d.top_used|length }}</span>{% endif %}
+      </header>
+      {% if d.top_used %}
+      <table class="card-table">
+        <tbody>
+        {% for r in d.top_used %}
+        <tr>
+          <td><span class="type type-{{ r.type }}">{{ r.type }}</span></td>
+          <td><a href="#tab=all" onclick="setActiveTab('all'); return false;">{{ r.name|truncate(60) }}</a></td>
+          <td class="num">👁 {{ r.usage_count }}</td>
+          {% if r.helpful_count %}<td class="num">👍 {{ r.helpful_count }}</td>{% else %}<td></td>{% endif %}
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="card-empty">Sin usage_count > 0 todavía. El Stop hook bumpea cuando el agente cita.</p>
+      {% endif %}
+    </article>
+
+    <article class="card">
+      <header>
+        <h3>👍 Más helpful</h3>
+        {% if d.top_helpful %}<span class="card-tag">{{ d.top_helpful|length }}</span>{% endif %}
+      </header>
+      {% if d.top_helpful %}
+      <table class="card-table">
+        <tbody>
+        {% for r in d.top_helpful %}
+        <tr>
+          <td><span class="type type-{{ r.type }}">{{ r.type }}</span></td>
+          <td><a href="#tab=all" onclick="setActiveTab('all'); return false;">{{ r.name|truncate(60) }}</a></td>
+          <td class="num">👍 {{ r.helpful_count }}</td>
+          <td class="num">{{ "%.0f"|format(r.ratio * 100) }}%</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="card-empty">Sin thumbs up todavía.</p>
+      {% endif %}
+    </article>
+
+    <article class="card">
+      <header>
+        <h3>🪦 Zombies</h3>
+        {% if d.zombies %}<span class="card-tag">{{ d.zombies|length }}+</span>{% endif %}
+      </header>
+      {% if d.zombies %}
+      <table class="card-table">
+        <tbody>
+        {% for z in d.zombies %}
+        <tr>
+          <td><a href="#tab=all" onclick="setActiveTab('all'); return false;">{{ z.name|truncate(50) }}</a></td>
+          <td class="num muted">{{ z.age_days }}d</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="card-empty">Sin zombies (usage=0 + edad > 60d).</p>
+      {% endif %}
+    </article>
+
+    <article class="card">
+      <header>
+        <h3>⧉ Duplicados pendientes</h3>
+        {% if d.duplicates.count %}<span class="card-tag">{{ d.duplicates.count }}</span>{% endif %}
+      </header>
+      {% if d.duplicates.pairs %}
+      <table class="card-table">
+        <tbody>
+        {% for p in d.duplicates.pairs %}
+        <tr>
+          <td><code>{{ p.a }}</code></td>
+          <td class="muted">↔</td>
+          <td><code>{{ p.b }}</code></td>
+          <td class="num">{{ "%.2f"|format(p.score) }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      <p class="hint">Mergear: <code>mem-vault consolidate --apply</code> · O abrí la tab <a href="#tab=duplicates" onclick="setActiveTab('duplicates'); return false;">duplicates</a>.</p>
+      {% else %}
+      <p class="card-empty">Sin pares similares (jaccard ≥ 0.7).</p>
+      {% endif %}
+    </article>
+
+    <article class="card">
+      <header>
+        <h3>⚠ Lint issues</h3>
+        {% if d.lint.count %}<span class="card-tag">{{ d.lint.count }}</span>{% endif %}
+      </header>
+      {% if d.lint.problems %}
+      <ul class="mini-list">
+        {% for p in d.lint.problems %}
+        <li>
+          <a href="#tab=quality" onclick="setActiveTab('quality'); return false;"><code>{{ p.id }}</code></a>
+          {% if p.issues is iterable and p.issues is not string %}
+            <span class="muted">— {{ p.issues|join(", ") }}</span>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+      <p class="hint">Abrir tab <a href="#tab=quality" onclick="setActiveTab('quality'); return false;">quality</a> para arreglar in-place.</p>
+      {% else %}
+      <p class="card-empty">Corpus saludable.</p>
+      {% endif %}
+    </article>
+
+    <article class="card">
+      <header>
+        <h3>↯ Tensiones</h3>
+        {% if d.contradictions %}<span class="card-tag">{{ d.contradictions|length }}</span>{% endif %}
+      </header>
+      {% if d.contradictions %}
+      <ul class="mini-list">
+        {% for c in d.contradictions[:8] %}
+        <li>
+          <a href="#tab=all" onclick="setActiveTab('all'); return false;">{{ c.name|truncate(60) }}</a>
+          <div class="muted small">↯ {{ c.contradicts|length }}: {% for cid in c.contradicts[:2] %}<code>{{ cid|truncate(40) }}</code>{% if not loop.last %}, {% endif %}{% endfor %}{% if c.contradicts|length > 2 %} +{{ c.contradicts|length - 2 }}{% endif %}</div>
+        </li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="card-empty">Sin contradicciones detectadas.</p>
+      {% endif %}
+    </article>
+
+  </section>
+
+  {# ───────────── ROW 5: reflections recientes ───────────── #}
+  {% if d.reflections %}
+  <section class="dash-grid grid-1">
+    <article class="card">
+      <header>
+        <h3>📓 Últimas reflections</h3>
+        <span class="card-tag">{{ d.reflections|length }}</span>
+      </header>
+      <ul class="reflection-list">
+      {% for r in d.reflections %}
+        <li>
+          <a href="#tab=all" onclick="setActiveTab('all'); return false;"><strong>{{ r.id }}</strong></a>
+          <span class="muted">— {{ r.description|truncate(120) }}</span>
+          <span class="ts">{{ r.updated[:10] }}</span>
+        </li>
+      {% endfor %}
+      </ul>
+    </article>
+  </section>
+  {% endif %}
+
+  <footer class="dashboard-foot">
+    <span>mem-vault v{{ d.version }}</span>
+    <span class="dot">·</span>
+    <a href="{{ prefix }}/api/dashboard">JSON</a>
+    <span class="dot">·</span>
+    <a href="{{ prefix }}/healthz">healthz</a>
+  </footer>
+
+</div>

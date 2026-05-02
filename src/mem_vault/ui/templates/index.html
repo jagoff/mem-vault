@@ -7,6 +7,7 @@
   <title>mem-vault · browse</title>
   <link rel="stylesheet" href="{{ prefix }}/static/style.css" />
   <link rel="stylesheet" href="{{ prefix }}/static/graph.css" />
+  <link rel="stylesheet" href="{{ prefix }}/static/dashboard.css" />
   <script src="https://unpkg.com/htmx.org@2.0.4" crossorigin="anonymous"></script>
 </head>
 <body data-prefix="{{ prefix }}">
@@ -16,9 +17,7 @@
       <span class="brand-version">v{{ version }}</span>
     </div>
     <nav class="navlinks">
-      <a href="{{ prefix }}/dashboard">dashboard</a>
-      <span class="dot">·</span>
-      <a href="{{ prefix }}/" class="active">memory</a>
+      <a href="{{ prefix }}/" class="active">mem-vault</a>
       <span class="dot">·</span>
       <a href="{{ prefix }}/graph">graph</a>
     </nav>
@@ -45,7 +44,13 @@
        the search form active; the others hide it because their datasets are
        already curated and a free-text query would be a UX dead-end there. #}
     <nav class="tabs" role="tablist">
-      <button class="tab-btn active" role="tab" data-tab="all"
+      <button class="tab-btn active" role="tab" data-tab="overview"
+              data-endpoint="{{ prefix }}/api/overview"
+              hx-get="{{ prefix }}/api/overview"
+              hx-target="#rows" hx-swap="innerHTML">
+        overview
+      </button>
+      <button class="tab-btn" role="tab" data-tab="all"
               data-endpoint="{{ prefix }}/api/memories"
               hx-get="{{ prefix }}/api/memories"
               hx-target="#rows" hx-swap="innerHTML">
@@ -108,10 +113,10 @@
     </section>
 
     <section id="rows"
-             hx-get="{{ prefix }}/api/memories"
+             hx-get="{{ prefix }}/api/overview"
              hx-trigger="load"
              hx-swap="innerHTML">
-      <div class="empty">loading memories…</div>
+      <div class="empty">loading mem-vault…</div>
     </section>
   </main>
 
@@ -129,12 +134,12 @@
     // initial load picks up the hash and swaps the corresponding fragment;
     // clicking a tab updates the hash and lets HTMX do the network call.
 
-    const VALID_TABS = ['all', 'top', 'quality', 'duplicates', 'by-project'];
+    const VALID_TABS = ['overview', 'all', 'top', 'quality', 'duplicates', 'by-project'];
 
     function getActiveTab() {
       const m = window.location.hash.match(/tab=([\w-]+)/);
-      const candidate = m ? m[1] : 'all';
-      return VALID_TABS.includes(candidate) ? candidate : 'all';
+      const candidate = m ? m[1] : 'overview';
+      return VALID_TABS.includes(candidate) ? candidate : 'overview';
     }
 
     function setActiveTab(name, { swap = true } = {}) {
@@ -166,11 +171,11 @@
 
     // Boot: honor the hash. We set the active tab WITHOUT triggering a swap
     // because the #rows section already has a hx-trigger="load" attribute
-    // that fires on page load. That fetches /api/memories. If the hash is
-    // anything other than 'all' we override the boot fetch.
+    // that fires on page load. That fetches /api/overview (the new default).
+    // If the hash is anything other than 'overview' we override the boot fetch.
     window.addEventListener('DOMContentLoaded', () => {
       const initial = getActiveTab();
-      setActiveTab(initial, { swap: initial !== 'all' });
+      setActiveTab(initial, { swap: initial !== 'overview' });
     });
 
     // ------ tab counters ---------------------------------------------------
