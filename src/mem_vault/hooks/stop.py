@@ -241,6 +241,32 @@ def _apply_auto_feedback(payload: dict[str, Any]) -> int:
             # Storage errors (disk full, corrupt file) must not break
             # the Stop hook. Silent skip — the user can always re-run.
             continue
+
+    # Telemetry: flip ``was_cited=1`` on the most-recent search-event row
+    # for each cited memory id. This is the supervised signal that
+    # ``mem-vault ranker train`` fits on — every time the agent's final
+    # response actually references a memory, the row that surfaced it
+    # gets stamped as a positive example.
+    #
+    # Best-effort: a missing telemetry DB (telemetry disabled, brand-new
+    # vault, mid-migration) just returns 0. Never raises.
+    if os.environ.get("MEM_VAULT_TELEMETRY", "1").lower() not in {"0", "false", "no", "off"}:
+        try:
+            from mem_vault import telemetry as _telemetry
+
+            session_id = (
+                payload.get("session_id")
+                or os.environ.get("MEM_VAULT_SESSION_ID")
+            )
+            _telemetry.mark_cited(
+                cfg.state_dir,
+                cited,
+                session_id=session_id if isinstance(session_id, str) else None,
+            )
+        except Exception:
+            # Telemetry failures must never bubble — the Stop hook's
+            # contract is "always exit 0".
+            pass
     return bumped
 
 

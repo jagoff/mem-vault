@@ -44,6 +44,7 @@ from mem_vault.discovery import (
 )
 from mem_vault.index import CircuitBreakerOpenError, VectorIndex, compute_content_hash
 from mem_vault.storage import VaultStorage
+from mem_vault import telemetry as _telemetry
 
 logger = logging.getLogger("mem_vault.server")
 
@@ -1164,6 +1165,36 @@ class MemVaultService:
         if self.config.usage_tracking_enabled and results:
             for r in results:
                 await self._to_thread(self.storage.record_usage, r["id"])
+
+        # Telemetry: persist one search-event row per surfaced result so
+        # the closed-loop ranker (``mem-vault ranker train``) has signal
+        # to fit on. The Stop hook flips ``was_cited=1`` on rows whose
+        # memory_id appears in the agent's final response (citation
+        # detection runs there already). Best-effort: a failed write
+        # never blocks search. Honor ``MEM_VAULT_TELEMETRY=0`` to opt
+        # out (e.g. CI / benchmarks where we don't want to pollute
+        # the dataset). Defaults ON — the DB lives under state_dir,
+        # not in the vault, so it doesn't sync to iCloud / git.
+        if results and os.environ.get("MEM_VAULT_TELEMETRY", "1").lower() not in {"0", "false", "no", "off"}:
+            session_id = args.get("session_id") or os.environ.get("MEM_VAULT_SESSION_ID")
+            events = [
+                _telemetry.build_event(
+                    query=query,
+                    rank=i,
+                    memory=r["memory"],
+                    score_dense=r.get("score_raw"),
+                    score_bm25=None,  # fused into score_raw upstream; kept None to avoid double-count
+                    score_rerank=None,
+                    score_final=r.get("score"),
+                    usage_boost=r.get("usage_boost"),
+                    user_id=user_id,
+                    agent_id=self.config.agent_id,
+                    project=filters.get("project"),
+                    session_id=session_id,
+                )
+                for i, r in enumerate(results)
+            ]
+            await self._to_thread(_telemetry.record_search, self.config.state_dir, events)
 
         response: dict[str, Any] = {
             "ok": True,
