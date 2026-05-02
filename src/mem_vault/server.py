@@ -1122,9 +1122,30 @@ class MemVaultService:
             if isinstance(hit, dict) and "rerank_score" in hit:
                 base_score = float(hit.get("rerank_score") or 0.0)
             elif isinstance(hit, dict):
-                base_score = float(hit.get("score") or 0.0)
+                # ``score`` from the index has decay applied with stale
+                # ``metadata.last_used``; we re-apply decay below using
+                # the FRESH last_used from the .md, so use ``score_raw``
+                # (the pre-decay base) as the starting point when present.
+                base_score = float(
+                    (hit.get("score_raw") if hit.get("score_raw") is not None else hit.get("score"))
+                    or 0.0
+                )
             else:
                 base_score = 0.0
+            # v0.6.0 per-memory effective decay: re-compute from the
+            # fresh ``mem.last_used`` (the Stop hook bumps it on every
+            # citation, but mem0's payload is stamped at index time and
+            # never refreshes — without this re-apply, a memory cited
+            # 5 minutes ago still looks weeks-old to the decay rule).
+            # Falls back to 1.0 when decay is disabled or both timestamps
+            # are missing, preserving v0.5.x behavior in that case.
+            from mem_vault.index import time_decay_factor
+            decay_factor = time_decay_factor(
+                mem.updated or None,
+                self.config.decay_half_life_days,
+                last_used_iso=mem.last_used or None,
+            )
+            base_score = base_score * decay_factor
             if self.config.usage_boost_enabled and self.config.usage_boost > 0:
                 # Clamp ratio to [0, 1] — negative feedback should NOT
                 # actively bury a memory (search diversity matters;
@@ -1141,6 +1162,7 @@ class MemVaultService:
                     "id": mem_id,
                     "score": boosted_score,
                     "score_raw": base_score,
+                    "decay_factor": round(decay_factor, 4),
                     "usage_boost": round(boost_factor, 4),
                     "memory": mem.to_dict(),
                     "snippet": hit.get("memory") or hit.get("text")
