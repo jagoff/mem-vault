@@ -1028,6 +1028,364 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
 
         return JSONResponse({"nodes": nodes, "edges": edges})
 
+    # ----- Dashboard (v0.6.0) -----------------------------------------------
+    #
+    # ``/dashboard`` is the new landing for power users — a single page that
+    # summarizes every signal mem-vault tracks across the corpus + the v0.6
+    # subsystems (telemetry, ranker, antagonist queue, reflection daemon).
+    # The page is server-rendered jinja2 (no HTMX islands) — a 30 s manual
+    # reload is more than enough cadence for these aggregates and keeps the
+    # template legible.
+    #
+    # ``/api/dashboard`` returns the same payload as JSON so external
+    # tooling (CLI watch, external monitors) can poll it without scraping.
+
+    async def _dashboard_payload() -> dict[str, Any]:
+        """Aggregate every cross-cutting signal into one payload.
+
+        Best-effort throughout: each subsystem (telemetry, ranker,
+        antagonist, daemon) is wrapped in its own try/except so a missing
+        module / corrupt state file degrades the corresponding card to
+        ``None`` rather than blanking the whole dashboard.
+        """
+        from datetime import datetime, timedelta
+
+        cfg = service.config
+
+        # --- Corpus --------------------------------------------------------
+        memorias = await asyncio.to_thread(
+            service.storage.list, type=None, tags=None, user_id=None, limit=10**9
+        )
+        total = len(memorias)
+        by_type: Counter = Counter()
+        by_agent: Counter = Counter()
+        by_project: Counter = Counter()
+        tag_counts: Counter = Counter()
+        now_utc = datetime.now(UTC)
+        cutoff_24h = now_utc - timedelta(hours=24)
+        cutoff_7d = now_utc - timedelta(days=7)
+        cutoff_30d = now_utc - timedelta(days=30)
+        cutoff_60d = now_utc - timedelta(days=60)
+        new_24h = updated_24h = new_7d = updated_7d = new_30d = updated_30d = 0
+
+        def _to_dt(iso: str | None):
+            if not iso:
+                return None
+            try:
+                if iso.endswith("Z"):
+                    iso = iso[:-1] + "+00:00"
+                dt = datetime.fromisoformat(iso)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=UTC)
+                return dt
+            except Exception:
+                return None
+
+        zombies: list[dict[str, Any]] = []
+        contradictions: list[dict[str, Any]] = []
+        for m in memorias:
+            by_type[m.type] += 1
+            by_agent[m.agent_id or "—"] += 1
+            for t in m.tags or []:
+                tag_counts[t] += 1
+                if t.startswith("project:"):
+                    by_project[t.split(":", 1)[1].lower()] += 1
+            created = _to_dt(m.created)
+            updated = _to_dt(m.updated)
+            if created and created >= cutoff_24h:
+                new_24h += 1
+            elif updated and updated >= cutoff_24h:
+                updated_24h += 1
+            if created and created >= cutoff_7d:
+                new_7d += 1
+            elif updated and updated >= cutoff_7d:
+                updated_7d += 1
+            if created and created >= cutoff_30d:
+                new_30d += 1
+            elif updated and updated >= cutoff_30d:
+                updated_30d += 1
+            if (m.usage_count or 0) == 0 and updated and updated < cutoff_60d:
+                age_days = (now_utc - updated).days
+                zombies.append(
+                    {
+                        "id": m.id,
+                        "name": m.name,
+                        "description": m.description,
+                        "age_days": age_days,
+                    }
+                )
+            if m.contradicts:
+                contradictions.append(
+                    {
+                        "id": m.id,
+                        "name": m.name,
+                        "description": m.description,
+                        "contradicts": list(m.contradicts),
+                    }
+                )
+
+        zombies.sort(key=lambda z: z["age_days"], reverse=True)
+
+        # --- Top usadas / helpful / unhelpful ------------------------------
+        top_used_pairs: list[tuple[int, dict[str, Any]]] = [
+            (
+                m.usage_count or 0,
+                {
+                    "id": m.id,
+                    "name": m.name,
+                    "type": m.type,
+                    "usage_count": m.usage_count or 0,
+                    "helpful_count": m.helpful_count or 0,
+                    "unhelpful_count": m.unhelpful_count or 0,
+                },
+            )
+            for m in memorias
+            if (m.usage_count or 0) > 0
+        ]
+        top_used_pairs.sort(key=lambda p: p[0], reverse=True)
+        top_used = [d for _, d in top_used_pairs[:10]]
+
+        top_helpful_pairs: list[tuple[int, dict[str, Any]]] = [
+            (
+                m.helpful_count or 0,
+                {
+                    "id": m.id,
+                    "name": m.name,
+                    "type": m.type,
+                    "helpful_count": m.helpful_count or 0,
+                    "ratio": round(m.helpful_ratio, 2),
+                },
+            )
+            for m in memorias
+            if (m.helpful_count or 0) > 0
+        ]
+        top_helpful_pairs.sort(key=lambda p: p[0], reverse=True)
+        top_helpful = [d for _, d in top_helpful_pairs[:10]]
+
+        # --- Lint + duplicates ---------------------------------------------
+        lint_payload = {}
+        try:
+            lint_payload = await service.lint({})
+        except Exception as exc:
+            logger.warning("dashboard: lint failed: %s", exc)
+        lint_problems = (lint_payload or {}).get("problems") or []
+
+        dup_pairs: list[dict[str, Any]] = []
+        try:
+            from mem_vault.discovery import find_duplicate_pairs_by_tag_overlap
+
+            for a, b, score in find_duplicate_pairs_by_tag_overlap(
+                memorias, threshold=0.7
+            )[:10]:
+                dup_pairs.append({"a": a, "b": b, "score": round(score, 3)})
+        except Exception as exc:
+            logger.warning("dashboard: duplicates failed: %s", exc)
+
+        # --- Knowledge graph -----------------------------------------------
+        graph_stats = {
+            "nodes": total,
+            "related": 0,
+            "contradicts": 0,
+            "cotag": 0,
+        }
+        try:
+            from mem_vault import graph as _graph
+
+            adj = await asyncio.to_thread(
+                _graph.build_adjacency, memorias, min_shared_tags=2, include_cotag=True
+            )
+            seen: set[tuple[str, str]] = set()
+            for a, neigh in adj.items():
+                for b, kinds in neigh.items():
+                    key = (a, b) if a < b else (b, a)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if "contradicts" in kinds:
+                        graph_stats["contradicts"] += 1
+                    if "related" in kinds:
+                        graph_stats["related"] += 1
+                    if "cotag" in kinds:
+                        graph_stats["cotag"] += 1
+        except Exception as exc:
+            logger.warning("dashboard: graph failed: %s", exc)
+
+        # --- Telemetry -----------------------------------------------------
+        telemetry_snap: dict[str, Any] | None = None
+        try:
+            from mem_vault import telemetry as _telemetry
+
+            telemetry_snap = _telemetry.stats(cfg.state_dir)
+        except Exception as exc:
+            logger.warning("dashboard: telemetry stats failed: %s", exc)
+            telemetry_snap = {"error": str(exc)}
+
+        # --- Ranker meta ---------------------------------------------------
+        ranker_snap: dict[str, Any] | None = None
+        try:
+            import json
+
+            from mem_vault import ranker as _ranker
+
+            active = _ranker.active_pickle_path(cfg.state_dir)
+            meta = _ranker.meta_path(cfg.state_dir)
+            ranker_snap = {
+                "enabled": _ranker.is_enabled(),
+                "active_pickle_exists": active.exists(),
+                "active_pickle_path": str(active),
+            }
+            if meta.exists():
+                try:
+                    blob = json.loads(meta.read_text(encoding="utf-8"))
+                    ranker_snap.update(
+                        {
+                            "version": blob.get("version"),
+                            "n_train": blob.get("n_train"),
+                            "n_positive": blob.get("n_positive"),
+                            "n_negative": blob.get("n_negative"),
+                            "auc": blob.get("auc"),
+                            "trained_at": blob.get("trained_at"),
+                        }
+                    )
+                except Exception as exc:
+                    logger.warning("dashboard: ranker meta parse failed: %s", exc)
+        except Exception as exc:
+            logger.warning("dashboard: ranker meta failed: %s", exc)
+            ranker_snap = {"error": str(exc)}
+
+        # --- Antagonist queue ----------------------------------------------
+        antagonist_snap: dict[str, Any] | None = None
+        try:
+            from mem_vault import antagonist as _antagonist
+
+            pending = _antagonist.read_pending(cfg.state_dir, ttl_s=10**9)  # show all, even expired
+            antagonist_snap = {
+                "enabled": _antagonist.is_enabled(),
+                "pending_count": len(pending),
+                "items": [p.to_dict() for p in pending[:5]],
+            }
+        except Exception as exc:
+            logger.warning("dashboard: antagonist failed: %s", exc)
+            antagonist_snap = {"error": str(exc)}
+
+        # --- Reflection daemon + last reflections --------------------------
+        reflections: list[dict[str, Any]] = []
+        for m in memorias:
+            if not m.id.startswith("reflection_"):
+                continue
+            reflections.append(
+                {
+                    "id": m.id,
+                    "name": m.name,
+                    "description": m.description,
+                    "updated": m.updated,
+                }
+            )
+        reflections.sort(key=lambda r: r.get("updated") or "", reverse=True)
+        reflections = reflections[:7]
+
+        daemon_snap: dict[str, Any] | None = None
+        try:
+            import platform
+            import subprocess
+
+            label = "com.mem-vault.reflect"
+            sys_name = platform.system()
+            loaded = None
+            detail = ""
+            if sys_name == "Darwin":
+                try:
+                    cp = subprocess.run(
+                        ["launchctl", "print", f"gui/{__import__('os').getuid()}/{label}"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    loaded = cp.returncode == 0
+                    detail = "launchd loaded" if loaded else "launchd not loaded"
+                except Exception as exc:
+                    detail = f"launchctl probe failed: {exc}"
+            elif sys_name == "Linux":
+                try:
+                    cp = subprocess.run(
+                        ["systemctl", "--user", "is-active", "mem-vault-reflect.timer"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    loaded = cp.returncode == 0
+                    detail = cp.stdout.strip() or detail
+                except Exception as exc:
+                    detail = f"systemctl probe failed: {exc}"
+            daemon_snap = {
+                "system": sys_name,
+                "label": label,
+                "loaded": loaded,
+                "detail": detail,
+                "last_reflection": reflections[0]["id"] if reflections else None,
+                "last_reflection_at": reflections[0]["updated"] if reflections else None,
+            }
+        except Exception as exc:
+            logger.warning("dashboard: daemon probe failed: %s", exc)
+            daemon_snap = {"error": str(exc)}
+
+        return {
+            "version": __version__,
+            "vault_path": str(cfg.memory_dir),
+            "agent_id": cfg.agent_id,
+            "user_id": cfg.user_id,
+            "collection": cfg.qdrant_collection,
+            "totals": {
+                "memorias": total,
+                "by_type": dict(by_type.most_common()),
+                "by_agent": dict(by_agent.most_common()),
+                "by_project": dict(by_project.most_common(10)),
+                "top_tags": tag_counts.most_common(15),
+            },
+            "activity": {
+                "new_24h": new_24h,
+                "updated_24h": updated_24h,
+                "new_7d": new_7d,
+                "updated_7d": updated_7d,
+                "new_30d": new_30d,
+                "updated_30d": updated_30d,
+            },
+            "graph": graph_stats,
+            "top_used": top_used,
+            "top_helpful": top_helpful,
+            "zombies": zombies[:10],
+            "contradictions": contradictions[:10],
+            "lint": {
+                "count": len(lint_problems),
+                "problems": [
+                    {"id": p.get("id"), "issues": p.get("issues") or p}
+                    for p in lint_problems[:10]
+                ],
+            },
+            "duplicates": {
+                "count": len(dup_pairs),
+                "pairs": dup_pairs,
+            },
+            "telemetry": telemetry_snap,
+            "ranker": ranker_snap,
+            "antagonist": antagonist_snap,
+            "daemon": daemon_snap,
+            "reflections": reflections,
+        }
+
+    @app.get("/dashboard", response_class=HTMLResponse)
+    async def dashboard_page(request: Request):
+        payload = await _dashboard_payload()
+        return templates.TemplateResponse(
+            request,
+            "dashboard.html",
+            {"d": payload, "version": __version__},
+        )
+
+    @app.get("/api/dashboard")
+    async def dashboard_api():
+        return JSONResponse(await _dashboard_payload())
+
     return app
 
 
