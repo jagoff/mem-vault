@@ -250,14 +250,13 @@ def _apply_auto_feedback(payload: dict[str, Any]) -> int:
     #
     # Best-effort: a missing telemetry DB (telemetry disabled, brand-new
     # vault, mid-migration) just returns 0. Never raises.
+    session_id = (
+        payload.get("session_id") or os.environ.get("MEM_VAULT_SESSION_ID")
+    )
     if os.environ.get("MEM_VAULT_TELEMETRY", "1").lower() not in {"0", "false", "no", "off"}:
         try:
             from mem_vault import telemetry as _telemetry
 
-            session_id = (
-                payload.get("session_id")
-                or os.environ.get("MEM_VAULT_SESSION_ID")
-            )
             _telemetry.mark_cited(
                 cfg.state_dir,
                 cited,
@@ -267,6 +266,28 @@ def _apply_auto_feedback(payload: dict[str, Any]) -> int:
             # Telemetry failures must never bubble — the Stop hook's
             # contract is "always exit 0".
             pass
+
+    # Antagonist mode (v0.6.0 game-changer #3, opt-in). After the agent
+    # cites a memory, look up its ``contradicts: [...]`` frontmatter — if
+    # non-empty, queue a "you leaned on X but X has tensions with Y"
+    # warning to be injected at the top of the next SessionStart /
+    # UserPromptSubmit. Off by default; enable with
+    # ``MEM_VAULT_ANTAGONIST=1`` once auto-contradict has populated
+    # enough contradicts: lists across the vault to be useful.
+    try:
+        from mem_vault import antagonist as _antagonist
+
+        if _antagonist.is_enabled():
+            items = _antagonist.detect_from_citations(
+                list(cited), storage=storage
+            )
+            for it in items:
+                it.session_id = session_id if isinstance(session_id, str) else None
+            _antagonist.write_pending(cfg.state_dir, items)
+    except Exception:
+        # Antagonist is best-effort: a missing module / FS error must
+        # not break the Stop hook contract.
+        pass
     return bumped
 
 

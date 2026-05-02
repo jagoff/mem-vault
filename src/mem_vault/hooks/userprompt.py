@@ -278,6 +278,26 @@ def run() -> None:
         exc_str = f"{type(exc).__name__}: {exc}"
         print(f"mem-vault: UserPromptSubmit hook failed: {exc}", file=sys.stderr)
 
+    # Antagonist warnings (v0.6.0): drain pending contradictions and
+    # prepend them to the additionalContext. The Stop hook of the
+    # previous turn enqueues these when the agent leans on a memory
+    # that has documented contradictions; the user's next prompt is
+    # the right moment to surface them. Best-effort: failure here
+    # never blocks the hook (contract: exit 0).
+    antagonist_block = ""
+    try:
+        from mem_vault import antagonist as _antagonist
+        from mem_vault.config import load_config
+
+        if _antagonist.is_enabled():
+            cfg = load_config()
+            pending = _antagonist.read_pending(cfg.state_dir)
+            if pending:
+                antagonist_block = _antagonist.render_warning_block(pending)
+                _antagonist.clear_pending(cfg.state_dir)
+    except Exception as exc:
+        print(f"mem-vault: antagonist render failed: {exc}", file=sys.stderr)
+
     latency_ms = (time.monotonic() - started) * 1000
     _log_canary(
         prompt=prompt,
@@ -287,13 +307,17 @@ def run() -> None:
         exc=exc_str,
     )
 
-    if not context:
+    # Combine antagonist + memorias context. Antagonist goes FIRST so
+    # the warning is the first thing the agent reads.
+    parts = [b for b in (antagonist_block, context) if b]
+    if not parts:
         return
+    full_context = "\n\n".join(parts)
 
     out = {
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
-            "additionalContext": context,
+            "additionalContext": full_context,
         }
     }
     json.dump(out, sys.stdout, ensure_ascii=False)
