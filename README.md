@@ -137,6 +137,12 @@ auto_extract_default = false      # opt-in LLM dedup; default off for predictabi
 | `MEM_VAULT_AUTO_EXTRACT` | `auto_extract_default` | `false` |
 | `MEM_VAULT_DECAY_HALF_LIFE_DAYS` | `decay_half_life_days` | `0` (disabled) |
 | `MEM_VAULT_USERPROMPT_SCRIPTS` | (UserPromptSubmit hook) | `""` (disabled — accept all scripts) |
+| `MEM_VAULT_LEARNED_RANKER` | v0.6 closed-loop ranker inference at search time | `0` (heurístico) |
+| `MEM_VAULT_TELEMETRY` | v0.6 persistir search events a SQLite (foundation del ranker) | `1` (on) |
+| `MEM_VAULT_ANTAGONIST` | v0.6 inyectar warnings cuando el agente cita memorias con contradicciones | `0` (off) |
+| `MEM_VAULT_ANTAGONIST_TTL_S` | cuanto sobreviven las warnings encoladas | `86400` (24 h) |
+| `MEM_VAULT_ANTAGONIST_MAX` | máximo de warnings inyectadas por turno | `3` |
+| `MEM_VAULT_BIN` | override del path del binario usado por `install-daemon` | `~/.local/bin/mem-vault` |
 
 **Vault auto-detection** (when `MEM_VAULT_PATH` is unset). First match wins:
 
@@ -215,6 +221,57 @@ memory_save(content="long conversation transcript...", auto_extract=True)
 memory_save(content="claude-code internal note", visible_to="private")
 # → only the saving agent_id sees it via memory_list/memory_search.
 ```
+
+### v0.6.0 — memoria que **aprende, conecta y critica**
+
+Tres features que separan a mem-vault de un wrapper sobre Qdrant:
+
+**1. Closed-loop adaptive ranking.** Cada `memory_search` persiste un
+evento por hit a `<state_dir>/search_events.db`, el Stop hook flipea
+`was_cited=1` cuando el agente cita un id, y `mem-vault ranker-train`
+fittea una regresión logística ([scikit-learn](https://scikit-learn.org),
+extra `[learning]`) que rankea sobre `[score_dense, score_final, rank,
+helpful_ratio, usage_count_log, recency_days, project_match,
+agent_id_match]`. Active con `MEM_VAULT_LEARNED_RANKER=1`.
+
+```bash
+mem-vault telemetry-stats         # ver cuánta señal se acumuló
+mem-vault ranker-train            # fittear la logreg (requiere ≥50 events + ≥5 citations)
+mem-vault ranker-eval             # hit@k + MRR con el ranker on
+mem-vault ranker-rollback         # kill-switch a la versión anterior
+```
+
+**2. Knowledge graph activo.** `related: [...]` y `contradicts: [...]` en
+el frontmatter dejan de ser decorativos. `memory_search` acepta
+`expand_hops=1|2|3` para BFS sobre el grafo local y anexar vecinos como
+`via_graph=true` hits. Las contradicciones del top-3 se **auto-inyectan**
+al response aunque no entren por relevancia (hasta 3 por search). Nuevo
+tool MCP `memory_neighborhood(ids, hops, edge_kinds)` para traversal
+multi-seed. El panel `/graph` se rehizo: edges coloreados por kind
+(rojo dashed = contradicts, verde = related, gris = cotag), filter chips
+`explicit | all | related | contradicts | cotag`, hover tooltip, side
+panel con contradicciones inline y botón "expand neighborhood".
+
+**3. Antagonist + reflection.** Cuando el agente cita una memoria que
+tiene contradicciones documentadas, una warning se encola y se inyecta
+al inicio del siguiente turno como *system warning* — "apoyaste en X
+pero X tiene tensiones con Y". Opt-in via `MEM_VAULT_ANTAGONIST=1`.
+Complementariamente, un daemon nocturno escribe una memoria
+`reflection_YYYY_MM_DD` con resumen del día: decisiones + bugs nuevos,
+tensiones, zombies, knowledge gaps.
+
+```bash
+mem-vault reflect                  # corré el pass a mano (rápido, offline)
+mem-vault reflect --consolidate    # + LLM-backed merge de duplicados (≥0.92)
+mem-vault install-daemon           # instala el plist launchd / systemd timer
+mem-vault install-daemon --dry-run # preview del plist sin escribir
+mem-vault daemon-status            # loaded? última reflection?
+```
+
+El daemon se activa *de verdad* (no "TODO corré `launchctl bootstrap`"):
+`install-daemon` corre `launchctl bootstrap` + `kickstart` en macOS y
+`systemctl --user enable --now` en Linux. Cumple la regla
+[CLAUDE.md](./CLAUDE.md): feature con daemon = ACTIVO al cerrar.
 
 ### Maintenance commands you'll occasionally run
 
@@ -755,6 +812,11 @@ is your knowledge graph** and you want the agent's memory to live inside it.
 - [x] Cross-vault sync — `mem-vault sync-status` + `mem-vault sync-watch` (works with iCloud / Syncthing / git / Dropbox / OneDrive)
 - [x] Time-decay scoring for `memory_search` — `MEM_VAULT_DECAY_HALF_LIFE_DAYS`
 - [x] Locale-aware `UserPromptSubmit` skip — `MEM_VAULT_USERPROMPT_SCRIPTS`
+- [x] **(v0.6.0)** Closed-loop adaptive ranker — `mem-vault ranker-train` + `MEM_VAULT_LEARNED_RANKER=1`
+- [x] **(v0.6.0)** Knowledge-graph traversal in search — `expand_hops`, `memory_neighborhood`, auto-inject contradictions
+- [x] **(v0.6.0)** Per-memory effective decay — `last_used` overrides `updated`
+- [x] **(v0.6.0)** Antagonist mode — `MEM_VAULT_ANTAGONIST=1` inyecta warnings cuando el agente cita memorias con contradicciones
+- [x] **(v0.6.0)** Reflection daemon — `mem-vault reflect` + `install-daemon` (launchd/systemd)
 
 ## License
 

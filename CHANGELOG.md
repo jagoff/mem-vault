@@ -6,6 +6,177 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-02
+
+**Tres game-changers que transforman el producto de "memoria persistente"
+a "memoria activa que aprende, conecta y critica".** Infra previa
+(`helpful_count`, `related`, `contradicts`, `eval.py`) dejaba de ser
+decorativa y pasaba a ser parte del loop de retrieval + curaduría.
+
+### Game-changer #1 — closed-loop adaptive ranking
+
+Antes: el feedback se recolectaba (`helpful_count`, citation detection
+del Stop hook) pero no alimentaba el ranking. El boost era una sola
+heurística sobre `helpful_ratio`, sin aprendizaje.
+
+Ahora: cada `memory_search` persiste una fila por hit surfaceado a
+`<state_dir>/search_events.db` (SQLite con WAL), el Stop hook flipea
+`was_cited=1` cuando la respuesta del agente cita un id, y
+`mem-vault ranker-train` fittea nightly una **regresión logística** sobre
+8 features (`score_dense`, `score_final`, `rank`, `helpful_ratio`,
+`usage_count_log`, `recency_days`, `project_match`, `agent_id_match`).
+`MEM_VAULT_LEARNED_RANKER=1` activa inferencia at search time — cada
+candidato se multiplica por `(0.5 + learned_probability)` así el modelo
+compone con el heurístico en vez de reemplazarlo.
+
+- Nuevo módulo `telemetry.py` con SQLite append-only + `mark_cited`
+  scoped por `session_id`.
+- Nuevo módulo `ranker.py` (dataclass `TrainedRanker`, atomic
+  `active.pkl` swap via `os.replace`, `rollback()` kill-switch).
+- Optional dep `[learning]` (scikit-learn + numpy, ~70MB). Sin la
+  extra, todo graceful-degrades a no-op.
+- 4 CLI nuevos: `mem-vault telemetry-stats` / `ranker-train` /
+  `ranker-eval` / `ranker-rollback`. `ranker-train` refusa fittear
+  abajo de 50 rows o 5 positives; `ranker-eval` reusa el harness
+  existente con `MEM_VAULT_LEARNED_RANKER=1`; `rollback` promueve la
+  versión previa atomic.
+
+### Game-changer #2 — knowledge graph activo
+
+Antes: `related: [...]` y `contradicts: [...]` en el frontmatter eran
+campos write-only. `memory_save` los poblaba via auto-link / auto-
+contradict; `memory_search` los ignoraba. `/graph` UI dibujaba edges
+por co-tags decorativos.
+
+Ahora: el graph es parte del retrieval pipeline + infraestructura
+reusable para UI y MCP.
+
+- Nuevo módulo `graph.py` (puro, sin deps): `build_adjacency` +
+  `expand_neighborhood` BFS multi-seed con filter por `edge_kinds` +
+  `max_nodes` cap + shortest-path hop tracking.
+- `memory_search` gana 4 params opcionales: `expand_hops` (BFS depth
+  0-3), `graph_min_shared_tags`, `graph_max_nodes`,
+  `inject_contradictions`. Default `expand_hops=0` mantiene
+  backward-compat.
+- **Auto-inyección de contradicciones**: hasta 3 `contradicts` del
+  top-3 se agregan al response como `via_graph=true` /
+  `edges=['contradicts']` aunque no entren al top-k organicamente.
+  Es lo que evita que una decisión stale sobreviva un search del
+  topic que contradice.
+- Nuevo MCP tool `memory_neighborhood(ids, hops, edge_kinds, ...)`:
+  multi-seed BFS. Stronger que `memory_related` (single-seed,
+  one-hop). Implementado también en `RemoteMemVaultService`.
+- `/graph` UI rehecho: edges con `primary` kind (contradicts > related
+  > cotag), styled por color (rojo dashed para contradictions, verde
+  solid para related, gris para cotag). Filter chips `explicit | all
+  | related | contradicts | cotag`. Side panel con contradictions
+  inline + click-to-jump + botón "expand neighborhood". Hover
+  tooltips flotantes con description + usage stats. Nuevo query param
+  `edges_filter` en `/api/graph`.
+
+### Game-changer #3a — antagonist mode (opt-in)
+
+Antes: la memoria era read-only context provider. El agente podía
+repetir una decisión stale sin saber que ya existía una memoria que
+la contradecía.
+
+Ahora: cuando el agente cita una memoria que tiene `contradicts: [...]`
+no vacío, se queda encolada una warning `pending_contradictions.json`
+y se inyecta al inicio del siguiente turno como
+`additionalContext` arriba de todo — "apoyaste en X pero X tiene
+tensiones documentadas con Y". El agente tiene que reconciliar antes
+de seguir.
+
+- Nuevo módulo `antagonist.py`: detect (de citations → pending items),
+  write_pending (dedupe por `cited_id`, append-merge), read_pending
+  (TTL 24h configurable, cap 3 items), clear_pending (idempotente).
+- Wire en `hooks/stop.py` tras el citation bump. Opt-in via
+  `MEM_VAULT_ANTAGONIST=1`.
+- Wire en `hooks/sessionstart.py` + `hooks/userprompt.py`: drain
+  pending y prepend al `additionalContext` (bloque ⚠ va PRIMERO).
+- Diseño deterministic — no LLM calls desde el Stop hook (evitamos
+  latency a close-of-turn). Reusa el `contradicts:` ya populado por
+  `auto_contradict`.
+
+### Game-changer #3b — reflection daemon nocturno
+
+Antes: consolidate + eval corrían manual. La memoria crecía pero no
+había higiene automática.
+
+Ahora: una vez por día (launchd/systemd, default 03:00 local) el
+reflection pass escribe una memoria `reflection_YYYY_MM_DD` con
+resumen del día: decisiones nuevas, bugs documentados, tensiones,
+zombies candidatas a archivar, knowledge gaps por proyecto.
+Idempotente — mismo día se update-in-place.
+
+- Nuevo módulo `reflection.py`: deterministic offline por default.
+  `--consolidate` opt-in al pase LLM de consolidate (reusa
+  `find_candidate_pairs` + `apply_resolution` existentes, cap 10
+  pairs bounded).
+- `_knowledge_gaps`: heurística por tag `project:foo` sin writes en
+  14d.
+- 3 CLI nuevos: `mem-vault reflect` / `install-daemon` /
+  `daemon-status`.
+- `install-daemon` cumple la regla CLAUDE.md: feature con daemon =
+  ACTIVO al cerrar, no "TODO corré launchctl bootstrap". Genera el
+  plist launchd (macOS) o service+timer systemd (Linux) + ejecuta
+  `launchctl bootstrap` + `launchctl kickstart` (primer tick
+  inmediato, schedule diario). Windows emite `schtasks` command.
+
+### Bonus — per-memory effective decay
+
+`time_decay_factor` ahora acepta `last_used_iso` opcional y usa el
+max() entre `updated` y `last_used`. El global `decay_half_life_days`
+deja de ser binario (todo o nada) y se vuelve un **per-memory effective
+half-life**: una memoria vieja pero citada ayer se mantiene caliente;
+una abandonada decae al ritmo completo. Backward-compat total — sin
+`last_used` el comportamiento es idéntico a v0.5.x.
+
+### Added — 834 tests (de 753 baseline → +81)
+
+- `test_telemetry.py` (10) — SQLite schema idempotente, batch inserts,
+  mark_cited per-session, TTL drop, error swallow.
+- `test_ranker.py` (15) — featurize order/None/recency cap/log1p,
+  train rejection, pickle round-trip, rollback, AUC ≥ 0.95 separable.
+- `test_per_memory_decay.py` (7) — legacy path, last_used overrides
+  updated, Z suffix normalization.
+- `test_graph.py` (17) — BFS pure: simetría related/contradicts,
+  normalize project:foo, hop shortest-path, edge_kinds filter,
+  max_nodes, dangling ids, self-loop termination.
+- `test_neighborhood.py` (9) — MCP handler integration: validation,
+  hop traversal, edge_kinds, unknown seeds, max_nodes.
+- `test_ui_graph.py` (6) — `/api/graph` nuevos kinds, filter values,
+  primary priority contradicts > related > cotag.
+- `test_antagonist.py` (12) — is_enabled env, detect con/sin
+  contradicts / dangling ids, dedupe by cited_id, TTL drop,
+  max_items cap, clear idempotente.
+- `test_reflection.py` (5) — idempotencia same-day, contradictions,
+  zombies count, body rendering con wikilinks.
+
+### Changed — pyproject
+
+- Version bump 0.5.0 → 0.6.0.
+- Nueva extra `[learning]` (`scikit-learn>=1.4` + `numpy>=1.26`) para
+  el ranker. Opt-in.
+
+### Wires operativos
+
+En este commit, corriendo contra el vault real (170 memorias):
+
+- **Telemetry**: `search_events.db` listo en `state_dir`, 0 eventos
+  iniciales (arranca a llenarse con cada search).
+- **Graph stats**: 282 edges `related`, 5 `contradicts`, 1405 `cotag`.
+  Modo `explicit` muestra solo las 287 reales (sin cotag noise).
+- **Reflection daemon**: `com.mem-vault.reflect` loaded en launchd,
+  PID vivo, programado 03:15 local. Primer tick ya generó
+  `reflection_2026_05_02.md` con 111 decisiones + 20 tensiones + 14
+  pending dups.
+- **Doctor**: todos los checks ✓ (el único ⚠ es drift preexistente
+  del sync, no nuevo).
+- **mypy + ruff**: verde.
+
+Generated with [Devin](https://cli.devin.ai/docs)
+
 ## [0.5.0] - 2026-05-01
 
 **UI overhaul: `/memory/` deja de ser un explorador plano y pasa a ser un
