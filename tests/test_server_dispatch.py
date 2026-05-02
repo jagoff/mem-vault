@@ -78,6 +78,9 @@ class _RecordingService:
     async def related(self, args):
         return await self._dispatch("related", args)
 
+    async def neighborhood(self, args):
+        return await self._dispatch("neighborhood", args)
+
 
 # ---------------------------------------------------------------------------
 # _build_server — list_tools and call_tool dispatch

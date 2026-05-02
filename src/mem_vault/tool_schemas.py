@@ -124,7 +124,13 @@ _TOOLS: list[types.Tool] = [
             "Semantic search across all memories using local embeddings. Returns "
             "the top-k most relevant memories with their full content. Useful at "
             "the start of a session to recover relevant context, or before "
-            "answering questions that depend on past decisions."
+            "answering questions that depend on past decisions.\n\n"
+            "v0.6.0: pass ``expand_hops`` to BFS the local knowledge graph "
+            "(``related`` ∪ ``contradicts`` ∪ co-tag) from the top-k and "
+            "include neighbors as ``via_graph=true`` hits. Contradictions of "
+            "the top-3 are auto-injected as ``edges=['contradicts']`` even "
+            "when they didn't make the semantic top-k organically — disable "
+            "with ``inject_contradictions=false``."
         ),
         inputSchema={
             "type": "object",
@@ -148,6 +154,48 @@ _TOOLS: list[types.Tool] = [
                         "Filter to memorias stamped with this project scope. "
                         "Pass ``*`` (or empty string) to bypass "
                         "``Config.project_default`` and search globally."
+                    ),
+                },
+                "expand_hops": {
+                    "type": "integer",
+                    "default": 0,
+                    "minimum": 0,
+                    "maximum": 3,
+                    "description": (
+                        "BFS depth on the local knowledge graph. 0 (default) = "
+                        "pure semantic. 1-2 = include neighbors via "
+                        "related/contradicts/co-tag for richer context."
+                    ),
+                },
+                "graph_min_shared_tags": {
+                    "type": "integer",
+                    "default": 2,
+                    "minimum": 1,
+                    "maximum": 10,
+                    "description": "Co-tag edge threshold during expansion.",
+                },
+                "graph_max_nodes": {
+                    "type": "integer",
+                    "default": 30,
+                    "minimum": 1,
+                    "maximum": 200,
+                    "description": "Soft cap on nodes added via graph expansion.",
+                },
+                "inject_contradictions": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": (
+                        "Auto-add up to 3 ``contradicts`` of the top-3 results "
+                        "as ``via_graph`` hits with ``edges=['contradicts']``. "
+                        "Off only when you want pure semantic ordering."
+                    ),
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional session id stamped on telemetry rows so the "
+                        "Stop hook can correlate citations to this exact turn. "
+                        "Defaults to the MEM_VAULT_SESSION_ID env var."
                     ),
                 },
             },
@@ -357,6 +405,66 @@ _TOOLS: list[types.Tool] = [
                 },
             },
             "required": ["id"],
+        },
+    ),
+    types.Tool(
+        name="memory_neighborhood",
+        description=(
+            "BFS the local knowledge graph from a set of seed memorias and "
+            "return every visited node with its hop distance + the edge "
+            "kinds that pulled it in. Stronger than ``memory_related`` (one "
+            "seed, one hop) — this can take multiple seeds, traverse 2-3 "
+            "hops, and lets you narrow the edge kinds. Useful for 'show me "
+            "the cluster of decisions around topic X' kinds of questions, "
+            "and for the agent to discover context implied by relationships "
+            "rather than semantic similarity alone.\n\n"
+            "Edge kinds: ``related`` (auto-link wikilinks), ``contradicts`` "
+            "(auto-detected tensions), ``cotag`` (≥ ``min_shared_tags`` shared "
+            "after ``project:foo``-splitting). Pass ``edge_kinds=['contradicts']`` "
+            "to scan only tensions, e.g. before reaffirming a decision."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Seed memory ids. At least one required.",
+                },
+                "hops": {
+                    "type": "integer",
+                    "default": 1,
+                    "minimum": 0,
+                    "maximum": 3,
+                    "description": "BFS depth. 0 returns just the seeds.",
+                },
+                "edge_kinds": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["related", "contradicts", "cotag"],
+                    },
+                    "description": (
+                        "Restrict traversal to these edge kinds. Defaults to "
+                        "all three when omitted."
+                    ),
+                },
+                "min_shared_tags": {
+                    "type": "integer",
+                    "default": 2,
+                    "minimum": 1,
+                    "maximum": 10,
+                    "description": "Co-tag edge threshold.",
+                },
+                "max_nodes": {
+                    "type": "integer",
+                    "default": 50,
+                    "minimum": 1,
+                    "maximum": 500,
+                    "description": "Soft cap on visited nodes.",
+                },
+            },
+            "required": ["ids"],
         },
     ),
     types.Tool(

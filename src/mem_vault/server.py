@@ -1225,6 +1225,100 @@ class MemVaultService:
         candidates.sort(key=lambda c: c["score"] or 0.0, reverse=True)
         results = candidates[:k]
 
+        # Knowledge-graph expansion (v0.6.0 game-changer #2). When the
+        # caller passes ``expand_hops >= 1``, we BFS from the top-k
+        # following ``related`` ∪ ``contradicts`` ∪ co-tag edges and
+        # append any neighbor that wasn't already in ``results`` as a
+        # graph-derived hit (``via_graph=True``, ``hop=N``). The
+        # heuristic top-k stays first; graph hits are appended after,
+        # so the agent always gets the semantic match first and the
+        # context cluster after. ``expand_hops=0`` (default) is a no-op
+        # — backward compatible with v0.5.x callers.
+        expand_hops = int(args.get("expand_hops", 0) or 0)
+        if expand_hops > 0 and results:
+            try:
+                from mem_vault import graph as _graph
+
+                corpus = await self._list_corpus()
+                seed_ids = [r["id"] for r in results]
+                visited = _graph.expand_neighborhood(
+                    corpus,
+                    seed_ids,
+                    hops=expand_hops,
+                    min_shared_tags=int(args.get("graph_min_shared_tags", 2) or 2),
+                    max_nodes=int(args.get("graph_max_nodes", 30) or 30),
+                )
+                seen_ids = {r["id"] for r in results}
+                for node in visited.values():
+                    if node.id in seen_ids or node.hop == 0:
+                        continue
+                    mem = await self._to_thread(self.storage.get, node.id)
+                    if mem is None or not mem.is_visible_to(viewer_agent_id):
+                        continue
+                    results.append(
+                        {
+                            "id": node.id,
+                            "score": 0.0,
+                            "score_raw": 0.0,
+                            "via_graph": True,
+                            "hop": node.hop,
+                            "edges": sorted(node.edges),
+                            "memory": mem.to_dict(),
+                            "snippet": None,
+                        }
+                    )
+                    seen_ids.add(node.id)
+            except Exception as exc:
+                logger.warning("graph expansion failed (%s); ignoring", exc)
+
+        # Auto-inject "contradicts top result" hits — even when the
+        # contradictory memory didn't make the semantic top-k. The
+        # agent NEEDS to see contradictions when reasoning about the
+        # top-1; without this, a stale decision silently survives a
+        # query for the topic it contradicts.
+        #
+        # This runs every search (no flag) because the cost is
+        # negligible (one in-memory dict lookup per top-result that
+        # actually has contradictions, which is the minority) and the
+        # value is high. Off only when ``inject_contradictions=false``.
+        inject_contras = bool(args.get("inject_contradictions", True))
+        if inject_contras and results:
+            try:
+                from mem_vault import graph as _graph
+
+                corpus_for_contra = await self._list_corpus()
+                seen_ids = {r["id"] for r in results}
+                contradictions_added = 0
+                MAX_CONTRADICTIONS = 3  # cap per search; beyond that the response drowns
+                for r in results[:3]:  # only inspect the top-3
+                    if contradictions_added >= MAX_CONTRADICTIONS:
+                        break
+                    contra = _graph.contradictions_for(corpus_for_contra, r["id"])
+                    for cm in contra:
+                        if contradictions_added >= MAX_CONTRADICTIONS:
+                            break
+                        if cm.id in seen_ids:
+                            continue
+                        if not cm.is_visible_to(viewer_agent_id):
+                            continue
+                        results.append(
+                            {
+                                "id": cm.id,
+                                "score": 0.0,
+                                "score_raw": 0.0,
+                                "via_graph": True,
+                                "hop": 1,
+                                "edges": ["contradicts"],
+                                "contradicts": r["id"],
+                                "memory": cm.to_dict(),
+                                "snippet": None,
+                            }
+                        )
+                        seen_ids.add(cm.id)
+                        contradictions_added += 1
+            except Exception as exc:
+                logger.warning("contradiction injection failed (%s); ignoring", exc)
+
         # Record usage post-hoc on the IDs we actually surface. This is
         # best-effort: failures are swallowed inside ``record_usage``.
         # Runs concurrently-ish via ``to_thread`` but sequentially per
@@ -1662,6 +1756,76 @@ class MemVaultService:
             "contradicts": contradicts_out,
             "cotag_neighbors": cotag_out,
             "semantic_neighbors": semantic_out,
+        }
+
+    async def neighborhood(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Multi-seed BFS over the local knowledge graph (v0.6.0 game-changer #2).
+
+        Where ``related`` returns one-hop neighbors of a single memory
+        grouped by edge kind, ``neighborhood`` takes multiple seeds,
+        traverses N hops, and returns each visited node with the
+        shortest hop + the union of edges that pulled it in. The
+        agent uses this to discover context implied by relationships
+        rather than semantic similarity alone.
+
+        Backed by the pure :mod:`mem_vault.graph` module so the same
+        traversal also powers the FastAPI ``/graph`` UI.
+        """
+        from mem_vault import graph as _graph
+
+        ids = args.get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            return {
+                "ok": False,
+                "error": "ids must be a non-empty list",
+                "code": "validation_failed",
+            }
+        seed_ids = [str(i) for i in ids if i]
+        hops = max(0, min(3, int(args.get("hops", 1) or 0)))
+        min_shared = max(1, min(10, int(args.get("min_shared_tags", 2) or 2)))
+        max_nodes = max(1, min(500, int(args.get("max_nodes", 50) or 50)))
+        edge_kinds = args.get("edge_kinds")
+        if edge_kinds is not None and not isinstance(edge_kinds, list):
+            return {
+                "ok": False,
+                "error": "edge_kinds must be a list of strings",
+                "code": "validation_failed",
+            }
+
+        corpus = await self._list_corpus()
+        # Verify at least one seed actually exists in the corpus — else
+        # the BFS returns {} and the caller has no signal that the seeds
+        # were bad ids.
+        known_ids = {m.id for m in corpus}
+        unknown = [i for i in seed_ids if i not in known_ids]
+        if len(unknown) == len(seed_ids):
+            return {
+                "ok": False,
+                "error": f"none of the seed ids exist: {unknown}",
+                "code": "not_found",
+            }
+
+        visited = await self._to_thread(
+            _graph.expand_neighborhood,
+            corpus,
+            seed_ids,
+            hops=hops,
+            min_shared_tags=min_shared,
+            include_cotag=(edge_kinds is None or "cotag" in edge_kinds),
+            edge_kinds=edge_kinds,
+            max_nodes=max_nodes,
+        )
+
+        # Sort: seeds first (hop=0), then by hop ascending, then by id.
+        nodes = sorted(visited.values(), key=lambda n: (n.hop, n.id))
+        return {
+            "ok": True,
+            "seeds": seed_ids,
+            "hops": hops,
+            "edge_kinds": edge_kinds,
+            "count": len(nodes),
+            "unknown_seeds": unknown,
+            "nodes": [n.to_dict() for n in nodes],
         }
 
     async def history(self, args: dict[str, Any]) -> dict[str, Any]:
