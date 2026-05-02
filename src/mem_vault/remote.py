@@ -209,6 +209,29 @@ class RemoteMemVaultService:
         }
         return await self._get(f"/api/v1/memories/{mem_id}/related", params=params)
 
+    async def neighborhood(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Multi-seed BFS over the local knowledge graph (v0.6.0).
+
+        Wraps ``MemVaultService.neighborhood`` over HTTP. Same input
+        contract — see the tool schema in ``tool_schemas.py``.
+        """
+        ids = args.get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            return {
+                "ok": False,
+                "error": "ids must be a non-empty list",
+                "code": "validation_failed",
+            }
+        body: dict[str, Any] = {
+            "ids": list(ids),
+            "hops": int(args.get("hops", 1) or 0),
+            "min_shared_tags": int(args.get("min_shared_tags", 2) or 2),
+            "max_nodes": int(args.get("max_nodes", 50) or 50),
+        }
+        if args.get("edge_kinds") is not None:
+            body["edge_kinds"] = list(args["edge_kinds"])
+        return await self._post("/api/v1/neighborhood", json=body)
+
     async def history(self, args: dict[str, Any]) -> dict[str, Any]:
         mem_id = args.get("id")
         if not mem_id:

@@ -919,29 +919,38 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
     async def graph_data(
         min_shared_tags: int = Query(2, ge=1, le=10),
         max_nodes: int = Query(200, ge=10, le=1000),
+        edges_filter: str = Query(
+            "all",
+            pattern=r"^(all|related|contradicts|cotag|explicit)$",
+            description=(
+                "Which edge kinds to render: ``all`` (default — every kind), "
+                "``related``, ``contradicts``, ``cotag`` (single kind), or "
+                "``explicit`` (related ∪ contradicts, no co-tag noise)."
+            ),
+        ),
     ):
         """Build a node/edge graph for cytoscape.js.
 
-        Nodes  = memories (limited to ``max_nodes`` most recent).
-        Edges  = pairs of memories that share at least ``min_shared_tags``
-                 tags. Tag overlap is the cheap, deterministic signal — no
-                 Qdrant kNN needed. Edge weight = number of shared tags.
+        v0.6.0: edges now carry a ``kind`` field — ``related`` (auto-link
+        wikilinks from frontmatter), ``contradicts`` (auto-detected
+        tensions), or ``cotag`` (≥ ``min_shared_tags`` shared after the
+        normalization split). The frontend styles each kind differently
+        so the graph stops being decorative and starts being a real
+        knowledge-graph visualization.
 
-        Tags shaped as ``project:foo`` / ``scope:bar`` are split on ``:`` and
-        only the suffix counts toward overlap, so two memories tagged
-        ``project:rag`` and ``project:rag-obsidian`` still cluster together.
+        Nodes  = memories (limited to ``max_nodes`` most recent).
+        Edges  = the union of related / contradicts / cotag (each pair
+                 may carry multiple kinds, joined into one edge with
+                 ``kinds=[...]``).
         """
+        from mem_vault import graph as _graph
+
         memories = await asyncio.to_thread(
             service.storage.list, type=None, tags=None, user_id=None, limit=max_nodes
         )
 
-        def normalize_tag(t: str) -> str:
-            return t.split(":", 1)[-1].lower()
-
         nodes = []
-        tag_index: dict[str, list[str]] = {}  # normalized_tag → [memory_id]
         for m in memories:
-            normalized = {normalize_tag(t) for t in m.tags if t}
             nodes.append(
                 {
                     "data": {
@@ -952,38 +961,70 @@ def create_app(service: MemVaultService | None = None) -> FastAPI:
                         "agent_id": m.agent_id,
                         "updated": m.updated,
                         "description": m.description,
+                        "usage_count": m.usage_count or 0,
+                        "helpful_ratio": round(m.helpful_ratio, 2),
                     }
                 }
             )
-            for t in normalized:
-                tag_index.setdefault(t, []).append(m.id)
 
-        # Build edges from tag co-occurrence. We compute pair → shared-tag-set
-        # incrementally to avoid O(N²) over all memories.
-        pair_tags: dict[tuple[str, str], set[str]] = {}
-        for tag, ids in tag_index.items():
-            if len(ids) < 2 or len(ids) > 50:  # huge cliques produce noise
-                continue
-            for i, a in enumerate(ids):
-                for b in ids[i + 1 :]:
-                    key = (a, b) if a < b else (b, a)
-                    pair_tags.setdefault(key, set()).add(tag)
+        # Pick edge kinds to render. ``explicit`` is the agent-friendly
+        # default for "show me the real knowledge graph": related +
+        # contradicts only, no co-tag noise from large project tags.
+        if edges_filter == "all":
+            include_cotag = True
+            allowed: set[str] | None = None
+        elif edges_filter == "related":
+            include_cotag = False
+            allowed = {"related"}
+        elif edges_filter == "contradicts":
+            include_cotag = False
+            allowed = {"contradicts"}
+        elif edges_filter == "cotag":
+            include_cotag = True
+            allowed = {"cotag"}
+        else:  # explicit
+            include_cotag = False
+            allowed = {"related", "contradicts"}
 
+        adj = await asyncio.to_thread(
+            _graph.build_adjacency,
+            memories,
+            min_shared_tags=min_shared_tags,
+            include_cotag=include_cotag,
+        )
+
+        # Flatten the symmetric adjacency to undirected edges (each pair
+        # appears once). The kind set is preserved on the edge so the
+        # frontend can style by primary kind (contradicts > related > cotag).
         edges = []
-        for (a, b), tags in pair_tags.items():
-            if len(tags) < min_shared_tags:
-                continue
-            edges.append(
-                {
-                    "data": {
-                        "id": f"{a}__{b}",
-                        "source": a,
-                        "target": b,
-                        "weight": len(tags),
-                        "shared": sorted(tags),
+        seen_pairs: set[tuple[str, str]] = set()
+        for a, neigh in adj.items():
+            for b, kinds in neigh.items():
+                key = (a, b) if a < b else (b, a)
+                if key in seen_pairs:
+                    continue
+                seen_pairs.add(key)
+                kept = kinds if allowed is None else (kinds & allowed)
+                if not kept:
+                    continue
+                edges.append(
+                    {
+                        "data": {
+                            "id": f"{key[0]}__{key[1]}",
+                            "source": key[0],
+                            "target": key[1],
+                            "kinds": sorted(kept),
+                            # ``primary`` defines the rendering color/style.
+                            # Priority: contradicts > related > cotag.
+                            "primary": (
+                                "contradicts"
+                                if "contradicts" in kept
+                                else ("related" if "related" in kept else "cotag")
+                            ),
+                            "weight": len(kept),
+                        }
                     }
-                }
-            )
+                )
 
         return JSONResponse({"nodes": nodes, "edges": edges})
 

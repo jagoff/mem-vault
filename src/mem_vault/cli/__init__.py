@@ -56,7 +56,13 @@ from mem_vault.cli import (
     install_skill as _install_skill_mod,
 )
 from mem_vault.cli import (
+    learn as _learn_mod,
+)
+from mem_vault.cli import (
     metrics as _metrics_mod,
+)
+from mem_vault.cli import (
+    reflect_cmd as _reflect_mod,
 )
 from mem_vault.cli import (
     reindex as _reindex_mod,
@@ -95,6 +101,8 @@ def _build_parser() -> argparse.ArgumentParser:
     _doctor_mod.add_subparser(sub)
     _eval_mod.add_subparser(sub)
     _metrics_mod.add_subparser(sub)
+    _learn_mod.add_subparsers(sub)
+    _reflect_mod.add_subparsers(sub)
 
     return parser
 
@@ -151,6 +159,27 @@ def _dispatch(argv: list[str]) -> None:
 
     if cmd == "metrics":
         sys.exit(_metrics_mod.run(args))
+
+    if cmd == "telemetry-stats":
+        sys.exit(_learn_mod.run_telemetry_stats(args))
+
+    if cmd == "ranker-train":
+        sys.exit(_learn_mod.run_ranker_train(args))
+
+    if cmd == "ranker-eval":
+        sys.exit(_learn_mod.run_ranker_eval(args))
+
+    if cmd == "ranker-rollback":
+        sys.exit(_learn_mod.run_ranker_rollback(args))
+
+    if cmd == "reflect":
+        sys.exit(_reflect_mod.run_reflect(args))
+
+    if cmd == "install-daemon":
+        sys.exit(_reflect_mod.run_install_daemon(args))
+
+    if cmd == "daemon-status":
+        sys.exit(_reflect_mod.run_daemon_status(args))
 
     if cmd in {"hook-sessionstart", "hook-userprompt", "hook-stop"}:
         _hooks_mod.run(cmd)

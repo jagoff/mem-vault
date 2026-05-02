@@ -436,7 +436,27 @@ async def _gather_context(cwd: str | None = None) -> str:
         )
         memorias_block = "\n".join(lines)
 
-    blocks = [b for b in (stats_block, memorias_block) if b]
+    # Antagonist warnings (v0.6.0): if the previous turn cited memorias
+    # that have documented contradictions, surface them at the top of
+    # this turn so the agent reconciles before re-leaning on the same
+    # decision. Best-effort: a missing antagonist module / unreadable
+    # state file is a no-op. Drained on read so the warning surfaces
+    # exactly once.
+    antagonist_block = ""
+    try:
+        from mem_vault import antagonist as _antagonist
+
+        if _antagonist.is_enabled():
+            pending = _antagonist.read_pending(service.config.state_dir)
+            if pending:
+                antagonist_block = _antagonist.render_warning_block(pending)
+                _antagonist.clear_pending(service.config.state_dir)
+    except Exception as exc:
+        print(f"mem-vault: antagonist render failed: {exc}", file=sys.stderr)
+
+    # Antagonist block goes FIRST when present — the warning has higher
+    # priority than the stats banner / memorias section.
+    blocks = [b for b in (antagonist_block, stats_block, memorias_block) if b]
     return "\n\n".join(blocks)
 
 

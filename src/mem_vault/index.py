@@ -134,29 +134,54 @@ class _CircuitBreaker:
             )
 
 
-def time_decay_factor(updated_iso: str | None, half_life_days: float) -> float:
-    """Multiplier in (0, 1] applied to a search score given an ``updated`` ISO timestamp.
+def _parse_iso(ts: str | None) -> datetime | None:
+    """ISO8601 → aware datetime; None on missing/unparseable."""
+    if not ts:
+        return None
+    try:
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt
+    except Exception:
+        return None
+
+
+def time_decay_factor(
+    updated_iso: str | None,
+    half_life_days: float,
+    last_used_iso: str | None = None,
+) -> float:
+    """Multiplier in (0, 1] applied to a search score given the memory's age.
+
+    v0.6.0 update: when ``last_used_iso`` is supplied (the
+    ``last_used`` frontmatter that the Stop hook bumps every time the
+    agent cites the memory), we use the **more recent** of
+    ``updated_iso`` and ``last_used_iso`` to compute the age. This
+    converts the global half-life into a *per-memory effective* decay:
+    a 6-month-old memory that the agent cited yesterday looks fresh,
+    while one that's never been cited decays at the full rate.
 
     Returns 1.0 when:
-    - ``half_life_days`` is 0 or negative (decay disabled)
-    - ``updated_iso`` is missing/unparseable (we don't punish memories that
-      simply lack a timestamp — better to fall back to pure semantic score)
 
-    Otherwise: ``2 ** (-age_days / half_life_days)`` — true half-life decay.
-    With a 90-day half-life, a memory updated 90 days ago has its score
-    halved; 180 days ago, quartered; one updated yesterday is barely
-    affected.
+    - ``half_life_days`` is 0 or negative (decay disabled)
+    - Both ``updated_iso`` and ``last_used_iso`` are missing/unparseable
+      (we don't punish memories that simply lack a timestamp — better
+      to fall back to pure semantic score).
+
+    Otherwise: ``2 ** (-age_days / half_life_days)``.
     """
     if half_life_days is None or half_life_days <= 0:
         return 1.0
-    if not updated_iso:
+    parsed: list[datetime] = [
+        c for c in (_parse_iso(updated_iso), _parse_iso(last_used_iso)) if c is not None
+    ]
+    if not parsed:
         return 1.0
-    try:
-        dt = datetime.fromisoformat(updated_iso)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=UTC)
-    except Exception:
-        return 1.0
+    # Most recent timestamp wins — citing an old memory keeps it warm.
+    dt = max(parsed)
     age_seconds = (datetime.now(tz=dt.tzinfo) - dt).total_seconds()
     if age_seconds <= 0:
         return 1.0
@@ -364,7 +389,17 @@ class VectorIndex:
                     or (h.get("metadata") or {}).get("updated")
                     or (h.get("metadata") or {}).get("created")
                 )
-                factor = time_decay_factor(ts, decay)
+                # v0.6.0: per-memory effective decay. ``last_used`` is
+                # the Stop-hook-maintained "last citation" timestamp on
+                # the .md frontmatter — when newer than ``updated``, it
+                # keeps the memory warm. mem0 doesn't surface our
+                # custom field directly, so the canonical source is
+                # ``metadata.last_used`` (stamped via vault payload).
+                last_used = (
+                    (h.get("metadata") or {}).get("last_used")
+                    or h.get("last_used")
+                )
+                factor = time_decay_factor(ts, decay, last_used_iso=last_used)
                 h["score_raw"] = base
                 h["decay_factor"] = factor
                 h["score"] = base * factor

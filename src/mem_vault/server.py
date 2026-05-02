@@ -31,6 +31,8 @@ import mcp.types as types
 from mcp.server import Server
 
 from mem_vault import __version__
+from mem_vault import ranker as _ranker
+from mem_vault import telemetry as _telemetry
 from mem_vault.config import Config, load_config
 from mem_vault.discovery import (
     compute_stats,
@@ -1120,9 +1122,30 @@ class MemVaultService:
             if isinstance(hit, dict) and "rerank_score" in hit:
                 base_score = float(hit.get("rerank_score") or 0.0)
             elif isinstance(hit, dict):
-                base_score = float(hit.get("score") or 0.0)
+                # ``score`` from the index has decay applied with stale
+                # ``metadata.last_used``; we re-apply decay below using
+                # the FRESH last_used from the .md, so use ``score_raw``
+                # (the pre-decay base) as the starting point when present.
+                base_score = float(
+                    (hit.get("score_raw") if hit.get("score_raw") is not None else hit.get("score"))
+                    or 0.0
+                )
             else:
                 base_score = 0.0
+            # v0.6.0 per-memory effective decay: re-compute from the
+            # fresh ``mem.last_used`` (the Stop hook bumps it on every
+            # citation, but mem0's payload is stamped at index time and
+            # never refreshes — without this re-apply, a memory cited
+            # 5 minutes ago still looks weeks-old to the decay rule).
+            # Falls back to 1.0 when decay is disabled or both timestamps
+            # are missing, preserving v0.5.x behavior in that case.
+            from mem_vault.index import time_decay_factor
+            decay_factor = time_decay_factor(
+                mem.updated or None,
+                self.config.decay_half_life_days,
+                last_used_iso=mem.last_used or None,
+            )
+            base_score = base_score * decay_factor
             if self.config.usage_boost_enabled and self.config.usage_boost > 0:
                 # Clamp ratio to [0, 1] — negative feedback should NOT
                 # actively bury a memory (search diversity matters;
@@ -1139,6 +1162,7 @@ class MemVaultService:
                     "id": mem_id,
                     "score": boosted_score,
                     "score_raw": base_score,
+                    "decay_factor": round(decay_factor, 4),
                     "usage_boost": round(boost_factor, 4),
                     "memory": mem.to_dict(),
                     "snippet": hit.get("memory") or hit.get("text")
@@ -1147,6 +1171,52 @@ class MemVaultService:
                 }
             )
 
+        # Closed-loop adaptive ranker (v0.6.0). Opt-in via
+        # ``MEM_VAULT_LEARNED_RANKER=1``. Loads the latest pickle from
+        # ``state_dir/ranker/active.pkl`` (trained nightly by
+        # ``mem-vault ranker-train`` on the search-event telemetry).
+        # The model returns a calibrated probability that the agent
+        # would cite this hit; we multiply it into the existing score
+        # so the heuristic boost still composes (positive feedback +
+        # learned weighting both lift the score). Disabled / absent /
+        # broken model = no-op, fall through to the heuristic sort.
+        if _ranker.is_enabled() and candidates:
+            try:
+                model = await self._to_thread(_ranker.load_active, self.config.state_dir)
+                if model is not None:
+                    for c in candidates:
+                        # Featurize from the same dict shape ``telemetry.build_event``
+                        # produces, so train and inference agree on column order.
+                        feat_row = {
+                            "score_dense": c.get("score_raw"),
+                            "score_final": c.get("score"),
+                            "rank": 0,  # rank-at-inference is unknown (we're computing it)
+                            "helpful_ratio": (c["memory"] or {}).get("helpful_ratio"),
+                            "usage_count": (c["memory"] or {}).get("usage_count"),
+                            "recency_days": None,  # left for the model's mean fallback
+                            "project_match": 1 if filters.get("project") and (
+                                (c["memory"] or {}).get("project") == filters["project"]
+                                or any(
+                                    t.lower() == f"project:{filters['project']}".lower()
+                                    for t in ((c["memory"] or {}).get("tags") or [])
+                                )
+                            ) else 0,
+                            "agent_id_match": 1 if (
+                                self.config.agent_id
+                                and (c["memory"] or {}).get("agent_id") == self.config.agent_id
+                            ) else 0,
+                        }
+                        learned = model.score(feat_row)
+                        # Compose: keep the heuristic score's *magnitude*
+                        # (we don't want to throw away semantic similarity)
+                        # and multiply by (0.5 + learned) so the model
+                        # nudges the order without inverting it. ``learned``
+                        # is in [0, 1]; the factor lands in [0.5, 1.5].
+                        c["score_learned"] = round(learned, 4)
+                        c["score"] = (c["score"] or 0.0) * (0.5 + learned)
+            except Exception as exc:
+                logger.warning("learned ranker failed (%s); falling back to heuristic", exc)
+
         # Re-sort by boosted score so feedback actually changes the ordering
         # before we take the top-k. When boost is disabled AND the reranker
         # didn't run, this is a no-op (all boost_factor=1.0, identical order).
@@ -1154,6 +1224,100 @@ class MemVaultService:
         # boost (rerank_score × boost_factor).
         candidates.sort(key=lambda c: c["score"] or 0.0, reverse=True)
         results = candidates[:k]
+
+        # Knowledge-graph expansion (v0.6.0 game-changer #2). When the
+        # caller passes ``expand_hops >= 1``, we BFS from the top-k
+        # following ``related`` ∪ ``contradicts`` ∪ co-tag edges and
+        # append any neighbor that wasn't already in ``results`` as a
+        # graph-derived hit (``via_graph=True``, ``hop=N``). The
+        # heuristic top-k stays first; graph hits are appended after,
+        # so the agent always gets the semantic match first and the
+        # context cluster after. ``expand_hops=0`` (default) is a no-op
+        # — backward compatible with v0.5.x callers.
+        expand_hops = int(args.get("expand_hops", 0) or 0)
+        if expand_hops > 0 and results:
+            try:
+                from mem_vault import graph as _graph
+
+                corpus = await self._list_corpus()
+                seed_ids = [r["id"] for r in results]
+                visited = _graph.expand_neighborhood(
+                    corpus,
+                    seed_ids,
+                    hops=expand_hops,
+                    min_shared_tags=int(args.get("graph_min_shared_tags", 2) or 2),
+                    max_nodes=int(args.get("graph_max_nodes", 30) or 30),
+                )
+                seen_ids = {r["id"] for r in results}
+                for node in visited.values():
+                    if node.id in seen_ids or node.hop == 0:
+                        continue
+                    mem = await self._to_thread(self.storage.get, node.id)
+                    if mem is None or not mem.is_visible_to(viewer_agent_id):
+                        continue
+                    results.append(
+                        {
+                            "id": node.id,
+                            "score": 0.0,
+                            "score_raw": 0.0,
+                            "via_graph": True,
+                            "hop": node.hop,
+                            "edges": sorted(node.edges),
+                            "memory": mem.to_dict(),
+                            "snippet": None,
+                        }
+                    )
+                    seen_ids.add(node.id)
+            except Exception as exc:
+                logger.warning("graph expansion failed (%s); ignoring", exc)
+
+        # Auto-inject "contradicts top result" hits — even when the
+        # contradictory memory didn't make the semantic top-k. The
+        # agent NEEDS to see contradictions when reasoning about the
+        # top-1; without this, a stale decision silently survives a
+        # query for the topic it contradicts.
+        #
+        # This runs every search (no flag) because the cost is
+        # negligible (one in-memory dict lookup per top-result that
+        # actually has contradictions, which is the minority) and the
+        # value is high. Off only when ``inject_contradictions=false``.
+        inject_contras = bool(args.get("inject_contradictions", True))
+        if inject_contras and results:
+            try:
+                from mem_vault import graph as _graph
+
+                corpus_for_contra = await self._list_corpus()
+                seen_ids = {r["id"] for r in results}
+                contradictions_added = 0
+                MAX_CONTRADICTIONS = 3  # cap per search; beyond that the response drowns
+                for r in results[:3]:  # only inspect the top-3
+                    if contradictions_added >= MAX_CONTRADICTIONS:
+                        break
+                    contra = _graph.contradictions_for(corpus_for_contra, r["id"])
+                    for cm in contra:
+                        if contradictions_added >= MAX_CONTRADICTIONS:
+                            break
+                        if cm.id in seen_ids:
+                            continue
+                        if not cm.is_visible_to(viewer_agent_id):
+                            continue
+                        results.append(
+                            {
+                                "id": cm.id,
+                                "score": 0.0,
+                                "score_raw": 0.0,
+                                "via_graph": True,
+                                "hop": 1,
+                                "edges": ["contradicts"],
+                                "contradicts": r["id"],
+                                "memory": cm.to_dict(),
+                                "snippet": None,
+                            }
+                        )
+                        seen_ids.add(cm.id)
+                        contradictions_added += 1
+            except Exception as exc:
+                logger.warning("contradiction injection failed (%s); ignoring", exc)
 
         # Record usage post-hoc on the IDs we actually surface. This is
         # best-effort: failures are swallowed inside ``record_usage``.
@@ -1164,6 +1328,36 @@ class MemVaultService:
         if self.config.usage_tracking_enabled and results:
             for r in results:
                 await self._to_thread(self.storage.record_usage, r["id"])
+
+        # Telemetry: persist one search-event row per surfaced result so
+        # the closed-loop ranker (``mem-vault ranker train``) has signal
+        # to fit on. The Stop hook flips ``was_cited=1`` on rows whose
+        # memory_id appears in the agent's final response (citation
+        # detection runs there already). Best-effort: a failed write
+        # never blocks search. Honor ``MEM_VAULT_TELEMETRY=0`` to opt
+        # out (e.g. CI / benchmarks where we don't want to pollute
+        # the dataset). Defaults ON — the DB lives under state_dir,
+        # not in the vault, so it doesn't sync to iCloud / git.
+        if results and os.environ.get("MEM_VAULT_TELEMETRY", "1").lower() not in {"0", "false", "no", "off"}:
+            session_id = args.get("session_id") or os.environ.get("MEM_VAULT_SESSION_ID")
+            events = [
+                _telemetry.build_event(
+                    query=query,
+                    rank=i,
+                    memory=r["memory"],
+                    score_dense=r.get("score_raw"),
+                    score_bm25=None,  # fused into score_raw upstream; kept None to avoid double-count
+                    score_rerank=None,
+                    score_final=r.get("score"),
+                    usage_boost=r.get("usage_boost"),
+                    user_id=user_id,
+                    agent_id=self.config.agent_id,
+                    project=filters.get("project"),
+                    session_id=session_id,
+                )
+                for i, r in enumerate(results)
+            ]
+            await self._to_thread(_telemetry.record_search, self.config.state_dir, events)
 
         response: dict[str, Any] = {
             "ok": True,
@@ -1562,6 +1756,76 @@ class MemVaultService:
             "contradicts": contradicts_out,
             "cotag_neighbors": cotag_out,
             "semantic_neighbors": semantic_out,
+        }
+
+    async def neighborhood(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Multi-seed BFS over the local knowledge graph (v0.6.0 game-changer #2).
+
+        Where ``related`` returns one-hop neighbors of a single memory
+        grouped by edge kind, ``neighborhood`` takes multiple seeds,
+        traverses N hops, and returns each visited node with the
+        shortest hop + the union of edges that pulled it in. The
+        agent uses this to discover context implied by relationships
+        rather than semantic similarity alone.
+
+        Backed by the pure :mod:`mem_vault.graph` module so the same
+        traversal also powers the FastAPI ``/graph`` UI.
+        """
+        from mem_vault import graph as _graph
+
+        ids = args.get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            return {
+                "ok": False,
+                "error": "ids must be a non-empty list",
+                "code": "validation_failed",
+            }
+        seed_ids = [str(i) for i in ids if i]
+        hops = max(0, min(3, int(args.get("hops", 1) or 0)))
+        min_shared = max(1, min(10, int(args.get("min_shared_tags", 2) or 2)))
+        max_nodes = max(1, min(500, int(args.get("max_nodes", 50) or 50)))
+        edge_kinds = args.get("edge_kinds")
+        if edge_kinds is not None and not isinstance(edge_kinds, list):
+            return {
+                "ok": False,
+                "error": "edge_kinds must be a list of strings",
+                "code": "validation_failed",
+            }
+
+        corpus = await self._list_corpus()
+        # Verify at least one seed actually exists in the corpus — else
+        # the BFS returns {} and the caller has no signal that the seeds
+        # were bad ids.
+        known_ids = {m.id for m in corpus}
+        unknown = [i for i in seed_ids if i not in known_ids]
+        if len(unknown) == len(seed_ids):
+            return {
+                "ok": False,
+                "error": f"none of the seed ids exist: {unknown}",
+                "code": "not_found",
+            }
+
+        visited = await self._to_thread(
+            _graph.expand_neighborhood,
+            corpus,
+            seed_ids,
+            hops=hops,
+            min_shared_tags=min_shared,
+            include_cotag=(edge_kinds is None or "cotag" in edge_kinds),
+            edge_kinds=edge_kinds,
+            max_nodes=max_nodes,
+        )
+
+        # Sort: seeds first (hop=0), then by hop ascending, then by id.
+        nodes = sorted(visited.values(), key=lambda n: (n.hop, n.id))
+        return {
+            "ok": True,
+            "seeds": seed_ids,
+            "hops": hops,
+            "edge_kinds": edge_kinds,
+            "count": len(nodes),
+            "unknown_seeds": unknown,
+            "nodes": [n.to_dict() for n in nodes],
         }
 
     async def history(self, args: dict[str, Any]) -> dict[str, Any]:
