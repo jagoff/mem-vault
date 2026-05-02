@@ -197,6 +197,41 @@ def test_install_force_overwrites_existing(tmp_path, capsys):
     assert "memory_save" in restored
 
 
+def test_install_force_unlinks_symlinked_alias(tmp_path):
+    """Regression: when ``mv/SKILL.md`` y ``mem_vault/SKILL.md`` son
+    symlinks a ``../memory/SKILL.md`` (legacy ahorro de disco), el
+    install no debe seguir el symlink y pisar el target — debe
+    unlinkear y crear archivos reales con el ``name:`` correcto.
+
+    Pre-fix: los 3 alias quedaban con el ``name:`` del último alias
+    instalado (memory), porque ``write_text`` seguía el symlink y
+    todos terminaban escribiendo al mismo archivo. La nueva lógica
+    detecta + unlinkea symlinks antes del write.
+    """
+    # Setup: armar los 3 directorios + un archivo real para 'memory'
+    # + symlinks para 'mv' y 'mem_vault'.
+    (tmp_path / "memory").mkdir()
+    real = tmp_path / "memory" / "SKILL.md"
+    real.write_text("---\nname: memory\n---\nlegacy", encoding="utf-8")
+
+    for alias in ("mv", "mem_vault"):
+        d = tmp_path / alias
+        d.mkdir()
+        (d / "SKILL.md").symlink_to("../memory/SKILL.md")
+
+    # Sanity: los 3 archivos accesibles, todos apuntan al mismo content.
+    for alias in ("mv", "mem_vault", "memory"):
+        assert (tmp_path / alias / "SKILL.md").read_text() == "---\nname: memory\n---\nlegacy"
+
+    install_skill.run(_make_args(target=tmp_path, force=True))
+
+    # Post-install: cada alias tiene su propio archivo real con su name correcto.
+    for alias in ("mv", "mem_vault", "memory"):
+        f = tmp_path / alias / "SKILL.md"
+        assert not f.is_symlink(), f"{alias} should be a real file, not symlink"
+        assert f.read_text(encoding="utf-8").splitlines()[1] == f"name: {alias}"
+
+
 def test_install_dry_run_does_not_write_anything(tmp_path, capsys):
     args = _make_args(target=tmp_path, dry_run=True)
     rc = install_skill.run(args)

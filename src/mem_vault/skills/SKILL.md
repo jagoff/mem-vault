@@ -1,7 +1,7 @@
 ---
 name: mv
-description: "Search/save/list/update/delete/feedback/history/related + verbos de descubrimiento (stats/recent/top/duplicates/timeline/lint/merge/doctor/eval) en mem-vault — el MCP local de memoria infinita backed by Obsidian (markdown plano + Qdrant + Ollama, 100% local). Triggers ALIAS-EQUIVALENTES: `/mem_vault`, `/memory` y `/mv` — los tres invocan EXACTAMENTE el mismo flow. Sin argumentos → boot briefing (1× por sesión: total + últimas 3 + top tags + lint flags) + listar últimas 10. Use cuando el user tipea `/mv <query>` (search semántico hibrido BM25+dense+RRF opt-in, decay opcional, usage-boost auto), `/mv list`, `/mv save <texto>` (auto-deriva title/type/tags/project + cross-link [[wikilinks]] + secret redaction; `-e` LLM extractor; `--contradict` flag opcional), `/mv get <id>`, `/mv update <id> <texto>`, `/mv delete <id>` (PIDE confirmación), `/mv feedback <id> up|down` (👍/👎 lifts ranking), `/mv history <id>` (snapshots pre-update), `/mv related <id>` (walk-the-graph: related/contradicts/cotag/semantic), `/mv stats` (counts), `/mv recent [n]`, `/mv top <tag>`, `/mv duplicates`, `/mv timeline <project>`, `/mv lint`, `/mv merge <id1> <id2>` (PIDE confirmación), `/mv doctor` (health check via CLI), `/mv eval --queries <file>` (hit@k baseline). Spec auto-save triggers (10 casos) + auto-context injection al task start + auto-citation en Stop hook (cita un id `[[X]]` o `` `X` `` en tu respuesta y mem-vault bumpea su last_used). Siempre routeá al MCP tool `mcp__mem-vault__memory_*` correspondiente, NUNCA escribas el .md a mano (el MCP maneja frontmatter + index Qdrant + history sidecar)."
-argument-hint: "<query> | list | save [-e] [--contradict] <text> | get <id> | update <id> <text> | delete <id> | feedback <id> [up|down] | history <id> | related <id> | stats | recent [n] | top <tag> | duplicates | timeline <project> | lint | merge <id1> <id2> | doctor | eval --queries <file>"
+description: "Search/save/list/update/delete + verbos de descubrimiento (stats/recent/top/duplicates/timeline/lint/merge) en mem-vault — el MCP local de memoria persistente backed by Obsidian (markdown plano + Qdrant + Ollama, 100% local). Triggers ALIAS-EQUIVALENTES: `/mem_vault`, `/memory` y `/mv` — los tres invocan EXACTAMENTE el mismo flow. Sin argumentos → boot briefing 1× por sesión (total + últimas 3 + top tags + lint flags). Use cuando el user tipea `/mv <query>` (search semántico — default), `/mv list` (últimas 20), `/mv save [-e] <texto>` (auto-deriva title/type/tags/project + cross-link [[wikilinks]] a memorias relacionadas, `-e` activa LLM extractor + dedup), `/mv get <id>`, `/mv update <id> <texto>`, `/mv delete <id>` (PIDE confirmación), `/mv stats` (counts por type, top tags, distribución de edades, lint summary), `/mv recent [n]` (últimas n por created), `/mv top <tag>` (memorias con tag, sorted por recency), `/mv duplicates` (pairs jaccard ≥0.7), `/mv timeline <project>` (línea temporal por mes), `/mv lint` (memorias con problemas: <3 tags, sin date, body skinny), `/mv merge <id1> <id2>` (combina 2, PIDE confirmación). Spec auto-save triggers (10 casos) + auto-context injection al task start. Siempre routeá al MCP tool `mcp__mem-vault__memory_*` correspondiente, NUNCA escribas el .md a mano (el MCP maneja frontmatter + index Qdrant + history sidecar)."
+argument-hint: "<query> | list | save [-e] <text> | get <id> | update <id> <text> | delete <id> | stats | recent [n] | top <tag> | duplicates | timeline <project> | lint | merge <id1> <id2>"
 ---
 
 # /mem_vault · /memory · /mv — router para mem-vault MCP
@@ -14,67 +14,20 @@ Los tres triggers (`/mem_vault`, `/memory`, `/mv`) son **alias-equivalentes**: i
 
 | Primera palabra | Acción | Sección |
 |---|---|---|
-| (vacío) | boot briefing + listar últimas 10 (briefing 1× por sesión) | "Boot briefing" + Output List |
+| (vacío) | listar últimas 10 + boot briefing si es la primera invocación de la sesión | "Boot briefing" + Output List |
 | `list` | listar últimas 20 | Output List |
-| `save` (con `-e` y/o `--contradict` opcional) + texto | auto-derivación + cross-link + redaction + opcional contradict-detect | "Save flow" |
+| `save` o `save -e` + texto | guardar con auto-derivación + cross-linking | "Save flow" |
 | `get` + id | mostrar memoria completa | Output Get |
-| `update` + id + texto | replace content (snapshot al sidecar history antes de pisar) | Output Update |
-| `delete` + id | borrar `.md` + sidecar history + index (CON confirmación) | "Delete flow" |
-| `feedback <id> [up\|down]` | 👍/👎 explícito (sin polarity = "used"); lifts el score en searches futuras | "Feedback loop" |
-| `history <id> [limit]` | snapshots pre-update (newest-first) | "Verbo: history" |
-| `related <id>` | walk-the-graph: 4 buckets (related/contradicts/cotag/semantic) | "Verbo: related" |
-| `stats` | counts por type, top tags, edades, lint summary | "Verbos de descubrimiento" |
+| `update` + id + texto | replace content (o tags/title con flags) | Output Update |
+| `delete` + id | borrar (CON confirmación) | "Delete flow" |
+| `stats` | counts por type, top tags, distribución de edades, lint summary | "Verbos de descubrimiento" |
 | `recent [n]` | últimas `n` por created (default 10) | "Verbos de descubrimiento" |
-| `top <tag>` | memorias con `<tag>`, sorted by recency | "Verbos de descubrimiento" |
+| `top <tag>` | memorias con `<tag>`, sorted por recency | "Verbos de descubrimiento" |
 | `duplicates` | pairs con similarity ≥0.70 candidatos a merge | "Verbos de descubrimiento" |
 | `timeline <project>` | línea temporal de memorias con tag `<project>` | "Verbos de descubrimiento" |
-| `lint` | memorias con problemas (<3 tags, sin date, body skinny, etc.) | "Verbos de descubrimiento" |
-| `merge <id1> <id2>` | combina 2 memorias en 1 (CON confirmación) | "Verbos de descubrimiento" |
-| `doctor` | shell out: `mem-vault doctor` (health check de Ollama/qdrant/vault/models) | "Verbo: doctor" |
-| `eval --queries <file> [--threshold N]` | shell out: `mem-vault eval` (hit@k + MRR sobre query set labeled) | "Verbo: eval" |
+| `lint` | memorias con problemas (sin tags, sin date, body vacío, etc.) | "Verbos de descubrimiento" |
+| `merge <id1> <id2>` | combina 2 memorias en 1 (PIDE confirmación) | "Verbos de descubrimiento" |
 | cualquier otra cosa | search semántico | `mcp__mem-vault__memory_search({query: $ARGUMENTS, k: 5, threshold: 0.05})` |
-
-## Feedback loop — self-supervised search ranking
-
-El vault aprende qué te sirve a partir de cómo lo usás. Tres señales independientes, todas escritas a frontmatter del `.md`:
-
-| Campo | Cuándo se incrementa | Quién lo escribe |
-|---|---|---|
-| `usage_count` | cada vez que la memoria sale como hit en `memory_search` | el MCP, post-hoc en search |
-| `helpful_count` | tool `memory_feedback({helpful: true})` | el agent (vos) o el user |
-| `unhelpful_count` | tool `memory_feedback({helpful: false})` | el agent o el user |
-| `last_used` | cualquiera de las anteriores **+** auto-citation en Stop hook | el MCP / Stop hook |
-
-**Auto-citation en Stop hook** (la mecánica que te conviene saber): cuando termina tu turno, el hook escanea tu última respuesta. Si menciona un id de memoria como `[[<id>]]` (wikilink), `` `<id>` `` (inline code), o bare-word ≥8 chars que matchea un memory_id real, ese id recibe un `record_feedback(helpful=None)` automático — bump neutro, sin polarity. **Implicación**: cuando uses una memoria en tu respuesta, citá el id en una de las tres formas. El sistema lo registra solo. Sin esfuerzo manual de tu parte.
-
-### Trigger explícito: `/mv feedback <id> [up|down]`
-
-Cuando el user dice "che esta memoria me sirvió" / "no me sirvió" / "ignorá esa" — o vos identificás que una memoria fue clave para resolver la task — usá el tool:
-
-```python
-# 👍 — thumbs up
-mcp__mem-vault__memory_feedback({id: "<id>", helpful: true})
-
-# 👎 — thumbs down (no entierra, sólo neutraliza el boost)
-mcp__mem-vault__memory_feedback({id: "<id>", helpful: false})
-
-# Sin polarity — "used", bump last_used pero no toca helpful/unhelpful
-mcp__mem-vault__memory_feedback({id: "<id>"})
-```
-
-Output al user (1 línea):
-
-```
-👍 Feedback registrado en `<id>` (helpful=N, unhelpful=M, ratio=+0.XX)
-```
-
-### Boost en search
-
-`memory_search` multiplica el score de cada hit por `1 + usage_boost × max(0, helpful_ratio)` donde `helpful_ratio = (helpful − unhelpful) / max(1, helpful + unhelpful)`. **Clamp a 0**: thumbs-down no entierra (floor `1.0×`), sólo neutraliza el boost.
-
-Defaults: `usage_boost=0.3` (memoria con `helpful_ratio=1` levanta su score 30%), `usage_boost_enabled=true`. Disable global via `MEM_VAULT_USAGE_BOOST_ENABLED=0`. Boost compone con cross-encoder rerank: cuando rerank está on, el boost multiplica el `rerank_score`, no el bi-encoder.
-
-El response de `memory_search` ahora incluye `score_raw` (pre-boost) y `usage_boost` (factor) por hit — útiles si querés ver por qué una memoria salió primero.
 
 ## Boot briefing — auto-summary al cargar el skill
 
@@ -283,69 +236,16 @@ Filtrá los results para que NO incluyan ningún memoria con `id == <slug que va
 
 **Si NO hay related memorias ≥0.50**: no agregues la sección — el body queda como vino.
 
-### `--contradict` (opt-in: detect contradictions vs existing memorias)
-
-Si el user pasa `--contradict` (o `--contradict=true`), agregá `auto_contradict: true` al call. El MCP corre un pass del LLM local sobre las top-5 memorias semánticamente similares y stampea las IDs que contradigan en el campo `contradicts:` del frontmatter. Costo: ~3-5s extra (qwen2.5:3b).
-
-**Cuándo dispararlo automático sin que el user lo pida**:
-
-- El content arranca con `## Decisión revisada` / `## Cambio de criterio` / `## Cambio de mind` / `Updated:` — señales de que estás potencialmente reemplazando una decisión vieja.
-- El type=`preference` o `decision` Y existe una memoria muy similar (`memory_search` k=3 threshold 0.65 returns ≥1 match) — high prior de que la nueva pisa la anterior.
-- El user dice explícitamente "actualizá X" / "ya no es así" / "ahora prefiero Y en lugar de Z".
-
-Sino, no lo dispares — el costo no compensa.
-
-### `--project <name>` (override del project scope)
-
-Por default, `project` se infiere del primer tag `project:X` o de `Config.project_default`. Si querés stampear scope explícito (ej. la memoria es del proyecto `obsidian-rag` aunque hayas escapado al cwd `mem-vault`), pasá `--project=obsidian-rag` y va al index metadata directo (más rápido para Qdrant filtering que el tag scan).
-
-### Secret redaction — automático, default ON
-
-Antes de que el body toque disco o el index, el MCP escanea por patterns de credentials (AWS/GitHub/OpenAI/Anthropic/Slack/Google/JWT/Bearer/PEM/`password=`/`token=`...) y los reemplaza con `[REDACTED:<kind>]`. La response incluye un campo `redactions: [{kind, count}]`. **Mostrá una warning al user** cuando hay matches:
-
-```
-⚠️ Redacted N credenciales del body antes de guardar:
-   - openai_key: 1
-   - bearer_token: 2
-```
-
-NO hace falta que vos hagas nada — es automático. Pero el warning es importante porque significa que el user pasó algo sensible y debería revisarlo.
-
-Disable opt-out via `MEM_VAULT_REDACT_SECRETS=0` (no recomendado — el vault sync a iCloud/Dropbox/git en todo setup real).
-
 ### Llamada final al MCP
 
 ```python
 mcp__mem-vault__memory_save({
-  content:         <body literal con sección "Memorias relacionadas" insertada si aplica>,
-  title:           <derivado o override>,
-  type:            <derivado o override>,
-  tags:            <derivados o override, ≥3>,
-  project:         <opcional — explicit override; sino se infiere de tags/config>,
-  auto_extract:    <true si -e, sino false>,
-  auto_contradict: <true si --contradict, sino false>,
+  content:      <body literal con sección "Memorias relacionadas" insertada si aplica>,
+  title:        <derivado o override>,
+  type:         <derivado o override>,
+  tags:         <derivados o override, ≥3>,
+  auto_extract: <true si -e, sino false>,
 })
-```
-
-**Response shape** (relevant fields):
-
-```json
-{
-  "ok": true,
-  "memory":      {...},
-  "indexed":     true,
-  "related":     ["<id-1>", "<id-2>"],
-  "contradicts": ["<id-3>"],
-  "redactions":  [{"kind": "openai_key", "count": 1}]
-}
-```
-
-Si `redactions` no es vacío → mostrá la warning. Si `contradicts` no es vacío → mostralos al user con descripción para que pueda revisar:
-
-```
-⚠️ Esta memoria contradice 1 existente:
-   - [[<id-3>]] — <description>
-   Si el cambio es intencional ignorá; si no, considerá `mv merge` o update.
 ```
 
 ## Verbos de descubrimiento
@@ -532,103 +432,6 @@ Combina 2 memorias en 1. Útil después de `/mv duplicates`.
 
 **Edge case**: si el body merged supera 5,000 chars, no merges en silencio — mostrá un warning y pedí confirmación adicional ("body resultante <N> chars — ¿confirmás?").
 
-## Verbo: history — snapshots pre-update
-
-`/mv history <id> [limit]` devuelve los snapshots tomados ANTES de cada `update` sobre la memoria. El MCP guarda un sidecar `<id>.history.jsonl` al lado del `.md` y appende una entry cada vez que el body / title / description / tags / related / contradicts cambian. Update no-op (mismo valor) NO genera entry.
-
-```python
-mcp__mem-vault__memory_history({id: "<id>", limit: 10})
-```
-
-**Output** (newest-first):
-
-```
-🕒 Historial de `<id>` — <N> snapshots
-
-#1 · <ts-relativo>  (reason: update)
-   tags: [a, b, c]
-   description: <prev_desc>
-   body (preview ~120 chars): "<prev body...>"
-
-#2 · <ts-relativo>  (reason: update)
-   ...
-```
-
-Si `count: 0`: `Sin historial — la memoria no fue modificada después del save inicial.`.
-
-**Casos de uso**:
-
-- "qué decía esta memoria hace 3 días" → `/mv history <id>` y leés.
-- "necesito recuperar el body anterior" → tomás el snapshot, lo pasás como content al `update`.
-- Auditoría de auto-link / auto-contradict: si `related` o `contradicts` cambió, ahí ves cuándo + por qué.
-
-## Verbo: related — walk the graph
-
-`/mv related <id>` devuelve los vecinos de la memoria en 4 buckets, en una sola llamada:
-
-```python
-mcp__mem-vault__memory_related({
-  id: "<id>",
-  min_shared_tags: 2,    # default — co-tag threshold
-  k: 5,                   # default — semantic neighbors cap
-  include_semantic: true, # default — set false para skip el LLM step
-})
-```
-
-**Output**:
-
-```
-🕸️ Vecinos de `<id>`:
-
-related (frontmatter):
-  - `<id-1>` — <description>
-  - `<id-2>` — <description>
-
-contradicts (frontmatter):
-  - `<id-3>` — <description>
-
-co-tag (≥2 tags compartidos):
-  - `<id-4>` — shared=[<tag-a>, <tag-b>]
-  - `<id-5>` — shared=[<tag-a>, <tag-c>, <tag-d>]
-
-semantic (top-5 search):
-  - `<id-6>` — score 0.78
-  - `<id-7>` — score 0.65
-  - `<id-8>` — score 0.51
-```
-
-Cualquier bucket vacío se muestra como `(ninguno)` o se omite — pero al menos uno suele existir si la memoria está bien linkeada. Si los 4 están vacíos: `🟢 Memoria sin vecinos detectables. Quizás es un hub aislado o el corpus es pobre del topic.`.
-
-**Cuándo usarlo**:
-
-- Pre-merge: chequeás vecindario para entender qué se ve afectado si combinás dos.
-- Pre-delete: ves si hay otras que dependen ([[link]]) antes de borrar.
-- Exploration: el user pregunta "qué más sabés de X" → `/mv related <id de la principal X>` te da contexto lateral.
-
-## Verbo: doctor — health check
-
-`/mv doctor` shell-out al CLI `mem-vault doctor`. NO es un MCP tool — corré el binario:
-
-```bash
-mem-vault doctor [--skip-ollama] [--skip-index]
-```
-
-Capturá el output y mostralo al user limpio. El doctor corre 10+ checks: vault path, state dir, Ollama up, modelos pulleados, Qdrant collection, drift sync, fastembed, FASTEMBED_CACHE_PATH gotcha (macOS), feedback loop flags, hybrid retrieval flag, project scope. Exit 0 = todo green, 1 = warnings, 2 = errors críticos.
-
-**Cuándo usarlo**: el user reporta "no me anda mem-vault" / "search devuelve vacío" / "qué tengo activado" → primer paso es siempre `/mv doctor`.
-
-## Verbo: eval — retrieval regression baseline
-
-`/mv eval --queries <file>` shell-out al CLI `mem-vault eval`. Toma un JSON file con queries labeled (`{query, expected, tag?}`) y reporta hit@1/3/5/10 + MRR sobre el corpus actual del user.
-
-```bash
-mem-vault eval --queries my_queries.json [--threshold 0.6] [--json]
-```
-
-Exit 0 si `hit@5 >= --threshold` (default 0), 1 si below. Útil para regression test cuando el user activa/desactiva flags (rerank, hybrid, decay) y quiere ver qué cambia.
-
-**Cuándo usarlo**: el user dice "quiero ver si activar hybrid mejora el ranking" → corré dos `eval` runs (con y sin la flag) y compará. El output `--json` es para CI / diff automatizado.
-
 ## Delete flow (irreversible — pidan confirmación)
 
 1. Primero llamá `mcp__mem-vault__memory_get({id})` y mostrale al user el contenido.
@@ -640,20 +443,7 @@ Exit 0 si `hit@5 >= --threshold` (default 0), 1 si below. Útil para regression 
 
 ### Search
 
-Pipeline interno (no expongas al user — sólo entendé qué pasa para razonar):
-
-1. **Dense bi-encoder** (Ollama bge-m3) → top raw_k.
-2. (opt) **BM25 sparse** + **RRF fusion** si `hybrid_enabled` → mejora keyword/ID/path queries.
-3. (opt) **Cross-encoder rerank** si `reranker_enabled` (`[hybrid]` extra) → reordena con un modelo que ve query+candidate juntos.
-4. (opt) **Time-decay** si `decay_half_life_days > 0` → memorias viejas pierden peso.
-5. **Usage boost** (default ON) → `score × (1 + 0.3 × max(0, helpful_ratio))`.
-6. **Project filter** si `project_default` set → filtra a memorias con ese scope.
-7. **Visibility filter** post-search (per-agent allowlist).
-8. Top-k cut.
-
-Tuneable via env vars (`MEM_VAULT_HYBRID`, `MEM_VAULT_RERANK`, `MEM_VAULT_DECAY_HALF_LIFE_DAYS`, `MEM_VAULT_USAGE_BOOST`, `MEM_VAULT_PROJECT`). Cuando el user pregunta "por qué salió esto primero", el response trae `score_raw` (pre-boost) y `usage_boost` (factor) por hit — usalos para explicar.
-
-**Output** — top-5 (cantidad real si hay menos), uno por bloque:
+Mostrá top-5 (cantidad real si hay menos), uno por bloque:
 
 ```
 **<title>** · `<id>` · score `0.XX` · type=<type>
@@ -662,11 +452,7 @@ Tuneable via env vars (`MEM_VAULT_HYBRID`, `MEM_VAULT_RERANK`, `MEM_VAULT_DECAY_
 
 Score: `≥0.70` = alto, `0.40-0.70` = medio, `<0.40` = bajo. Si todos los hits están bajo 0.40, agregá al final: `(matches débiles — quizás no tenés memoria sobre esto)`.
 
-Si una memoria tiene boost activo (su `score_raw` < `score`), opcional: agregá `(boosted ×<factor>)` al lado del score. Útil cuando el user se sorprende del orden.
-
 Si `count: 0`, decí: `No encontré nada para «<query>». ¿Querés guardarla con `/memory save <texto>`?`.
-
-**Auto-citation hint**: si vas a referenciar un hit en tu respuesta posterior, citalo como `[[<id>]]` o `` `<id>` `` — el Stop hook lo detecta y bumpea el `last_used` automático. Sin esfuerzo manual.
 
 ### List
 

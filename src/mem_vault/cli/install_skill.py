@@ -228,6 +228,21 @@ def _install(
             continue
 
         dest_dir.mkdir(parents=True, exist_ok=True)
+        # If a previous install (or a manual workaround) symlinked the
+        # alias copy at ``mv/SKILL.md`` → ``../memory/SKILL.md`` to save
+        # disk, ``write_text`` follows the symlink and ends up writing
+        # all three aliases into the *same* underlying file — only the
+        # last alias's ``name:`` survives, the other two end up showing
+        # the wrong label. Detect + unlink so the next ``write_text``
+        # creates a real file with the right contents.
+        if dest_file.is_symlink():
+            try:
+                dest_file.unlink()
+            except OSError as exc:
+                print(
+                    f"  warn:          /{alias} symlink unlink failed: {exc}",
+                    file=sys.stderr,
+                )
         dest_file.write_text(_rewrite_name(template, alias), encoding="utf-8")
         print(f"  installed:     /{alias} → {dest_file}")
         installed += 1
