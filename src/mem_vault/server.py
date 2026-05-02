@@ -44,6 +44,7 @@ from mem_vault.discovery import (
 )
 from mem_vault.index import CircuitBreakerOpenError, VectorIndex, compute_content_hash
 from mem_vault.storage import VaultStorage
+from mem_vault import ranker as _ranker
 from mem_vault import telemetry as _telemetry
 
 logger = logging.getLogger("mem_vault.server")
@@ -1147,6 +1148,52 @@ class MemVaultService:
                     else None,
                 }
             )
+
+        # Closed-loop adaptive ranker (v0.6.0). Opt-in via
+        # ``MEM_VAULT_LEARNED_RANKER=1``. Loads the latest pickle from
+        # ``state_dir/ranker/active.pkl`` (trained nightly by
+        # ``mem-vault ranker-train`` on the search-event telemetry).
+        # The model returns a calibrated probability that the agent
+        # would cite this hit; we multiply it into the existing score
+        # so the heuristic boost still composes (positive feedback +
+        # learned weighting both lift the score). Disabled / absent /
+        # broken model = no-op, fall through to the heuristic sort.
+        if _ranker.is_enabled() and candidates:
+            try:
+                model = await self._to_thread(_ranker.load_active, self.config.state_dir)
+                if model is not None:
+                    for c in candidates:
+                        # Featurize from the same dict shape ``telemetry.build_event``
+                        # produces, so train and inference agree on column order.
+                        feat_row = {
+                            "score_dense": c.get("score_raw"),
+                            "score_final": c.get("score"),
+                            "rank": 0,  # rank-at-inference is unknown (we're computing it)
+                            "helpful_ratio": (c["memory"] or {}).get("helpful_ratio"),
+                            "usage_count": (c["memory"] or {}).get("usage_count"),
+                            "recency_days": None,  # left for the model's mean fallback
+                            "project_match": 1 if filters.get("project") and (
+                                (c["memory"] or {}).get("project") == filters["project"]
+                                or any(
+                                    t.lower() == f"project:{filters['project']}".lower()
+                                    for t in ((c["memory"] or {}).get("tags") or [])
+                                )
+                            ) else 0,
+                            "agent_id_match": 1 if (
+                                self.config.agent_id
+                                and (c["memory"] or {}).get("agent_id") == self.config.agent_id
+                            ) else 0,
+                        }
+                        learned = model.score(feat_row)
+                        # Compose: keep the heuristic score's *magnitude*
+                        # (we don't want to throw away semantic similarity)
+                        # and multiply by (0.5 + learned) so the model
+                        # nudges the order without inverting it. ``learned``
+                        # is in [0, 1]; the factor lands in [0.5, 1.5].
+                        c["score_learned"] = round(learned, 4)
+                        c["score"] = (c["score"] or 0.0) * (0.5 + learned)
+            except Exception as exc:
+                logger.warning("learned ranker failed (%s); falling back to heuristic", exc)
 
         # Re-sort by boosted score so feedback actually changes the ordering
         # before we take the top-k. When boost is disabled AND the reranker
