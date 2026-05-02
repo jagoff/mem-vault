@@ -31,7 +31,20 @@
   <main class="graph-main">
     <aside class="graph-controls">
       <div class="control-group">
-        <label for="min-shared-tags">edge threshold</label>
+        <label>edges</label>
+        <div class="edge-filter" id="edge-filter">
+          <button data-filter="explicit" class="active">explicit</button>
+          <button data-filter="all">all</button>
+          <button data-filter="related">related</button>
+          <button data-filter="contradicts">contradicts</button>
+          <button data-filter="cotag">cotag</button>
+        </div>
+        <div class="control-meta">
+          <em>explicit</em> = related ∪ contradicts (real knowledge graph)
+        </div>
+      </div>
+      <div class="control-group">
+        <label for="min-shared-tags">cotag threshold</label>
         <input type="range"
                id="min-shared-tags"
                min="1"
@@ -58,7 +71,7 @@
       <button id="fit" class="ghost">fit</button>
 
       <div class="legend">
-        <h4>type</h4>
+        <h4>node type</h4>
         <span class="leg type-feedback">feedback</span>
         <span class="leg type-preference">preference</span>
         <span class="leg type-decision">decision</span>
@@ -68,12 +81,20 @@
         <span class="leg type-todo">todo</span>
       </div>
 
+      <div class="legend">
+        <h4>edge kind</h4>
+        <span class="leg edge-related">related</span>
+        <span class="leg edge-contradicts">contradicts</span>
+        <span class="leg edge-cotag">co-tag</span>
+      </div>
+
       <div class="graph-stats" id="graph-stats">
         <span class="stat-pill">loading…</span>
       </div>
     </aside>
 
     <div id="cy" class="graph-canvas"></div>
+    <div id="hover-tooltip" class="hover-tooltip" hidden></div>
 
     <aside class="graph-detail" id="graph-detail">
       <div class="empty">click a node to inspect a memory</div>
@@ -92,9 +113,23 @@
       reference:  '#22d3ee',
     };
     const FALLBACK_COLOR = '#94a3b8';
+    // v0.6.0: edges carry a ``primary`` kind. Color codes the meaning:
+    // red for contradictions (tension), green for related (auto-link),
+    // gray for cotag (loose association).
+    const EDGE_COLORS = {
+      contradicts: '#f87171',
+      related:     '#4ade80',
+      cotag:       '#3a3a4a',
+    };
+    const EDGE_DASH = {
+      contradicts: [2, 6],   // dashed — visually flags tension
+      related:     [],       // solid
+      cotag:       [],
+    };
 
     const PREFIX = document.body.dataset.prefix || '';
     let cy = null;
+    let edgesFilter = 'explicit';
 
     function renderGraph(payload) {
       const { nodes, edges } = payload;
@@ -120,8 +155,8 @@
               'text-margin-y': 6,
               'text-wrap': 'wrap',
               'text-max-width': 120,
-              'width': 16,
-              'height': 16,
+              'width': (e) => 14 + Math.min(8, (e.data('usage_count') || 0)),
+              'height': (e) => 14 + Math.min(8, (e.data('usage_count') || 0)),
               'border-width': 0,
               'transition-property': 'background-color, border-width, border-color, width, height',
               'transition-duration': '160ms',
@@ -138,14 +173,33 @@
             },
           },
           {
+            selector: 'node.highlighted',
+            style: {
+              'border-width': 3,
+              'border-color': '#fbbf24',
+            },
+          },
+          {
             selector: 'edge',
             style: {
-              'line-color': '#3a3a4a',
-              'opacity': (e) => Math.min(0.25 + 0.15 * e.data('weight'), 0.85),
-              'width': (e) => Math.min(0.5 + 0.4 * e.data('weight'), 3),
+              'line-color': (e) => EDGE_COLORS[e.data('primary')] || '#3a3a4a',
+              'opacity': (e) => {
+                const w = e.data('weight') || 1;
+                // contradicts always at full opacity — they're the most
+                // important signal in the graph.
+                return e.data('primary') === 'contradicts'
+                  ? 0.85
+                  : Math.min(0.35 + 0.15 * w, 0.85);
+              },
+              'width': (e) => {
+                const w = e.data('weight') || 1;
+                return e.data('primary') === 'contradicts' ? 2 : Math.min(1 + 0.5 * w, 3);
+              },
+              'line-style': (e) =>
+                e.data('primary') === 'contradicts' ? 'dashed' : 'solid',
               'curve-style': 'bezier',
               'target-arrow-shape': 'none',
-              'transition-property': 'line-color, opacity',
+              'transition-property': 'line-color, opacity, width',
               'transition-duration': '160ms',
             },
           },
@@ -153,6 +207,13 @@
             selector: 'edge:selected',
             style: {
               'line-color': '#7dd3fc',
+              'opacity': 1,
+            },
+          },
+          {
+            selector: 'edge.highlighted',
+            style: {
+              'line-color': '#fbbf24',
               'opacity': 1,
             },
           },
@@ -169,23 +230,81 @@
         },
       });
 
-      cy.on('tap', 'node', (evt) => showNodeDetail(evt.target.data()));
+      cy.on('tap', 'node', (evt) => showNodeDetail(evt.target));
       cy.on('tap', (evt) => {
-        if (evt.target === cy) clearDetail();
+        if (evt.target === cy) {
+          clearDetail();
+          clearHighlights();
+        }
       });
+      cy.on('mouseover', 'node', (evt) => showHover(evt));
+      cy.on('mouseout', 'node', () => hideHover());
+      cy.on('mousemove', 'node', (evt) => moveHover(evt));
 
       const stats = document.getElementById('graph-stats');
+      const breakdown = countEdgeKinds(edges);
       stats.innerHTML = `
         <span class="stat-pill">${nodes.length} nodes</span>
         <span class="stat-pill">${edges.length} edges</span>
+        ${breakdown.contradicts ? `<span class="stat-pill stat-warn">${breakdown.contradicts} ⚠</span>` : ''}
       `;
     }
 
-    function showNodeDetail(d) {
+    function countEdgeKinds(edges) {
+      const out = { related: 0, contradicts: 0, cotag: 0 };
+      for (const e of edges) {
+        out[e.data.primary] = (out[e.data.primary] || 0) + 1;
+      }
+      return out;
+    }
+
+    function clearHighlights() {
+      if (!cy) return;
+      cy.elements().removeClass('highlighted');
+    }
+
+    function showHover(evt) {
+      const d = evt.target.data();
+      const tip = document.getElementById('hover-tooltip');
+      tip.innerHTML = `
+        <strong>${escapeHTML(d.label || d.id)}</strong>
+        ${d.description ? `<div class="hover-desc">${escapeHTML(d.description.slice(0, 140))}${d.description.length > 140 ? '…' : ''}</div>` : ''}
+        <div class="hover-meta">
+          <span class="type type-${d.type}">${d.type}</span>
+          ${d.usage_count ? `<span>👁 ${d.usage_count}</span>` : ''}
+          ${d.helpful_ratio ? `<span>👍 ${d.helpful_ratio}</span>` : ''}
+        </div>
+      `;
+      tip.hidden = false;
+      moveHover(evt);
+    }
+
+    function moveHover(evt) {
+      const tip = document.getElementById('hover-tooltip');
+      const x = evt.originalEvent ? evt.originalEvent.clientX : 0;
+      const y = evt.originalEvent ? evt.originalEvent.clientY : 0;
+      tip.style.left = `${x + 14}px`;
+      tip.style.top = `${y + 14}px`;
+    }
+
+    function hideHover() {
+      document.getElementById('hover-tooltip').hidden = true;
+    }
+
+    function showNodeDetail(node) {
+      const d = node.data();
       const el = document.getElementById('graph-detail');
       const tagPills = (d.tags || [])
         .map((t) => `<span class="tag">#${t}</span>`)
         .join(' ');
+      // v0.6.0: show neighbors directly in the side panel + button to
+      // expand the visible BFS subgraph (highlight 1-hop neighbors).
+      const neighbors = node.neighborhood('node').map((n) => n.data());
+      const contras = node.connectedEdges('[primary = "contradicts"]')
+        .map((e) => {
+          const other = e.source().id() === d.id ? e.target() : e.source();
+          return other.data();
+        });
       el.innerHTML = `
         <div class="detail-card">
           <header>
@@ -194,14 +313,46 @@
           </header>
           ${d.description ? `<p>${escapeHTML(d.description)}</p>` : ''}
           <div class="detail-tags">${tagPills}</div>
+          ${contras.length ? `
+            <div class="contradictions">
+              <h4>⚠ contradicts</h4>
+              <ul>
+                ${contras.map((c) => `<li><a href="#" data-id="${c.id}" class="goto-node">${escapeHTML(c.label || c.id)}</a></li>`).join('')}
+              </ul>
+            </div>` : ''}
           <footer>
             <code>${d.id}</code>
             ${d.agent_id ? `<span>@${d.agent_id}</span>` : ''}
             ${d.updated ? `<span>${d.updated.slice(0, 10)}</span>` : ''}
+            ${d.usage_count ? `<span>👁 ${d.usage_count}</span>` : ''}
+            ${d.helpful_ratio ? `<span>👍 ${d.helpful_ratio}</span>` : ''}
           </footer>
-          <a href="${PREFIX}/" class="open-list">open in list view →</a>
+          <div class="detail-actions">
+            <button class="ghost" id="action-expand">expand neighborhood (1 hop · ${neighbors.length})</button>
+            <a href="${PREFIX}/" class="open-list">open in list view →</a>
+          </div>
         </div>
       `;
+      // Expand-neighborhood: highlight 1-hop neighbors + their edges.
+      document.getElementById('action-expand').addEventListener('click', () => {
+        clearHighlights();
+        node.neighborhood().addClass('highlighted');
+        node.addClass('highlighted');
+      });
+      // Click a contradiction → focus that node in the graph.
+      el.querySelectorAll('.goto-node').forEach((a) => {
+        a.addEventListener('click', (evt) => {
+          evt.preventDefault();
+          const id = a.dataset.id;
+          const target = cy.getElementById(id);
+          if (target.length) {
+            cy.elements().unselect();
+            target.select();
+            cy.animate({ center: { eles: target }, zoom: 1.2 }, { duration: 250 });
+            showNodeDetail(target);
+          }
+        });
+      });
     }
 
     function clearDetail() {
@@ -220,7 +371,8 @@
       const maxNodes = document.getElementById('max-nodes').value;
       document.getElementById('graph-stats').innerHTML =
         '<span class="stat-pill">loading…</span>';
-      const res = await fetch(`${PREFIX}/api/graph?min_shared_tags=${minTags}&max_nodes=${maxNodes}`);
+      const url = `${PREFIX}/api/graph?min_shared_tags=${minTags}&max_nodes=${maxNodes}&edges_filter=${edgesFilter}`;
+      const res = await fetch(url);
       const payload = await res.json();
       renderGraph(payload);
     }
@@ -235,6 +387,15 @@
     });
     document.getElementById('min-shared-tags').addEventListener('change', reload);
     document.getElementById('max-nodes').addEventListener('change', reload);
+
+    document.getElementById('edge-filter').addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-filter]');
+      if (!btn) return;
+      document.querySelectorAll('#edge-filter button').forEach((b) =>
+        b.classList.toggle('active', b === btn));
+      edgesFilter = btn.dataset.filter;
+      reload();
+    });
 
     reload();
   </script>
