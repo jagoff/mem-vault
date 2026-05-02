@@ -31,23 +31,24 @@ import argparse
 import asyncio
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 
 def _format_ts(ts: float | None) -> str:
     if ts is None:
         return "—"
-    return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone().isoformat(timespec="seconds")
+    return datetime.fromtimestamp(ts, tz=UTC).astimezone().isoformat(timespec="seconds")
 
 
 def _format_bytes(n: int) -> str:
     if n < 1024:
         return f"{n} B"
+    size = float(n)
     for unit in ("KB", "MB", "GB"):
-        n /= 1024.0
-        if n < 1024:
-            return f"{n:.1f} {unit}"
-    return f"{n:.1f} TB"
+        size /= 1024.0
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+    return f"{size:.1f} TB"
 
 
 def add_subparsers(sub: argparse._SubParsersAction) -> None:

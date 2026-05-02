@@ -11,7 +11,8 @@ Public surface is intentionally tiny — most consumers just spawn the MCP serve
 via `mem-vault-mcp` and talk to it through stdio.
 """
 
-from importlib.metadata import PackageNotFoundError, version as _pkg_version
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 
 from mem_vault.config import Config, load_config
 from mem_vault.storage import Memory, VaultStorage

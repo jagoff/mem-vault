@@ -37,8 +37,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -83,7 +82,7 @@ def _parse_dt(iso: str | None) -> datetime | None:
             iso = iso[:-1] + "+00:00"
         dt = datetime.fromisoformat(iso)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(tzinfo=UTC)
         return dt
     except Exception:
         return None
@@ -196,7 +195,7 @@ def _knowledge_gaps(corpus: list[Any], lookback: timedelta) -> list[str]:
     Returns a short list of human-readable strings.
     """
     project_last_write: dict[str, datetime] = {}
-    cutoff = datetime.now(timezone.utc) - lookback
+    cutoff = datetime.now(UTC) - lookback
     for m in corpus:
         for t in m.tags or []:
             if not t.startswith("project:"):
@@ -211,7 +210,7 @@ def _knowledge_gaps(corpus: list[Any], lookback: timedelta) -> list[str]:
     gaps: list[str] = []
     for proj, last in sorted(project_last_write.items(), key=lambda x: x[1]):
         if last < cutoff:
-            days = (datetime.now(timezone.utc) - last).days
+            days = (datetime.now(UTC) - last).days
             gaps.append(f"`project:{proj}` — sin writes hace {days} días")
     return gaps[:5]  # cap to 5; anything longer is noise
 
@@ -247,7 +246,7 @@ def run_reflection(
     storage = VaultStorage(config.memory_dir)
 
     now = now or datetime.now().astimezone()
-    cutoff = now.astimezone(timezone.utc) - timedelta(hours=lookback_hours)
+    cutoff = now.astimezone(UTC) - timedelta(hours=lookback_hours)
     day_slug = _today_slug(now)
 
     corpus = storage.list(type=None, tags=None, user_id=None, limit=10**9)
@@ -284,7 +283,7 @@ def run_reflection(
 
         # Zombies: never used + old enough.
         if (m.usage_count or 0) == 0 and updated:
-            age_days = (now.astimezone(timezone.utc) - updated).days
+            age_days = (now.astimezone(UTC) - updated).days
             if age_days >= zombie_age_days:
                 zombies.append(
                     {
@@ -324,9 +323,10 @@ def run_reflection(
 
     if apply_consolidate:
         try:
-            from mem_vault.consolidate import apply_resolution, find_candidate_pairs, _ask_llm
-            from mem_vault.index import VectorIndex
             import ollama
+
+            from mem_vault.consolidate import _ask_llm, apply_resolution, find_candidate_pairs
+            from mem_vault.index import VectorIndex
 
             vi = VectorIndex(config)
             pairs = find_candidate_pairs(

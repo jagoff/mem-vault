@@ -44,11 +44,12 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -179,8 +180,8 @@ def _recency_days(updated_iso: str | None, now_ts: float | None = None) -> float
             updated_iso = updated_iso[:-1] + "+00:00"
         dt = datetime.fromisoformat(updated_iso)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        now = datetime.fromtimestamp(now_ts or time.time(), tz=timezone.utc)
+            dt = dt.replace(tzinfo=UTC)
+        now = datetime.fromtimestamp(now_ts or time.time(), tz=UTC)
         return max(0.0, (now - dt).total_seconds() / 86400.0)
     except (ValueError, TypeError):
         return None

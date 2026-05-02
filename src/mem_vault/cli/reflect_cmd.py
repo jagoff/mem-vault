@@ -20,7 +20,6 @@ no dejar TODO corre `launchctl bootstrap`".
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import os
 import platform

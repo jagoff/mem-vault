@@ -30,8 +30,8 @@ duplicating the BFS logic.
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 from mem_vault.storage import Memory
 

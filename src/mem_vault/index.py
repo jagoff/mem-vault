@@ -175,12 +175,13 @@ def time_decay_factor(
     """
     if half_life_days is None or half_life_days <= 0:
         return 1.0
-    candidates = [_parse_iso(updated_iso), _parse_iso(last_used_iso)]
-    candidates = [c for c in candidates if c is not None]
-    if not candidates:
+    parsed: list[datetime] = [
+        c for c in (_parse_iso(updated_iso), _parse_iso(last_used_iso)) if c is not None
+    ]
+    if not parsed:
         return 1.0
     # Most recent timestamp wins — citing an old memory keeps it warm.
-    dt = max(candidates)
+    dt = max(parsed)
     age_seconds = (datetime.now(tz=dt.tzinfo) - dt).total_seconds()
     if age_seconds <= 0:
         return 1.0

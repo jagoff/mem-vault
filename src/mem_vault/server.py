@@ -31,6 +31,8 @@ import mcp.types as types
 from mcp.server import Server
 
 from mem_vault import __version__
+from mem_vault import ranker as _ranker
+from mem_vault import telemetry as _telemetry
 from mem_vault.config import Config, load_config
 from mem_vault.discovery import (
     compute_stats,
@@ -44,8 +46,6 @@ from mem_vault.discovery import (
 )
 from mem_vault.index import CircuitBreakerOpenError, VectorIndex, compute_content_hash
 from mem_vault.storage import VaultStorage
-from mem_vault import ranker as _ranker
-from mem_vault import telemetry as _telemetry
 
 logger = logging.getLogger("mem_vault.server")
 
